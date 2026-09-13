@@ -50,6 +50,7 @@ ZERO_STATS = {
     "merged": 0,
     "superseded": 0,
     "archived": 0,
+    "archived_by_range": 0,
     "retracted": 0,
     "merge_rejected": 0,
     "protected_rejected": 0,
@@ -688,7 +689,7 @@ def test_id_not_found_increments_unmatched_and_logs(
 # XPASSes instead of breaking CI.
 
 @pytest.mark.xfail(
-    reason="Docstring requires an `op` key, but a missing op currently defaults to KEEP (#311 gap).",
+    reason="Docstring requires an `op` key, but a missing op currently defaults to KEEP.",
     strict=False,
 )
 def test_missing_op_key_is_malformed_and_skipped(memory_file: Path) -> None:
@@ -711,7 +712,7 @@ def test_non_string_op_is_malformed_and_skipped(memory_file: Path) -> None:
 
 
 @pytest.mark.xfail(
-    reason="MERGE `ids` is documented as a list, but a tuple is currently accepted (#311 gap).",
+    reason="MERGE `ids` is documented as a list, but a tuple is currently accepted.",
     strict=False,
 )
 def test_merge_ids_must_be_a_list(memory_file: Path) -> None:
@@ -904,7 +905,7 @@ def test_nightly_merge_rejects_empty_ids(memory_file: Path) -> None:
 
 
 @pytest.mark.xfail(
-    reason="MERGE `ids` is documented as a list, but a tuple is currently accepted under nightly policy (#311 gap).",
+    reason="MERGE `ids` is documented as a list, but a tuple is currently accepted under nightly policy.",
     strict=False,
 )
 def test_nightly_merge_rejects_malformed_id_list_without_crashing(memory_file: Path) -> None:

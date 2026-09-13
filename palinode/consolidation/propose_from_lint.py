@@ -1,4 +1,4 @@
-"""Lint findings become proposed operations — the ``detect → propose → dispose`` seam.
+"""Translate supported lint findings into reviewable consolidation operations.
 
 ``palinode lint`` has always been report-only: it finds orphans, stale files,
 contradictions, drifting wikilinks and withdrawn backing, prints them, and the
@@ -7,7 +7,7 @@ the *deterministic* half of that report into operations in the executor's own
 vocabulary, each carrying the finding it came from, and hands them to the same
 deterministic write paths a consolidation pass uses.
 
-The separation is the point, and it is deliberately narrower than an LLM pass:
+The lint path is deliberately limited to mappings that need no judgement:
 
 * **detect** — :func:`palinode.core.lint.run_lint_pass`, deterministic.
 * **propose** — this module. A finding maps to an op only when the mapping needs
@@ -15,7 +15,7 @@ The separation is the point, and it is deliberately narrower than an LLM pass:
   fact, a chosen winner between two claims) is proposed here; those stay the
   LLM proposer's job, and this module emits an advisory ``PROPOSE_*`` note
   instead — the same vocabulary :mod:`palinode.core.review` already uses.
-* **dispose** — the executor, unchanged. Nothing here writes files.
+* **apply** — the existing write functions, unchanged. Nothing here writes files.
 
 Dry-run is the default on every surface. ``apply`` is opt-in, and each applied
 op is stamped with an actor of ``lint`` so the git history and the audit trail
@@ -82,7 +82,11 @@ Two layers decide, and a skipped finding always says which one stopped it:
   short list of classes this proposer declines to nominate even though the
   invariant leaves them age-eligible. It is a preference about what an
   unattended deterministic pass should volunteer, not a claim about what the
-  executor would allow, and the recorded reason says so.
+  executor would allow, and the recorded reason says so. It applies only to
+  documents nobody classified: an explicit ``retirement_policy: age-eligible``
+  declaration is the operator saying "this one is episodic", and the
+  declaration wins over the proposer's caution just as it wins over the
+  classifier's inferred signals.
 
 The asymmetry is what justifies the second layer: a stale memory that keeps
 being reported costs a line of output, a wrongly archived one costs the memory.
@@ -98,7 +102,7 @@ from typing import Any
 import frontmatter
 
 from palinode.consolidation.op_parse import op_kind
-from palinode.consolidation.retirement import SUPERSEDED_ONLY, classify
+from palinode.consolidation.retirement import DECLARED_SIGNAL, SUPERSEDED_ONLY, classify
 from palinode.core.config import config
 
 logger = logging.getLogger("palinode.consolidation.propose_from_lint")
@@ -133,6 +137,9 @@ ADVISORY_OPS: frozenset[str] = frozenset({"PROPOSE_UPDATE"})
 #: an explicit ``retirement_policy: superseded-only``) is deliberately absent
 #: here: it comes from :func:`palinode.consolidation.retirement.classify`, so
 #: this list and the executor guard cannot disagree about what is protected.
+#: Nor does the list override a declaration: a ``decisions/`` document that
+#: declares ``retirement_policy: age-eligible`` has been classified by its
+#: author, and :func:`_archive_exclusion` lets it through.
 _CONSERVATIVE_DIRS: frozenset[str] = frozenset({"decisions"})
 
 #: A list-item fact and its executor-addressable id — the only body line an
@@ -177,20 +184,32 @@ def _archive_exclusion(rel_path: str, meta: dict[str, Any]) -> str | None:
     the ADR-020 classification the executor would enforce anyway, and
     ``proposer: conservative class`` is this module declining to nominate a
     document the executor would in fact accept.
+
+    An explicit declaration settles both layers. The classifier already gives
+    a declared ``retirement_policy`` precedence over every inferred signal;
+    this module extends the same precedence over its own conservatism, so a
+    document that declares itself ``age-eligible`` is proposed wherever it
+    lives. The conservative list only ever speaks for documents nobody
+    classified.
     """
     policy, signal = classify(os.path.join(_memory_dir(), rel_path), meta)
     if policy == SUPERSEDED_ONLY:
         return (
             f"retirement_policy: superseded-only ({signal}) — age is not a "
             "retirement reason for this document; it retires by SUPERSEDE, "
-            "RETRACT or an ARCHIVE naming superseded_by (ADR-020)"
+            "a RETRACT naming falsified_by, or an ARCHIVE naming "
+            "superseded_by (ADR-020)"
         )
+    if signal == DECLARED_SIGNAL:
+        # Not superseded-only and declared: the author said age-eligible.
+        return None
     top = rel_path.split(os.sep)[0]
     if top in _CONSERVATIVE_DIRS:
         return (
             f"proposer: conservative class ({top}/) — age-eligible under "
             "ADR-020, so the executor would apply this, but the lint proposer "
-            "does not volunteer age ARCHIVEs against governing documents"
+            "does not volunteer age ARCHIVEs against governing documents; "
+            "declare `retirement_policy: age-eligible` to opt in"
         )
     return None
 

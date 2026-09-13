@@ -9,9 +9,12 @@ All operations run against the data repo (config.memory_dir).
 from __future__ import annotations
 
 import os
+import random
 import re
 import subprocess
 import tempfile
+import threading
+import time
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -271,6 +274,55 @@ def _git_failure_reason(result: subprocess.CompletedProcess) -> str:
     return f"exit {result.returncode}: {first_line or '(no output)'}"
 
 
+#: Serialises the stage-and-commit pair across threads in one process. The
+#: API's save path, its backfill, and a CLI-driven bootstrap can all commit
+#: from the same server at once; without this they race each other for
+#: ``.git/index.lock`` and the loser's file stays dirty. Cross-process
+#: contention (the watcher against the API) is what the retry below is for.
+_COMMIT_LOCK = threading.Lock()
+
+#: Bounded backoff for an ``index.lock`` collision. Git holds the lock for
+#: milliseconds per commit, so a handful of short waits covers the watcher
+#: committing a cross_refs update while the API commits a save. Base delays
+#: in seconds, each jittered by up to +50%; the sum caps the worst case near
+#: a second so a *stale* lock (a crashed git) still reports promptly. Module
+#: constants so a test can shrink them.
+_INDEX_LOCK_RETRIES = 5
+_INDEX_LOCK_BACKOFF = (0.05, 0.1, 0.2, 0.3, 0.4)
+
+
+def _is_index_lock_collision(result: subprocess.CompletedProcess) -> bool:
+    """Git's "another process holds the index" signature, and nothing else.
+
+    Exit 128 with ``index.lock`` in stderr. Other exit-128 reasons (not a
+    repository, bad path spec) stay terminal — retrying those only delays
+    the honest failure.
+    """
+    return result.returncode == 128 and "index.lock" in (result.stderr or "")
+
+
+def _run_git_retrying_lock(*args: str) -> subprocess.CompletedProcess:
+    """``_run_git`` that waits out a transient ``index.lock`` collision.
+
+    Returns the last result either way: a success, a non-lock failure on the
+    first try, or the final lock failure after the retries are spent — the
+    caller's error handling is unchanged.
+    """
+    result = _run_git(*args)
+    for attempt in range(_INDEX_LOCK_RETRIES):
+        if not _is_index_lock_collision(result):
+            break
+        base = _INDEX_LOCK_BACKOFF[min(attempt, len(_INDEX_LOCK_BACKOFF) - 1)]
+        delay = base * (1 + random.random() * 0.5)  # nosec B311 - jitter, not security
+        logger.debug(
+            "git %s hit index.lock (attempt %d/%d); retrying in %.0f ms",
+            args[0], attempt + 1, _INDEX_LOCK_RETRIES, delay * 1000,
+        )
+        time.sleep(delay)
+        result = _run_git(*args)
+    return result
+
+
 def try_commit_memory_files(file_paths: list[str], message: str) -> CommitOutcome:
     """Stage an explicit list of files and commit them in one commit.
 
@@ -292,6 +344,13 @@ def try_commit_memory_files(file_paths: list[str], message: str) -> CommitOutcom
     "Nothing to commit" is detected locale-independently: a ``git commit``
     exit of 1 followed by ``git diff --cached --quiet`` succeeding on the
     same paths means the index holds no change for them.
+
+    Concurrency: the stage-and-commit pair holds a process-wide lock, so
+    threads in one server never race each other for ``.git/index.lock``;
+    a collision with *another* process (the watcher committing while the
+    API commits) is waited out with a short bounded backoff before it is
+    reported. A whole-store ``bootstrap-ids`` racing the watcher's
+    cross_refs commits stranded 82 files as dirty before either existed.
     """
     if not config.git.auto_commit or not file_paths:
         return CommitOutcome(False)
@@ -301,21 +360,22 @@ def try_commit_memory_files(file_paths: list[str], message: str) -> CommitOutcom
         rels.append(os.path.relpath(p, config.memory_dir) if os.path.isabs(p) else p)
 
     try:
-        add = _run_git("add", "--", *rels)
-        if add.returncode != 0:
-            reason = _git_failure_reason(add)
-            logger.error("Git add failed for %r: %s", rels, reason)
-            return CommitOutcome(False, reason)
-        commit = _run_git("commit", "-m", message)
-        if commit.returncode == 0:
-            return CommitOutcome(True)
-        if commit.returncode == 1:
-            staged = _run_git("diff", "--cached", "--quiet", "--", *rels)
-            if staged.returncode == 0:
+        with _COMMIT_LOCK:
+            add = _run_git_retrying_lock("add", "--", *rels)
+            if add.returncode != 0:
+                reason = _git_failure_reason(add)
+                logger.error("Git add failed for %r: %s", rels, reason)
+                return CommitOutcome(False, reason)
+            commit = _run_git_retrying_lock("commit", "-m", message)
+            if commit.returncode == 0:
                 return CommitOutcome(True)
-        reason = _git_failure_reason(commit)
-        logger.error("Git commit failed for %r: %s", rels, reason)
-        return CommitOutcome(False, reason)
+            if commit.returncode == 1:
+                staged = _run_git("diff", "--cached", "--quiet", "--", *rels)
+                if staged.returncode == 0:
+                    return CommitOutcome(True)
+            reason = _git_failure_reason(commit)
+            logger.error("Git commit failed for %r: %s", rels, reason)
+            return CommitOutcome(False, reason)
     except (subprocess.SubprocessError, OSError) as e:
         logger.error("Git commit failed for %r: %s", rels, e, exc_info=True)
         return CommitOutcome(False, str(e))

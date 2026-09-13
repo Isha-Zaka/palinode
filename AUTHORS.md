@@ -31,6 +31,8 @@ Contributions welcome via pull request. Names appear here once a PR is merged.
 - [Rehan30g](https://github.com/Rehan30g)
 - [Alfredo Lorentiar Santonanda](https://github.com/alorentiar)
 - [Saket7002](https://github.com/Saket7002)
+- [Mayank Suthar](https://github.com/Mayanksuthar07)
+- [Vardhman Gupta](https://github.com/Kaap10)
 
 ## Acknowledgements
 

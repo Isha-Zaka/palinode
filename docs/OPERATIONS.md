@@ -18,6 +18,10 @@ Database (.palinode.db)              ← rebuild anytime with `palinode reindex`
 
 ## Upgrading
 
+Version-specific steps live with the version. **Upgrading to v0.20 has a
+one-pass index migration and a rollback note:
+[UPGRADING-v0.20.md](UPGRADING-v0.20.md).**
+
 ### Standard upgrade
 
 ```bash
@@ -141,8 +145,12 @@ through it, so the count is exact and needs no separate counter to keep in sync.
 
 **Weekly and nightly are gated independently.** Last-run state lives in
 `<memory_dir>/.palinode/consolidation-state.json`, one entry per mode, so
-whichever ran last cannot starve the other. A pass that raises records nothing
-and is retried on the next tick; a `--dry-run` records nothing either.
+whichever ran last cannot starve the other. The recorded time is the pass's
+*start*, and the elapsed floor carries one hour of slack, so a daily cron
+satisfies the 24 h default no matter how long the previous pass took or how
+many seconds the tick drifted; the ceiling has no slack. A pass that raises,
+or that finishes `partial` (a project group failed), records nothing and is
+retried on the next tick; a `--dry-run` records nothing either.
 
 Notes:
 
@@ -159,6 +167,47 @@ Notes:
 - **Current state is on `/status`** under `consolidation_gate` (`palinode
   status --format json`): the configured thresholds plus, per mode, the last
   run, hours elapsed, sessions since, and whether a pass is due now.
+
+---
+
+## Status log retention
+
+A `projects/<slug>-status.md` fed by `POST /session-end` gains one dated line
+per session:
+
+```markdown
+- [2026-03-04] Shipped the retrieval receipt. (2 decisions → daily/2026-03-04.md) <!-- fact:proj-status-9c1f02 -->
+```
+
+Six months of those is a backlog the weekly compaction cannot digest — an
+honest proposal naming each stale line individually runs past any token cap,
+so the pass fails and nothing is retired. The weekly pass therefore retires
+them itself, before the model is shown anything:
+
+| Config key | Default | Meaning |
+|---|---|---|
+| `consolidation.status_log_retention_days` | 90 | A dated log line older than this is archived into the `-history.md` sibling. `0` disables the sweep. |
+
+What to know about it operationally:
+
+- **Nothing is deleted.** Every retired line is appended verbatim to
+  `projects/<slug>-history.md`, which stays indexed and retrievable on demand
+  (`status: archived` keeps it out of default recall).
+- **It runs on the weekly pass only**, once per target, before the prompt is
+  built. It commits on its own (`palinode age-retention: N status log line(s)
+  older than 90d`) and writes one `## Consolidation Log` line naming the range.
+- **The run summary reports `age_retired`.** `palinode consolidate --dry-run`
+  counts what would be retired and changes nothing.
+- **Identity and profile documents are never swept.** A `people/` memory, a
+  project's profile document (`projects/<slug>.md`, as distinct from its
+  `-status.md`), a `core: true` or `update_policy: replace` document, or
+  anything declaring `retirement_policy: superseded-only`, retires only by
+  supersession or retraction — never by age (ADR-020). To protect one
+  particular status document, add `retirement_policy: superseded-only` to its
+  frontmatter.
+- **The model can do the same thing in one operation.** `ARCHIVE_BEFORE`
+  (weekly `allowed_ops` only) retires every dated log line older than a date it
+  names, subject to the same guards.
 
 ---
 

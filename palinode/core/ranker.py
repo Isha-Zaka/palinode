@@ -154,7 +154,7 @@ def rank_hybrid(
     ``top_k`` — measured in production as a hybrid-search result count that
     silently plateaued well below the requested limit. Same lesson the
     forget resolver learned from the demand side
-    (``palinode/consolidation/forget.py``, commit 69c7e5a): never threshold
+    (``palinode/consolidation/forget.py``): never threshold
     a post-RRF score.
     """
     # Arm-specific relevance floors — see the docstring above. Apply them before

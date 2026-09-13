@@ -468,6 +468,7 @@ def test_lint_text_represents_every_lint_result_key(tmp_path, monkeypatch):
         "stale_open_questions": "No stale open questions",
         "open_contradictions": "No open contradictions",
         "stale_backing": "No stale backing",
+        "oversized_core": "All core memories are gist-sized",
         "entity_aliases": "No entity-alias candidates",
         "core_count": "No core files found",
     }

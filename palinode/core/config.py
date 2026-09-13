@@ -167,6 +167,38 @@ class AutoSummaryConfig:
     llm_fallback_max_per_run: int = 10
 
 @dataclass
+class EvidenceConfig:
+    """Budgets for the opt-in evidence resolver behind ``search --resolve``.
+
+    Each is a hard, deterministic ceiling on one kind of work the resolver
+    may do for one request (``palinode.core.evidence``). Link traversal
+    (``max_files`` / ``max_edges`` / ``max_depth``), replacement-chain walks
+    (``max_replacement_chain``) and unlinked discovery (``fallback_*``) are
+    budgeted separately so exhausting one never silently starves another,
+    and every exhausted budget is named in the result's ``coverage``.
+    Conservative on purpose: the resolver runs inside a search request.
+    """
+    #: Distinct files read from disk beyond the seeds (link traversal).
+    max_files: int = 24
+    #: Typed-link edges followed (forward and reverse, all seeds together).
+    max_edges: int = 48
+    #: Hops of ``contradicts`` / ``backed_by`` from a seed.
+    max_depth: int = 2
+    #: Hops along a ``superseded_by`` chain from any node, kept apart from
+    #: ``max_depth`` so a long replacement lineage cannot eat the edge budget.
+    max_replacement_chain: int = 8
+    #: Retrieval calls unlinked discovery may make (entity, keyword, neighbour
+    #: lookups count one each), spent in seed rank order.
+    fallback_max_queries: int = 18
+    #: Files unlinked discovery may read beyond the linked ones.
+    fallback_max_reads: int = 12
+    #: Hops of ``backed_by`` the read-time support check walks from a record
+    #: (1 = its own sources, 2 = its sources' sources). Separate from
+    #: ``max_depth`` so a spent traversal budget cannot silence the second-hop
+    #: check; its file reads are still charged against ``max_files``.
+    max_support_hops: int = 2
+
+@dataclass
 class SearchConfig:
     """Matching index score cutoffs thresholds layouts.
 
@@ -263,6 +295,8 @@ class SearchConfig:
     # MCP renders snippet by default; full chunk content remains available
     # through `content` (API/CLI) or the `full=true` flag on palinode_search.
     snippet_max_chars: int = 400
+    # Budgets for the opt-in evidence resolver (``resolve`` on search).
+    evidence: EvidenceConfig = field(default_factory=EvidenceConfig)
 
 @dataclass
 class ReadConfig:
@@ -355,7 +389,10 @@ class AutoGateConfig:
     ``min_hours_elapsed`` since that pass last ran, and at least
     ``min_sessions`` session-end entries recorded since then — so the cron can
     fire as often as you like and the pass lands on use rather than on the
-    calendar.
+    calendar. The elapsed floor carries one hour of slack and is measured from
+    the previous pass's *start*, so a daily cron satisfies the 24 h default
+    despite tick jitter and however long the pass itself took; the ceiling has
+    no slack.
 
     ``max_hours_elapsed`` is the ceiling that defeats the gate: past it the
     pass runs whatever the session count is. Without it, a store that ingests
@@ -393,7 +430,7 @@ class ConsolidationConfig:
     # this and did nothing — removed; this is now the only weekly-pass knob.
     allowed_ops: list[str] = field(default_factory=lambda:
         ["KEEP", "UPDATE", "MERGE", "SUPERSEDE", "ARCHIVE", "RETRACT",
-         "PROPOSE_CONTRADICTS"])
+         "PROPOSE_CONTRADICTS", "ARCHIVE_BEFORE"])
     nightly: NightlyConfig = field(default_factory=NightlyConfig)
     auto_gate: AutoGateConfig = field(default_factory=AutoGateConfig)
     write_time: WriteTimeConfig = field(default_factory=WriteTimeConfig)
@@ -403,6 +440,19 @@ class ConsolidationConfig:
     # older blocks collapse into one cumulative elision line (the full detail
     # stays in git history). 0 disables the cap.
     status_log_max_blocks: int = 10
+    # How long a dated `- [YYYY-MM-DD] …` status log line stays in the document
+    # before the weekly pass retires it to `-history.md` — deterministically,
+    # with no model involved. One line per session accumulates faster than any
+    # proposal can retire it: at 449 facts the honest ARCHIVE-per-fact proposal
+    # overflowed every workable token cap, so nothing was ever retired.
+    # 90 days is a quarter: long enough that a line is still in the window
+    # while anyone might reasonably recall the session that wrote it, and
+    # more than twelve times the weekly pass's own 7-day lookback, so a line
+    # has been seen by a dozen passes before age alone retires it. Nothing is
+    # lost — the sibling `-history.md` keeps every retired line verbatim.
+    # 0 disables the sweep entirely. Only applied to age-eligible documents
+    # (ADR-020): an identity/profile document is never retired by age.
+    status_log_retention_days: int = 90
 
 @dataclass
 class DecayConfig:
@@ -546,12 +596,49 @@ class LayerSplitConfig:
 
 @dataclass
 class ContextConfig:
-    """Ambient context for search boosting. Resolves caller's project from CWD."""
+    """Ambient context for search boosting. Resolves caller's project from CWD.
+
+    Also carries the **injection budgets** — the ceilings on what Palinode puts
+    into a context window without being asked. The two surfaces are budgeted
+    separately because they are paid differently: the startup payload is paid
+    once per session and can afford orientation; the per-turn recall block is
+    paid on every message and competes with the user's own turn.
+
+    Both are expressed twice, in characters and in estimated tokens
+    (``packing.estimate_tokens``, chars/4 — an estimate, not a tokenizer).
+    Under that estimator the pairs below are two views of one ceiling; they
+    diverge only if a real tokenizer ever replaces the estimate, which is why
+    both are enforced. ``0`` disables a cap; ``0`` on both members of a pair
+    leaves that surface bounded only by its own line/count limits
+    (``context_prime.MAX_*``), which is exactly the pre-budget behaviour.
+
+    Defaults. ``injection_max_chars = 6000`` (~1500 estimated tokens) is a
+    little above what today's bounds can produce — 23 rows capped at
+    ``MAX_LINE_CHARS`` plus headings — so a normal digest is unaffected and an
+    accreting core set is caught instead of quietly crowding the window.
+    ``recall_max_chars = 3000`` (~750 tokens) matches the per-turn ceiling the
+    shipped harness plugin already applies (``PALINODE_HOOK_RECALL_MAX_CHARS``),
+    so the server-side budget agrees with the client-side one rather than
+    fighting it.
+    """
     enabled: bool = True
     boost: float = 1.5              # Multiplier for context-matching results (1.0 = disabled)
     auto_detect: bool = True        # Fall back to project/{basename(cwd)} if not in project_map
     project_map: dict[str, str] = field(default_factory=dict)  # CWD basename → entity ref
     embed_augment: bool = True      # Prepend project context to query before embedding
+    #: Session-start core injection: /context/prime, palinode_session_init,
+    #: palinode prime.
+    injection_max_chars: int = 6000
+    injection_max_tokens: int = 1500
+    #: Per-turn recall block (the harness recall hook's payload).
+    recall_max_chars: int = 3000
+    recall_max_tokens: int = 750
+    #: A `core: true` memory is an index entry — a gist and a pointer to the
+    #: file that holds the detail. Above this size it is a document wearing a
+    #: core flag, and `palinode lint` says so. 1500 chars (~375 estimated
+    #: tokens, roughly a screenful) keeps the whole core set readable in a few
+    #: thousand tokens even when every pointer is followed.
+    core_gist_max_chars: int = 1500
 
 @dataclass
 class AutoInjectConfig:

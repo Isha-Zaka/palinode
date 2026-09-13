@@ -1,4 +1,4 @@
-"""`PROPOSE_CONTRADICTS` across the propose→dispose seam, on a real store.
+"""`PROPOSE_CONTRADICTS` through a consolidation pass, on a real store.
 
 `tests/test_typed_links.py` hand-feeds the op to `apply_operations`, which proves
 the executor arm works and nothing about whether a *pass* can ever produce one.

@@ -200,7 +200,20 @@ consolidation:
   # PROPOSE_CONTRADICTS records a conflict between two memories without
   # picking a winner (SUPERSEDE stays the only winner-picking op); drop it
   # from this list to stop the pass proposing contradiction links at all.
-  allowed_ops: ["KEEP", "UPDATE", "MERGE", "SUPERSEDE", "ARCHIVE", "RETRACT", "PROPOSE_CONTRADICTS"]
+  # ARCHIVE_BEFORE retires every dated `- [YYYY-MM-DD] …` status log line
+  # older than one date in a single operation, so a proposal's size follows
+  # the number of reasons rather than the number of facts. Weekly only — it
+  # is deliberately absent from nightly.allowed_ops below.
+  allowed_ops: ["KEEP", "UPDATE", "MERGE", "SUPERSEDE", "ARCHIVE", "RETRACT", "PROPOSE_CONTRADICTS", "ARCHIVE_BEFORE"]
+
+  # How long a dated `- [YYYY-MM-DD] …` status log line stays in the document
+  # before the weekly pass retires it into the `-history.md` sibling — no LLM
+  # involved, applied before the model is shown anything. A status document
+  # fed by session-end gains a line per session; at several hundred, an honest
+  # per-line proposal overruns any token cap and nothing is ever retired.
+  # 90 days is a quarter, and more than twelve weekly passes. 0 disables the
+  # sweep. Identity/profile documents are never swept (ADR-020).
+  status_log_retention_days: 90
 
   # Nightly pass configuration (Tier 2)
   nightly:

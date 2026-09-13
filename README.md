@@ -101,9 +101,11 @@ That's the entire client config. Works with Claude Code, Claude Desktop, Cursor,
 
 - **Python 3.11+**
 - **Git**
-- **Ollama** with `bge-m3` (`ollama pull bge-m3`, ≈1.2 GB) — for semantic search.
-  **Optional:** without an embedder Palinode runs in **keyword-only mode** (BM25/FTS5) — save,
-  search, and audit all still work; you just don't get vector recall until you add one.
+- **Ollama** with `bge-m3` (`ollama pull bge-m3`, ≈1.2 GB), or another supported
+  embedding endpoint — for search. Saves persist without an embedder, but search
+  returns HTTP 503 until it is reachable (`palinode resolve` degrades to
+  keyword-only and says so). See the
+  [Homebrew setup guide](docs/HOMEBREW.md) for installation and verification.
 
 Optional extras: a chat model for weekly consolidation (any 7B+ that outputs JSON), OpenClaw for agent plugin hooks.
 
@@ -111,16 +113,17 @@ Optional extras: a chat model for weekly consolidation (any 7B+ that outputs JSO
 
 ## Install
 
-**Homebrew (macOS/Linux) — quickest path to the CLI:**
+**Homebrew (macOS/Linux) — local installation:**
 
 ```bash
 brew install phasespace-labs/palinode/palinode
 palinode --version
 ```
 
-That taps and installs in one command. It puts the `palinode` CLI on your PATH; the
-service binaries (`palinode-api`, `palinode-watcher`, `palinode-mcp`) currently live in
-the tap's private prefix, so for running services use the source install below or Docker.
+That installs the CLI, API, watcher, and MCP executables with their Python dependencies.
+Follow the [Homebrew setup guide](docs/HOMEBREW.md) to create your private memory
+directory, start the services, connect your editor, and verify your first saved memory.
+The guide also covers upgrades and service restarts.
 
 **From source — the full-stack path.** Clone, install, point at a memory directory,
 check it worked:
@@ -246,12 +249,15 @@ palinode archive insights/stale-finding.md --reason "superseded by the re-run" \
 
 ## Tools
 
-29 tools available through every interface:
+Tools available through every interface (the full inventory, with parameters, is
+the table in [docs/MCP-SETUP.md](docs/MCP-SETUP.md) — a prose count here only
+drifts):
 
 | Tool | What It Does |
 |------|-------------|
 | `session_init` | Session-start context digest for the resolved project scope |
-| `search` | Hybrid BM25 + vector search with category filter |
+| `search` | Hybrid BM25 + vector search with category filter; `resolve` attaches bounded evidence and a resolution per hit |
+| `resolve` | What memory holds *right now* for a question or one record — what stands, what replaced what, conflicts with both sides intact, and what is explicitly unknown |
 | `save` | Store a typed memory (person, decision, insight, project) |
 | `list` | Browse memory files by type, filter by core status |
 | `read` | Read the full content of a memory file |
@@ -260,6 +266,9 @@ palinode archive insights/stale-finding.md --reason "superseded by the re-run" \
 | `entities` | Entity graph — cross-references between memories |
 | `consolidate` | Preview or run LLM-powered compaction |
 | `archive` | Retire one memory that's wrong or obsolete — archive it, or supersede it with a named replacement |
+| `restore` | Bring an archived memory back into default recall — the inverse of `archive` |
+| `unretract` | Withdraw one preference's mention-level retraction from one memory |
+| `forget_withdraw` | Take a forget request back — restore what it archived, un-strike what it retracted |
 | `archive_expired` | Archive ephemeral memories whose TTL has expired |
 | `diff` | What changed in the last N days |
 | `blame` | Trace a fact back to the commit that recorded it |
@@ -403,7 +412,7 @@ When exposing the API beyond loopback (`PALINODE_API_HOST` other than `127.0.0.1
 | `POST` | `/search` | Hybrid search with filters |
 | `POST` | `/search-associative` | Entity graph traversal |
 | `POST` | `/save` | Create a typed memory file. Schema: `{content, type, slug?, entities?, title?}`. Body cap **5 MB** (override via `PALINODE_MAX_REQUEST_BYTES`). |
-| `POST` | `/ingest-url` | Fetch URL, save as research |
+| `POST` | `/ingest-url` | Fetch URL, save as research. The URL and each redirect target (five hops at most) are validated before they are requested: a host must resolve only to globally routable addresses. The connection is not pinned to the validated address. |
 | `GET/POST` | `/triggers` | Prospective recall triggers |
 | `POST` | `/consolidate` | Run or preview compaction |
 | `GET` | `/list` | Browse files by type |

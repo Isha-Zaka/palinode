@@ -53,7 +53,14 @@ from palinode.core.defaults import (
     SESSION_END_TIMEOUT_SECONDS as _SESSION_END_TIMEOUT,
     _SESSION_END_TIMEOUT_SENTINEL as _SENTINEL,
 )
-from palinode.core.parity import CATEGORIES, MEMORY_TYPES, PROMPT_TASKS, TIERS
+from palinode.core.parity import (
+    CATEGORIES,
+    MEMORY_TYPES,
+    PROMPT_TASKS,
+    RESOLVE_INTENTS,
+    RESOLVE_MODES,
+    TIERS,
+)
 from palinode.core.scoring import describe_match
 from palinode.core.path_guard import to_rel_path
 from palinode.core.typed_links import parse_link_refs
@@ -625,7 +632,163 @@ _FULL_CONTENT_HARD_CAP = 4000  # Politeness ceiling for full=True.
 MCP_SEARCH_LIMIT_MAX = 50
 
 
-def _format_results(results: list[dict[str, Any]], full: bool = False) -> str:
+#: How one evidence record reads, by (relation, direction). Reverse edges are
+#: phrased from the hit's side: a record whose ``superseded_by`` names the
+#: hit is one the hit *replaces*.
+_EVIDENCE_LABELS: dict[tuple[str, str], str] = {
+    ("superseded_by", "forward"): "replaced by",
+    ("superseded_by", "reverse"): "replaces",
+    ("contradicts", "forward"): "contradicts",
+    ("contradicts", "reverse"): "contradicted by",
+    ("backed_by", "forward"): "backed by",
+    ("backed_by", "reverse"): "backs",
+}
+
+#: Excerpt characters rendered per evidence record — a glance, not the body.
+_EVIDENCE_EXCERPT_CHARS = 160
+
+
+def _format_evidence(evidence: dict[str, Any]) -> list[str]:
+    """Render one hit's ``evidence`` block (opt-in ``resolve``) as indented lines.
+
+    Every record carries its own ``currency`` so a replaced or retracted
+    record is never read as current just because it was linked; the seed's
+    ``coverage`` is rendered only when partial, with its reasons verbatim —
+    the reasons are a closed vocabulary and name no hidden record.
+    """
+    lines: list[str] = []
+    for bucket in ("replacements", "conflicts", "support", "discovered"):
+        for rec in evidence.get(bucket) or []:
+            if not isinstance(rec, dict):
+                continue
+            relation = str(rec.get("relation") or "linked")
+            if rec.get("direction") == "discovered":
+                label = f"discovered via {relation}"
+            else:
+                label = _EVIDENCE_LABELS.get((relation, str(rec.get("direction"))), relation)
+            flags: list[str] = []
+            currency = rec.get("currency")
+            if currency in ("retired", "contested"):
+                flags.append(f"⚠ {currency}")
+            elif currency:
+                flags.append(str(currency))
+            if rec.get("freshness") == "stale":
+                flags.append("⚠ index stale")
+            if rec.get("effective_at"):
+                flags.append(str(rec["effective_at"])[:10])
+            line = f"  ↳ {label}: {rec.get('ref')} [{', '.join(flags)}]"
+            excerpt = str(rec.get("excerpt") or "").strip()
+            if excerpt:
+                if len(excerpt) > _EVIDENCE_EXCERPT_CHARS:
+                    excerpt = excerpt[:_EVIDENCE_EXCERPT_CHARS].rstrip() + "…"
+                line += f" — {excerpt}"
+            lines.append(line)
+    coverage = evidence.get("coverage") or {}
+    if coverage.get("status") == "partial":
+        reasons = [str(x) for x in coverage.get("reasons") or []]
+        lines.append("  ↳ coverage: partial (" + ", ".join(reasons) + ")")
+    return lines
+
+
+#: How one resolution outcome reads. The three states stay distinguishable:
+#: a conflict is never rendered as an answer, and unknown is never silence.
+_OUTCOME_LABELS: dict[str, str] = {
+    "supported_current": "current",
+    "unresolved_conflict": "⚠ unresolved conflict",
+    "insufficient_evidence": "⚠ insufficient evidence",
+}
+
+
+def _format_side(side: dict[str, Any]) -> str:
+    bits = [str(side.get("kind") or "unknown"), str(side.get("currency") or "")]
+    bits.extend(str(q) for q in side.get("qualifiers") or [])
+    return f"{side.get('ref')} [{', '.join(b for b in bits if b)}]"
+
+
+def _format_resolution(resolution: dict[str, Any]) -> list[str]:
+    """Render one hit's ``resolution`` block (opt-in ``resolve``) as indented lines.
+
+    The decision is made server-side (``palinode.core.resolution``); this only
+    renders it, so the MCP, CLI and REST readings of the same hit agree.
+    """
+    outcome = str(resolution.get("outcome") or "")
+    label = _OUTCOME_LABELS.get(outcome, outcome)
+    reasons = ", ".join(str(r) for r in resolution.get("reasons") or [])
+    current = resolution.get("current")
+    head = f"  ⇒ {label}"
+    if isinstance(current, dict):
+        head += f": {_format_side(current)}"
+    if reasons:
+        head += f" — {reasons}"
+    lines = [head]
+    sides = [s for s in resolution.get("sides") or [] if isinstance(s, dict)]
+    if outcome != "supported_current" or len(sides) > 1:
+        for side in sides:
+            lines.append(f"    · side: {_format_side(side)}")
+    groups = [g for g in resolution.get("support") or [] if isinstance(g, dict)]
+    for group in groups:
+        members = [str(m.get("ref")) for m in group.get("members") or [] if isinstance(m, dict)]
+        if len(members) > 1:
+            lines.append(
+                f"    · support origin {group.get('origin_kind')}:{group.get('origin')} "
+                f"— {len(members)} records ({', '.join(members)}) count once"
+            )
+    return lines
+
+
+def _format_receipt(receipt: dict[str, Any]) -> list[str]:
+    """Render the delivery receipt as trailing lines.
+
+    Two shapes, matching the two the API returns. Without ``resolve`` the
+    receipt is the two-field reference and this is a single line — the whole
+    growth an ordinary search response takes on. With ``resolve`` it is the
+    public view, and the block says what was supplied, at which exact source
+    revision, how each record was disposed, which copies share one origin, and
+    when the delivery was evaluated against what next known transition.
+
+    Refs, hashes and dispositions only: the receipt carries no memory text, so
+    rendering it in full costs a line per supplied record and nothing more.
+    """
+    bundle = receipt.get("bundle_id")
+    evaluated = receipt.get("evaluated_at")
+    head = f"Receipt: {bundle} · evaluated {evaluated}"
+    supplied = [s for s in receipt.get("supplied") or [] if isinstance(s, dict)]
+    if not supplied:
+        return ["", head]
+    if receipt.get("policy_version"):
+        head += f" · policy {receipt['policy_version']}"
+    if receipt.get("scope"):
+        head += f" · scope {', '.join(str(s) for s in receipt['scope'])}"
+    if receipt.get("next_transition"):
+        head += f" · next transition {receipt['next_transition']}"
+    lines = ["", head]
+    for rec in supplied:
+        revision = rec.get("revision")
+        # An unknown revision is said, not omitted: the delivery never computed
+        # one for that record, which is not the same as it having none.
+        rev = f"@{str(revision)[:12]}" if revision else "@unknown"
+        lines.append(f"  · {rec.get('ref')}{rev} — {rec.get('disposition')}")
+    for group in receipt.get("lineage") or []:
+        members = [str(m) for m in (group.get("members") or [])]
+        if group.get("status") == "known" and len(members) > 1:
+            lines.append(
+                f"  · lineage {group.get('origin_kind')}:{group.get('origin')} — "
+                f"{len(members)} records ({', '.join(members)}) share one origin"
+            )
+    coverage = receipt.get("coverage") or {}
+    if coverage.get("status"):
+        line = f"  · coverage: {coverage['status']}"
+        if coverage.get("reasons"):
+            line += " (" + ", ".join(str(r) for r in coverage["reasons"]) + ")"
+        lines.append(line)
+    return lines
+
+
+def _format_results(
+    results: list[dict[str, Any]],
+    full: bool = False,
+    receipt: dict[str, Any] | None = None,
+) -> str:
     """Format search results as clean text — minimal context burn.
 
     Renders ``snippet`` by default (populated by ``/search`` per the palinode_search
@@ -638,14 +801,32 @@ def _format_results(results: list[dict[str, Any]], full: bool = False) -> str:
     populated (older API or external caller).
     """
     if not results:
-        return "No results found."
+        return "No results found." + ("\n".join(_format_receipt(receipt)) if receipt else "")
     parts = []
     any_truncated = False
     for r in results:
         rel = _rel_path_from(r)
         match_label = describe_match(r)
+        # `freshness` is index/source agreement — the stored section hash
+        # against the file on disk — and nothing more. A chunk that still
+        # carries a superseded fact's tombstone is `valid` because the index
+        # faithfully reflects the file, so the label must say what was
+        # compared and never read as the assertion being verified or current.
+        # Whether the assertion is still in force is `currency`, below.
         freshness = r.get("freshness")
-        fresh_label = f" ✓ {freshness}" if freshness == "valid" else (f" ⚠ {freshness}" if freshness == "stale" else "")
+        fresh_label = {
+            "valid": " [index matches source]",
+            "stale": " [⚠ index stale]",
+        }.get(freshness, "")
+        # Cited-span integrity: are the record's `sources:` quote anchors still
+        # present verbatim in the files they cite (the palinode_blame check)?
+        # Silent when the record cites nothing.
+        span = r.get("span_integrity")
+        span_label = ""
+        if span == "ok":
+            span_label = " [cited quote found in source]"
+        elif span and span != "unanchored":
+            span_label = f" [⚠ cited quote: {span}]"
         # Render external_refs when present in result metadata.
         meta = r.get("metadata") or {}
         ext_refs = meta.get("external_refs")
@@ -693,6 +874,19 @@ def _format_results(results: list[dict[str, Any]], full: bool = False) -> str:
         contradicts = parse_link_refs(meta, "contradicts")
         backed_by = parse_link_refs(meta, "backed_by")
         _link_bits = []
+        # Assertion currency, from the file's live frontmatter and the chunk
+        # text (see check_freshness). `retired` and `contested` are the states
+        # a reader must not miss; `current` and `unmarked` stay unlabelled, as
+        # in the session digest, so a hit with nothing to warn about stays
+        # quiet. A contested hit is normally labelled by its `contradicts`
+        # refs below; the bare word is only added when the indexed metadata
+        # has not caught up with the file and would otherwise say nothing.
+        currency = r.get("currency")
+        if currency == "retired":
+            _reason = r.get("currency_reason")
+            _link_bits.append("⚠ retired" + (f": {_reason}" if _reason else ""))
+        elif currency == "contested" and not contradicts:
+            _link_bits.append("⚠ contested")
         if contradicts:
             _link_bits.append("⚠ contradicts: " + ", ".join(contradicts))
         if backed_by:
@@ -723,16 +917,33 @@ def _format_results(results: list[dict[str, Any]], full: bool = False) -> str:
             if r.get("content_truncated"):
                 any_truncated = True
 
-        parts.append(
-            f"[{rel}] ({match_label}){fresh_label}{epi_label}{links_label}{refs_label}\n{(body or '').strip()}"
+        entry = (
+            f"[{rel}] ({match_label}){fresh_label}{span_label}{epi_label}{links_label}{refs_label}\n{(body or '').strip()}"
         )
+        evidence = r.get("evidence")
+        if isinstance(evidence, dict):
+            entry += "".join("\n" + line for line in _format_evidence(evidence))
+        resolution = r.get("resolution")
+        if isinstance(resolution, dict):
+            entry += "".join("\n" + line for line in _format_resolution(resolution))
+        parts.append(entry)
 
     rendered = "\n\n---\n\n".join(parts)
+    blocks = [r.get("evidence") for r in results if isinstance(r.get("evidence"), dict)]
+    if blocks:
+        from palinode.core.evidence import fold_coverage
+
+        cov = fold_coverage(blocks)
+        rendered += f"\n\nEvidence coverage: {cov['status']}"
+        if cov["reasons"]:
+            rendered += " (" + ", ".join(cov["reasons"]) + ")"
     if any_truncated and not full:
         rendered += (
             "\n\n(some results truncated — call palinode_search with full=true, "
             "or palinode_read <file> for the complete text.)"
         )
+    if receipt:
+        rendered += "\n".join(_format_receipt(receipt))
     return rendered
 
 
@@ -977,6 +1188,20 @@ def _all_tools() -> list[types.Tool]:
                             "relevance checks; 'overview' returns frontmatter "
                             "plus the head of the body; 'full' is the chunk "
                             "body. Omit to keep the default snippet view."
+                        ),
+                    },
+                    "resolve": {
+                        "type": "string",
+                        "enum": list(RESOLVE_MODES),
+                        # Read-only closure over the typed links; the caller
+                        # opts in because it multiplies file reads per hit.
+                        "description": (
+                            "Attach evidence around each hit: 'linked' follows "
+                            "superseded_by/contradicts/backed_by both ways under "
+                            "fixed budgets; 'full' adds bounded unlinked discovery. "
+                            "Each hit reports coverage and a resolution — a current "
+                            "answer, an unresolved conflict with both sides, or "
+                            "insufficient evidence. Default none."
                         ),
                     },
                 },
@@ -1851,6 +2076,53 @@ def _all_tools() -> list[types.Tool]:
             ),
         ),
         types.Tool(
+            name="palinode_resolve",
+            description=(
+                "Ask what memory holds RIGHT NOW about a question, or about one record. "
+                "Returns the assertions that stand (with their evidence and source revisions), "
+                "what replaced what, conflicts with every side intact, and what is explicitly "
+                "unknown. Use instead of palinode_search when you want the current answer "
+                "rather than a list of hits. Read-only; a tight budget can shrink the answer "
+                "but never turns a conflict into a settled one."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language question. Give this or `ref`.",
+                    },
+                    "ref": {
+                        "type": "string",
+                        "description": "Exact memory ref (path without .md), e.g. 'decisions/db'.",
+                    },
+                    "context": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Refs you already hold; each is checked, not assumed current.",
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "What to answer. Only current state is supported.",
+                        "enum": list(RESOLVE_INTENTS),
+                        "default": RESOLVE_INTENTS[0],
+                    },
+                    "max_items": {
+                        "type": "integer",
+                        "description": "Max units in the answer (default 8).",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Max characters in the answer (default 2000).",
+                    },
+                },
+            },
+            annotations=types.ToolAnnotations(
+                title="Resolve Current State",
+                readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+            ),
+        ),
+        types.Tool(
             name="palinode_doctor",
             description=(
                 "Fast palinode health check (<500ms). "
@@ -2094,6 +2366,13 @@ async def _tool_search(arguments: dict[str, Any]) -> list[types.TextContent]:
         body["threshold"] = float(arguments["threshold"])
     else:
         body["threshold"] = config.search.mcp_threshold
+    # Opt-in evidence closure; "none" is the API default and is not sent.
+    if arguments.get("resolve") and arguments["resolve"] != "none":
+        body["resolve"] = arguments["resolve"]
+    # Always ask for the delivery receipt. It is not a tool parameter: an agent
+    # never has a reason to decline provenance for what it was just handed, and
+    # the cost is two lines of text without `resolve`.
+    body["receipt"] = True
     # ADR-008: ambient context boost
     context = _resolve_context()
     if context:
@@ -2102,10 +2381,19 @@ async def _tool_search(arguments: dict[str, Any]) -> list[types.TextContent]:
     resp = await _post("/search", json=body, timeout=60.0)
     if resp.status_code != 200:
         return _text(f"Search failed: {resp.text}")
+    # With `receipt` the API answers with an envelope; a bare list means an
+    # older API server that predates receipts, which still renders.
+    payload = resp.json()
+    if isinstance(payload, dict):
+        results, receipt = payload.get("results") or [], payload.get("receipt")
+    else:
+        results, receipt = payload, None
     # `full` is purely a rendering choice — the API always
     # populates `snippet` and preserves `content`, so the MCP picks
     # which to render without an extra round-trip.
-    return _text(_format_results(resp.json(), full=bool(arguments.get("full"))))
+    return _text(_format_results(
+        results, full=bool(arguments.get("full")), receipt=receipt,
+    ))
 
 
 # ── save ──────────────────────────────────────────────────────────
@@ -2712,6 +3000,31 @@ async def _tool_topic_coverage(arguments: dict[str, Any]) -> list[types.TextCont
         pct = int(sim * 100)
         return _text(f"COVERED — {fp} ({pct}% similar). Consider updating the existing page.")
     return _text(f"NOT COVERED — no existing page matches above threshold (best similarity: {sim:.2f}). Safe to create new.")
+
+
+# ── resolve ───────────────────────────────────────────────────────
+@_handles("palinode_resolve")
+async def _tool_resolve(arguments: dict[str, Any]) -> list[types.TextContent]:
+    """Bounded resolution. Renders the API's own bundle text, never its own.
+
+    The rendering lives in ``palinode.core.bundle`` so this surface, REST and
+    the CLI cannot disagree about what stands; the structured bundle is one
+    ``/resolve`` call away for a caller that wants the fields.
+    """
+    body: dict[str, Any] = {}
+    for key in ("query", "ref", "intent"):
+        if arguments.get(key):
+            body[key] = arguments[key]
+    context = coerce_str_array(arguments.get("context"))
+    if context:
+        body["context"] = context
+    for key in ("max_items", "max_chars"):
+        if arguments.get(key) is not None:
+            body[key] = int(arguments[key])
+    resp = await _post("/resolve", json=body, timeout=60.0)
+    if resp.status_code != 200:
+        return _text(f"Resolve failed: {resp.text}")
+    return _text(resp.json().get("text", ""))
 
 
 # ── doctor ────────────────────────────────────────────────────────

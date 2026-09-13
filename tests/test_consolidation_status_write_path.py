@@ -45,6 +45,11 @@ def _seed(memory_dir: Path, monkeypatch) -> Path:
     monkeypatch.setattr(config, "memory_dir", str(memory_dir))
     monkeypatch.setattr(config, "db_path", str(memory_dir / ".palinode.db"))
     monkeypatch.setattr(config.git, "auto_commit", True)
+    # The deterministic age sweep is off for this module: its subject is
+    # what the *model* proposes and what the writer does with it, and a
+    # fixture dated months back would otherwise be retired by age before
+    # the proposal is ever read. The sweep has its own tests.
+    monkeypatch.setattr(config.consolidation, "status_log_retention_days", 0)
 
     for sub in ("projects", "specs/prompts", "daily"):
         (memory_dir / sub).mkdir(parents=True, exist_ok=True)
@@ -236,7 +241,12 @@ def test_merge_that_retired_nothing_writes_no_merge_line(tmp_path, monkeypatch):
 def test_preview_and_write_agree_on_rationale(tmp_path, monkeypatch):
     """The regression that let this ship: preview and write must render the same
     rationale for the same operation."""
-    ops = [{"op": "RETRACT", "id": "f1", "rationale": "Measured wrong."}]
+    # Cites today's note, which the prompt renders: the propose-side guard
+    # downgrades a RETRACT that names nothing in context, and this test is
+    # about the rationale of one that is applied.
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    ops = [{"op": "RETRACT", "id": "f1", "rationale": "Measured wrong.",
+            "falsified_by": f"daily/{today}"}]
 
     preview_dir = tmp_path / "preview"
     preview_dir.mkdir()

@@ -24,6 +24,8 @@ from palinode.core.config import config
 from palinode.core import aliases
 from palinode.core import expiry as _expiry
 from palinode.core import parser as _parser
+from palinode.core.lifecycle import contains_retired_fact_text, eligibility
+from palinode.core.quote_verify import QuoteStatus, verify_source_anchors
 # The hybrid-search scoring pipeline + its pure decay/predicate helpers live in
 # ranker.py. Re-exported here so `store.effective_importance`,
 # `store._is_daily_file`, etc. keep resolving for internal callers and tests.
@@ -378,6 +380,18 @@ def init_db() -> None:
     except sqlite3.OperationalError:
         pass  # Column already exists
 
+    # The derived-text domain (palinode.core.projection): ``content`` is the
+    # projected current-state text, ``projected_hash`` hashes it, and
+    # ``projection_version`` says which rules produced it. ``content_hash``
+    # stays a hash of the raw section — the source domain check_freshness
+    # and anchor verification compare against. NULL on pre-upgrade rows,
+    # which reconcile.plan treats as "not yet projected" and re-derives.
+    for _col in ("projected_hash TEXT", "projection_version INTEGER"):
+        try:
+            db.execute(f"ALTER TABLE chunks ADD COLUMN {_col}")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
     try:
         db.execute("ALTER TABLE chunks ADD COLUMN importance FLOAT DEFAULT 0.5")
         db.execute("ALTER TABLE chunks ADD COLUMN last_recalled TEXT")
@@ -522,6 +536,25 @@ def fts5_delete_chunk(cursor: sqlite3.Cursor, chunk_id: str) -> None:
     )
 
 
+def _fts_holds_chunk(cur: sqlite3.Cursor, chunk_id: str) -> bool:
+    """Does the FTS5 index hold a document for this chunk's rowid?
+
+    ``chunks_fts_docsize`` has one row per indexed document (the same shadow
+    table the doctor's sync check counts), keyed by the source rowid. A
+    missing ``chunks`` row, a missing shadow table, or any error reads as
+    "not held" so the caller skips the delete rather than risking one.
+    """
+    try:
+        row = cur.execute(
+            "SELECT 1 FROM chunks_fts_docsize WHERE id = "
+            "(SELECT rowid FROM chunks WHERE id = ?)",
+            (chunk_id,),
+        ).fetchone()
+    except Exception:
+        return False
+    return row is not None
+
+
 def write_chunk_row(
     cur: sqlite3.Cursor,
     *,
@@ -536,6 +569,8 @@ def write_chunk_row(
     created_at: str | None,
     last_updated: str | None,
     embedding: list[float],
+    projected_hash: str | None = None,
+    projection_version: int | None = None,
 ) -> tuple[bool, bool]:
     """Write one chunk's ``chunks`` + ``chunks_vec`` + ``chunks_fts`` rows.
 
@@ -543,9 +578,33 @@ def write_chunk_row(
     whole file's chunks under one ``transaction()``). Returns ``(vec_ok,
     fts_ok)`` for per-index health. An empty ``embedding`` is the deliberate
     FTS-only path (deferred/keyword-only) and does not clear ``vec_ok``.
+
+    ``content`` is the *derived* text (the current-text projection the
+    embedder and FTS see); ``content_hash`` is over the *raw* section it was
+    derived from, and ``projected_hash`` / ``projection_version`` describe
+    the derived text. Leaving the last two ``None`` writes a row the reconcile
+    planner will re-derive on its next pass, exactly like a pre-upgrade row.
     """
     vec_ok = True
     fts_ok = True
+
+    # An existing row is about to have its ``content`` overwritten. The FTS5
+    # tokens for that row can only be removed with the ``'delete'`` command
+    # fed the values *as indexed* — i.e. the old content — so this must run
+    # before the UPDATE below, while the chunks row still holds them. Without
+    # it the old tokens stayed in the inverted index next to the new ones and
+    # a term that no longer appears in the chunk kept matching it. Only done
+    # when the FTS shadow table actually holds the rowid: a 'delete' for a
+    # document FTS never indexed is undefined behaviour.
+    if _fts_holds_chunk(cur, chunk_id):
+        try:
+            fts5_delete_chunk(cur, chunk_id)
+        except Exception as _pre_exc:
+            _store_logger.warning(
+                "palinode.store: FTS5 pre-update delete failed for %r (file=%r) — "
+                "stale tokens may linger until rebuild: %s",
+                chunk_id, file_path, _pre_exc,
+            )
 
     # H2: INSERT OR REPLACE would revert the recall columns (importance,
     # recall_count, last_recalled) — not in this column list — to defaults on
@@ -555,8 +614,9 @@ def write_chunk_row(
         """
         INSERT INTO chunks
         (id, file_path, section_id, category, content, metadata,
-         created_at, last_updated, content_hash, meta_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         created_at, last_updated, content_hash, meta_hash,
+         projected_hash, projection_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             file_path = excluded.file_path,
             section_id = excluded.section_id,
@@ -566,11 +626,14 @@ def write_chunk_row(
             created_at = excluded.created_at,
             last_updated = excluded.last_updated,
             content_hash = excluded.content_hash,
-            meta_hash = excluded.meta_hash
+            meta_hash = excluded.meta_hash,
+            projected_hash = excluded.projected_hash,
+            projection_version = excluded.projection_version
         """,
         (
             chunk_id, file_path, section_id, category, content, metadata_json,
             created_at, last_updated, content_hash, meta_hash,
+            projected_hash, projection_version,
         ),
     )
 
@@ -579,11 +642,20 @@ def write_chunk_row(
         # Deferred/keyword-only row: no vector yet. The absent chunks_vec row
         # is the exact signal reconcile.plan re-indexes on, so the row
         # converges once the embedder is reachable. Deliberate skip, not a
-        # failure: vec_ok untouched.
+        # failure: vec_ok untouched. Any vector already stored for this id
+        # described the *previous* text and must go with it — left in place
+        # it would read as "embedded" and the re-embed would never come.
         _store_logger.debug(
             "palinode.store: empty embedding for %r — chunks+FTS only, "
             "vec write deferred", chunk_id,
         )
+        try:
+            cur.execute("DELETE FROM chunks_vec WHERE id = ?", (chunk_id,))
+        except Exception as _stale_exc:
+            _store_logger.debug(
+                "palinode.store: stale chunks_vec drop skipped for %r: %s",
+                chunk_id, _stale_exc,
+            )
     else:
         emb_json = json.dumps(embedding)
         try:
@@ -665,6 +737,23 @@ def write_chunk_meta(
     cur.execute(
         "UPDATE chunks SET metadata = ?, meta_hash = ? WHERE id = ?",
         (metadata_json, meta_hash, chunk_id),
+    )
+
+
+def write_chunk_projection(
+    cur: sqlite3.Cursor, chunk_id: str, projected_hash: str, projection_version: int,
+) -> None:
+    """Stamp a chunk's projection hash and version without rewriting its text.
+
+    For a row whose stored ``content`` already equals the current projection
+    (a pre-upgrade row of a section with nothing to project out): the derived
+    text, its vector and its FTS tokens are all correct, only the stamp is
+    missing. Writing the stamp alone is what keeps the migration from
+    re-embedding a whole store.
+    """
+    cur.execute(
+        "UPDATE chunks SET projected_hash = ?, projection_version = ? WHERE id = ?",
+        (projected_hash, projection_version, chunk_id),
     )
 
 
@@ -1158,51 +1247,141 @@ def check_freshness(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     chasing a staleness that isn't there. (The frontmatter field stays on
     disk as provenance; this was its only reader.)
 
-    Returns results with added 'freshness' key: 'valid' | 'stale' | 'unknown'
+    ``freshness`` answers exactly one question — does the index agree with the
+    source file? — and it is the only question a hash can answer. A chunk whose
+    section still contains a superseded fact's tombstone is ``valid``: the index
+    faithfully reflects the file. The comparand is the **raw** section: the
+    indexer stores the current-text projection as ``chunks.content`` (see
+    :mod:`palinode.core.projection`) but keeps ``content_hash`` over the raw
+    bytes, in a separate column from ``projected_hash``, so this check never
+    compares a projected text against a source. Two further, independent questions are
+    answered alongside it, each in its own additive key, so that a matching hash
+    can never be read as the assertion being current:
+
+    ``span_integrity``
+        Whether the spans the record cites (``sources:`` quote anchors) are
+        still present verbatim in the files they cite, via the same verifier
+        ``palinode_blame`` uses. ``unanchored`` when the record cites nothing;
+        otherwise ``ok`` or the worst :class:`QuoteStatus` among its anchors
+        (``anchor_tampered`` / ``source_drifted`` / ``source_missing``).
+    ``currency``
+        Whether the assertion is still in force, from the lifecycle classifier
+        on the file's **live** frontmatter (``chunks.metadata`` can lag a
+        frontmatter-only edit) plus the chunk text: ``retired`` when the record
+        is retired or the chunk carries a retired fact tombstone, ``contested``
+        when it is in an open ``contradicts`` conflict, else the declared state,
+        ``current`` or ``unmarked``. ``currency_reason`` says which signal
+        decided (``status:archived``, ``superseded_by: …``, ``retired fact
+        text``, ``contradicts: …``, ``unmarked``, …).
+
+    Returns results with added keys:
+    ``freshness``: ``valid`` | ``stale`` | ``unknown`` (unchanged contract);
+    ``span_integrity``; ``currency``: ``current`` | ``retired`` | ``contested``
+    | ``unmarked``; ``currency_reason``.
     """
-    # Cache parsed sections per file path to avoid re-reading the same file
-    # once per result when multiple chunks come from the same file.
-    _sections_cache: dict[str, list[dict[str, str]]] = {}
+    # Cache the parsed file per path to avoid re-reading the same file once
+    # per result when multiple chunks come from the same file. ``None`` marks
+    # a file that could not be read or parsed.
+    _parsed_cache: dict[str, tuple[dict[str, Any], list[dict[str, str]]] | None] = {}
+
+    def _parsed(full_path: str) -> tuple[dict[str, Any], list[dict[str, str]]] | None:
+        if full_path not in _parsed_cache:
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    raw = f.read()
+                meta, sections = _parser.parse_markdown(raw)
+                _parsed_cache[full_path] = (meta if isinstance(meta, dict) else {}, sections)
+            except Exception:
+                _parsed_cache[full_path] = None
+        return _parsed_cache[full_path]
 
     for result in results:
         file_path = result.get("file_path", "")
         stored_hash = result.get("content_hash")
+        full_path = os.path.join(config.palinode_dir, file_path) if not os.path.isabs(file_path) else file_path
+        exists = os.path.exists(full_path)
+        parsed = _parsed(full_path) if exists else None
 
+        # (a) index/source agreement — the hash comparison, unchanged.
         if not stored_hash:
             result["freshness"] = "unknown"
-            continue
-
-        full_path = os.path.join(config.palinode_dir, file_path) if not os.path.isabs(file_path) else file_path
-        if not os.path.exists(full_path):
+        elif not exists:
             result["freshness"] = "stale"
-            continue
-
-        try:
-            if full_path not in _sections_cache:
-                with open(full_path, "r", encoding="utf-8") as f:
-                    raw = f.read()
-                _, sections = _parser.parse_markdown(raw)
-                _sections_cache[full_path] = sections
-
-            sections = _sections_cache[full_path]
+        elif parsed is None:
+            result["freshness"] = "unknown"
+        else:
             section_id = result.get("section_id", "root")
-
             # Find the section whose section_id matches this chunk.
-            matching = next((s for s in sections if s["section_id"] == section_id), None)
+            matching = next((s for s in parsed[1] if s["section_id"] == section_id), None)
             if matching is None:
                 # Section no longer exists in the file — content was removed.
                 result["freshness"] = "stale"
-                continue
+            else:
+                # Hash the section content exactly as the indexer does (fix).
+                full_hash = hashlib.sha256(matching["content"].encode()).hexdigest()
+                # Support both full (64-char) and legacy truncated (16-char) hashes.
+                current_hash = full_hash if len(stored_hash) > 16 else full_hash[:16]
+                result["freshness"] = "valid" if current_hash == stored_hash else "stale"
 
-            # Hash the section content exactly as the indexer does (fix).
-            full_hash = hashlib.sha256(matching["content"].encode()).hexdigest()
-            # Support both full (64-char) and legacy truncated (16-char) hashes.
-            current_hash = full_hash if len(stored_hash) > 16 else full_hash[:16]
-            result["freshness"] = "valid" if current_hash == stored_hash else "stale"
-        except Exception:
-            result["freshness"] = "unknown"
+        # (b) source-span integrity and (c) assertion currency, from the live
+        # file. Without one there is nothing to classify: the least-claiming
+        # value, with the reason, rather than a guess from indexed metadata.
+        if parsed is None:
+            result["span_integrity"] = "unanchored"
+            result["currency"] = "unmarked"
+            result["currency_reason"] = "source missing" if not exists else "source unreadable"
+            continue
+        meta = parsed[0]
+        result["span_integrity"] = _span_integrity(meta)
+        result["currency"], result["currency_reason"] = currency_of(
+            meta, file_path, result.get("content") or ""
+        )
 
     return results
+
+
+# Worst-first: a non-``ok`` anchor always wins, and among failures the one
+# that says the anchor itself is unusable outranks the ones about its source.
+_SPAN_STATUS_ORDER: tuple[QuoteStatus, ...] = (
+    QuoteStatus.ANCHOR_TAMPERED,
+    QuoteStatus.SOURCE_DRIFTED,
+    QuoteStatus.SOURCE_MISSING,
+    QuoteStatus.OK,
+)
+
+
+def _span_integrity(meta: dict[str, Any]) -> str:
+    """Summarise a record's ``sources:`` anchors into one ``span_integrity`` value."""
+    if not isinstance(meta.get("sources"), list):
+        return "unanchored"
+    try:
+        checks = verify_source_anchors(meta.get("sources"), config.memory_dir)
+    except Exception:
+        return "unanchored"
+    if not checks:
+        return "unanchored"
+    statuses = {c.status for c in checks}
+    return next(s.value for s in _SPAN_STATUS_ORDER if s in statuses)
+
+
+def currency_of(
+    meta: dict[str, Any], file_path: str, content: str, *, now: datetime | None = None
+) -> tuple[str, str]:
+    """``(currency, reason)`` for one chunk from its file's live frontmatter and its text.
+
+    ``now`` is the clock for ``expires_at``; ``None`` reads the wall clock.
+    """
+    elig = eligibility(meta, path=file_path, now=now)
+    if elig.retired:
+        reason = elig.reason
+        if elig.superseded_by:
+            reason = f"superseded_by: {elig.superseded_by}"
+        return "retired", reason
+    if contains_retired_fact_text(content):
+        return "retired", "retired fact text"
+    if elig.contradicts:
+        return "contested", "contradicts: " + ", ".join(elig.contradicts)
+    return elig.state, elig.reason
 
 
 def list_recent(

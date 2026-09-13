@@ -23,7 +23,12 @@ from palinode import __version__ as palinode_version
 from palinode.cli import main
 from palinode.cli.prompt import sync_plan
 from palinode.core.config import config
-from palinode.prompts import packaged_prompt_names, packaged_prompts_dir, shipped_hashes
+from palinode.prompts import (
+    packaged_prompt_names,
+    packaged_prompts_dir,
+    prompt_body_hash,
+    shipped_hashes,
+)
 
 #: What a store provisioned by an older release holds. Synthesised rather than
 #: dug out of git history: the rule under test is "the hash is in the manifest",
@@ -32,6 +37,28 @@ from palinode.prompts import packaged_prompt_names, packaged_prompts_dir, shippe
 #: history is asserted separately, below and in
 #: tests/test_packaged_prompts_match_source.py.
 _EARLIER_RELEASE = b"# Compaction Prompt\n\nAs shipped by some earlier release.\n"
+
+
+def _machine_rewritten_frontmatter(text: str) -> str:
+    """*text* with the frontmatter a store's own machinery would leave behind.
+
+    Not hypothetical: the cross-reference auto-updater and the description
+    backfill both rewrote ``specs/prompts/*.md`` in place on real stores —
+    adding ``cross_refs:`` and ``description:``, reordering the keys and
+    renormalising quoting — and left the body untouched. Rebuilt here through
+    the same round-trip (parse, add, dump) rather than by pasting a literal, so
+    what the test calls "a machine rewrite" is the shape a YAML writer produces.
+    """
+    import frontmatter
+
+    from palinode.core.parser import split_frontmatter
+
+    _, body = split_frontmatter(text)
+    metadata = dict(frontmatter.loads(text).metadata)
+    metadata["cross_refs"] = ["specs/prompts/consolidation.md"]
+    metadata["description"] = "Backfilled description for the prompt."
+    block = yaml.safe_dump(metadata, sort_keys=True, default_flow_style=False, allow_unicode=True)
+    return f"---\n{block}---\n{body}"
 
 
 @pytest.fixture()
@@ -92,11 +119,9 @@ def test_a_previous_release_copy_is_refreshed(
     store: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The case the whole command exists for: a store a release behind."""
-    from palinode.prompts import content_hash
-
     monkeypatch.setattr(
         "palinode.prompts.shipped_hashes",
-        lambda: {"compaction.md": [content_hash(_EARLIER_RELEASE)]},
+        lambda: {"compaction.md": [prompt_body_hash(_EARLIER_RELEASE.decode())]},
     )
     stale = _prompts(store) / "compaction.md"
     stale.write_bytes(_EARLIER_RELEASE)
@@ -117,6 +142,117 @@ def test_the_real_manifest_keeps_more_than_the_current_hash(store: Path) -> None
     edited and `sync` would never touch it again.
     """
     assert len(shipped_hashes()["compaction.md"]) > 1
+
+
+# ---------------------------------------------------------------------------
+# The verdicts are about the body, not the file
+# ---------------------------------------------------------------------------
+
+
+def test_machine_rewritten_frontmatter_is_not_an_edit(store: Path) -> None:
+    """A store rewrites its own prompt frontmatter; that is not operator tuning.
+
+    Every store whose watcher ran while the cross-reference updater still
+    touched ``specs/prompts`` is in this state: same body, different bytes. A
+    whole-file hash called all nine prompts edited, which made the upgrade
+    procedure "run `--force`" — the command that discards real edits — in
+    response to a machine's own bookkeeping.
+    """
+    for name in packaged_prompt_names():
+        packaged = (packaged_prompts_dir() / name).read_text(encoding="utf-8")
+        (_prompts(store) / name).write_text(
+            _machine_rewritten_frontmatter(packaged), encoding="utf-8"
+        )
+
+    rewritten = (_prompts(store) / "compaction.md").read_bytes()
+    assert rewritten != (packaged_prompts_dir() / "compaction.md").read_bytes()
+
+    assert set(_actions(store).values()) == {"unchanged"}
+
+
+def test_machine_rewritten_frontmatter_on_an_older_body_is_refreshed(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dogfood case end to end: a release behind *and* frontmatter-rewritten."""
+    stale_text = _machine_rewritten_frontmatter(
+        f"---\nversion: 1\nactive: true\n---\n{_EARLIER_RELEASE.decode()}"
+    )
+    monkeypatch.setattr(
+        "palinode.prompts.shipped_hashes",
+        lambda: {"compaction.md": [prompt_body_hash(_EARLIER_RELEASE.decode())]},
+    )
+    stale = _prompts(store) / "compaction.md"
+    stale.write_text(stale_text, encoding="utf-8")
+
+    assert _actions(store)["compaction.md"] == "refreshed"
+
+    result = _sync()
+
+    assert result.exit_code == 0, result.output
+    assert stale.read_bytes() == (packaged_prompts_dir() / "compaction.md").read_bytes()
+
+
+def test_one_changed_body_line_is_still_an_edit(store: Path) -> None:
+    """The other half of the contract: body changes are the operator's.
+
+    Minimal on purpose — one line inside an otherwise pristine copy, with the
+    frontmatter left alone. This is what a tuned prompt looks like, and it must
+    survive a `sync` that no longer cares about frontmatter at all.
+    """
+    packaged = (packaged_prompts_dir() / "compaction.md").read_text(encoding="utf-8")
+    lines = packaged.splitlines(keepends=True)
+    body_start = next(
+        i for i, line in enumerate(lines) if i > 1 and line.strip() == "---"
+    ) + 1
+    lines[body_start + 1] = "MY OWN INSTRUCTION TO THE MODEL.\n"
+    edited = _prompts(store) / "compaction.md"
+    edited.write_text("".join(lines), encoding="utf-8")
+
+    assert _actions(store)["compaction.md"] == "kept-edited"
+
+    result = _sync()
+
+    assert result.exit_code == 0, result.output
+    assert "MY OWN INSTRUCTION TO THE MODEL." in edited.read_text(encoding="utf-8")
+
+    forced = _sync("--force")
+
+    assert forced.exit_code == 0, forced.output
+    assert edited.read_text(encoding="utf-8") == packaged
+
+
+def test_a_manifest_from_the_whole_file_era_is_refused(
+    store: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wrong-domain hashes must abort, not quietly match nothing.
+
+    A manifest without ``hash_domain: body`` lists whole-file hashes. Compared
+    against body hashes they match nothing, and "nothing matches" is this
+    command's phrase for "you edited every prompt" — advice to `--force`, which
+    is the one destructive thing it can do.
+    """
+    from palinode.prompts import PromptCatalogueUnsupported
+
+    package = tmp_path / "packaged"
+    package.mkdir()
+    for source in packaged_prompts_dir().glob("*.md"):
+        (package / source.name).write_bytes(source.read_bytes())
+    (package / "shipped-hashes.json").write_text(
+        json.dumps({"schema": 1, "prompts": {"compaction.md": ["0" * 64]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("palinode.prompts.packaged_prompts_dir", lambda: package)
+
+    with pytest.raises(PromptCatalogueUnsupported) as caught:
+        sync_plan(_prompts(store))
+
+    assert "hash_domain" in str(caught.value)
+    assert "body" in str(caught.value)
+
+    result = _sync()
+
+    assert result.exit_code != 0
+    assert "hash_domain" in result.output
 
 
 # ---------------------------------------------------------------------------

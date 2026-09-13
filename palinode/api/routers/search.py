@@ -7,7 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from palinode.core import store, embedder
 from palinode.core.config import config
-from palinode.core.parity import CATEGORIES, MEMORY_TYPES, TIERS
+from palinode.core.parity import CATEGORIES, MEMORY_TYPES, RESOLVE_MODES, TIERS
 from palinode.core.path_guard import to_rel_path
 from palinode.api._util import _retrieval_logger, _safe_500
 from palinode.api.rate_limit import _RATE_LIMIT_SEARCH, _check_rate_limit
@@ -167,6 +167,76 @@ class SearchRequest(BaseModel):
     # ADR-007 §3.2: session id for per-(chunk, session) nudge deduplication. When
     # provided, importance is reinforced at most once per memory per session.
     session_id: str | None = None
+    # Bounded evidence resolution around each hit (palinode.core.evidence):
+    # "linked" follows superseded_by / contradicts / backed_by both ways under
+    # fixed budgets; "full" adds bounded unlinked discovery. Each hit gains an
+    # `evidence` block with its own `coverage`, and a `resolution` block
+    # (palinode.core.resolution) saying whether a record stands, the sides are
+    # contested, or the evidence is insufficient. Omitted / "none" attaches
+    # nothing, so an ordinary request stays byte-identical.
+    resolve: Literal[*RESOLVE_MODES] | None = None
+    # Delivery-receipt transport. `/search` returns a bare JSON array and that
+    # is a frozen contract, so the receipt cannot simply become a top-level
+    # key: with `receipt=true` the response is
+    # ``{"results": [...], "receipt": {...}}``, and the `results` array is
+    # byte-identical to what the same request returns without the flag. Omitted
+    # → today's array, unchanged for every existing caller. Deliberately not a
+    # canonical parity param: the *capability* (a delivery receipt) is on every
+    # surface, this flag is the REST envelope opt-in, like the `ps` shortcut.
+    # The receipt itself is built and logged either way.
+    receipt: bool | None = None
+
+
+def _attach_evidence(results: list[dict[str, Any]], req: "SearchRequest", chain) -> None:
+    """Opt-in evidence closure over the final hit list, plus the resolution it
+    supports. Read-only; additive.
+
+    The resolution block is decided here, once, and rendered by every surface
+    — so the MCP, CLI and REST readings of one hit cannot disagree about
+    whether a record stands, is contested, or is unknown.
+    """
+    if req.resolve and req.resolve != "none" and results:
+        from palinode.core.evidence import attach_evidence
+        from palinode.core.resolution import attach_resolution
+
+        evidence = attach_evidence(results, mode=req.resolve, chain=chain)
+        attach_resolution(results, evidence)
+
+
+def _build_receipt(results: list[dict[str, Any]], req: "SearchRequest", chain):
+    """The delivery receipt for this response (:mod:`palinode.core.receipt`).
+
+    Built from the rows as they are about to be returned — their exact source
+    revisions, currency/freshness, and the evidence/resolution blocks already
+    attached — so it costs no lookup of its own. Always built: the receipt is
+    what the retrieval log records, whether or not the caller asked for it back.
+    """
+    from palinode.core.receipt import build_receipt
+
+    return build_receipt(
+        results,
+        request=req.model_dump(exclude_none=True),
+        scope=chain.as_list() if chain is not None else (),
+        resolve_mode=req.resolve or "none",
+        surface="search",
+        memory_dir=config.memory_dir,
+    )
+
+
+def _delivery(results: list[dict[str, Any]], req: "SearchRequest", receipt):
+    """Shape the response: today's bare array, or the receipt envelope.
+
+    With ``resolve`` on, the envelope carries the receipt's **public** view —
+    refs, exact revisions, dispositions, lineage, coverage, scope, times; never
+    memory content and never the caller's query. With ``resolve`` off there is
+    no evidence to qualify, so it carries only the two-field reference
+    (``bundle_id`` + ``evaluated_at``): enough to correlate the response with
+    the logged delivery without growing an ordinary response.
+    """
+    if not req.receipt:
+        return results
+    view = receipt.public() if (req.resolve and req.resolve != "none") else receipt.reference()
+    return {"results": results, "receipt": view}
 
 
 class SearchAssociativeRequest(BaseModel):
@@ -233,8 +303,10 @@ class TopicCoverageRequest(BaseModel):
     min_similarity: float | None = 0.78
 
 
-@router.post("/search")
-def search_api(req: SearchRequest, request: Request = None) -> list[dict[str, Any]]:
+@router.post("/search", response_model=None)
+def search_api(
+    req: SearchRequest, request: Request = None
+) -> list[dict[str, Any]] | dict[str, Any]:
     """Semantic vector search against cached `.palinode.db` chunks.
 
     Empty query routes to recency-only mode: returns the most recent
@@ -242,7 +314,10 @@ def search_api(req: SearchRequest, request: Request = None) -> list[dict[str, An
     `since_days`. Skips embedding entirely.
 
     Returns:
-        list[dict[str, Any]]: List payload sequence matching the criteria boundaries.
+        list[dict[str, Any]]: List payload sequence matching the criteria
+        boundaries — or, when ``receipt=true``, ``{"results": [...],
+        "receipt": {...}}`` with that same list under ``results`` and the
+        delivery receipt (:mod:`palinode.core.receipt`) beside it.
 
     # Security audit (I2, 2026-04-30):
     # - All SQL goes through store.search / store.search_hybrid /
@@ -301,7 +376,8 @@ def search_api(req: SearchRequest, request: Request = None) -> list[dict[str, An
             _enrich_with_snippets(recent, "", _resolve_snippet_max_chars(req.max_chars))
             _apply_tier(recent, req.tier)
             _enrich_with_rel_path(recent)
-            return recent
+            _attach_evidence(recent, req, scope_chain)
+            return _delivery(recent, req, _build_receipt(recent, req, scope_chain))
 
         # ADR-008: Augment query with project context before embedding
         embed_query = req.query
@@ -442,14 +518,24 @@ def search_api(req: SearchRequest, request: Request = None) -> list[dict[str, An
                 _search_source = "palinode_search"
             elif hdr == "cli":
                 _search_source = "cli_search"
+        # Evidence closure runs over the final hit list, after truncation: a
+        # linked correction rides on its seed's `evidence` block, so no top-k
+        # window can keep the stale record and cut off what corrects it.
+        _attach_evidence(final, req, scope_chain)
+        receipt = _build_receipt(final, req, scope_chain)
+        # The retrieval log is written last so each row carries the receipt
+        # this delivery produced (bundle, policy, scope, revision,
+        # disposition, coverage). The *set* of logged rows is unchanged — the
+        # plain hit list, never the evidence gathered around it.
         _retrieval_logger.record_search_results(
             final,
             query=req.query,
             source=_search_source,
             mode=recall_mode,
             session_id=req.session_id,
+            receipt=receipt,
         )
-        return final
+        return _delivery(final, req, receipt)
     except embedder.EmbeddingInputError:
         raise  # typed 422 via the app-level handler in server.py
     except embedder.EmbeddingUnavailable:

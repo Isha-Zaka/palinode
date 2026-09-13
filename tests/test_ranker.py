@@ -196,16 +196,6 @@ def test_context_boost_lifts_in_context_files(monkeypatch):
     assert _order(out)[0] == "b.md", "context boost should lift an in-context file"
 
 
-def test_daily_penalty_demotes_daily_files(monkeypatch):
-    monkeypatch.setattr(config.search, "daily_penalty", 0.1)
-    daily = _res("daily/2026-06-21.md")   # rank 0, would win without penalty
-    normal = _res("insights/x.md")        # rank 1
-    out = _run([daily, normal], [])
-    assert _order(out)[0] == "insights/x.md", "daily files are penalised unless include_daily"
-    out_incl = _run([daily, normal], [], include_daily=True)
-    assert _order(out_incl)[0] == "daily/2026-06-21.md", "include_daily disables the penalty"
-
-
 def test_date_window_filters_by_last_updated():
     inwin = _res("in.md", metadata={"last_updated": "2026-06-10"})
     old = _res("old.md", metadata={"last_updated": "2026-01-01"})

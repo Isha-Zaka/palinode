@@ -114,6 +114,28 @@ def test_memory_search_returns_hits(client):
     assert "/ui/memory/decisions/searchme" in html
 
 
+def test_memory_search_labels_agreement_separately_from_currency(client):
+    """A file carrying a superseded fact's tombstone: the index is derived from
+    the projected text, so the hit shows the successor only, still matches its
+    source (the raw hash), and no badge reads as currency or verification."""
+    tombstone = (
+        "# Endpoint\n\n"
+        "- ~~Use endpoint A.~~ [superseded 2026-09-12] <!-- fact:endpoint -->\n"
+        "- Use endpoint B. <!-- fact:supersedes-endpoint -->\n"
+    )
+    _seed(client, slug="endpoint", content=tombstone)
+    with patch("palinode.core.embedder.embed", return_value=_FAKE_VECTOR):
+        res = client.get("/ui/memory?q=endpoint")
+    assert res.status_code == 200
+    html = res.text
+    assert "decisions/endpoint.md" in html
+    assert "Use endpoint B." in html
+    assert "Use endpoint A." not in html
+    assert "index matches source" in html
+    assert "⚠ retired" not in html
+    assert "verified" not in html.lower()
+
+
 def test_memory_search_degrades_when_embedder_down(client):
     """A search backend failure renders a soft banner, never a 500."""
     _seed(client, slug="x", content="# X\n\nbody")

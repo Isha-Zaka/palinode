@@ -121,7 +121,7 @@ Fix is by restart, not by data motion: `systemctl --user restart palinode-api`. 
 
 #### `watcher_alive`
 
-On Linux, prefers `systemctl --user is-active palinode-watcher.service` and falls back to scanning `ps -ef` for a process whose command line contains `palinode.indexer.watcher`. On macOS, only the `ps` scan is available because Palinode does not currently ship a launchd unit.
+On Linux, probes `systemctl is-active` on the **system** manager first and `systemctl --user is-active` second, accepting either shipped unit name — `palinode-watcher.service` (the `deploy/systemd/` default) or `palinode-indexer.service` (the installer's `WATCHER_UNIT_NAME` override, which the check also honours when it is exported) — and names the manager and unit that answered. It falls back to scanning `ps -ef` for a process whose command line contains `palinode.indexer.watcher`, and only suggests installing a unit when no unit is active under either manager. On macOS, only the `ps` scan is available because Palinode does not currently ship a launchd unit.
 
 #### `watcher_indexes_correct_db`
 
@@ -205,6 +205,7 @@ Tagged `fast`: one directory glob plus a bounded read of the recent daily notes,
 | `chunks_match_md_count` | warn (error if ratio < 0.5) | Partial reindex, fresh empty DB, or watcher stopped early |
 | `db_size_sanity` | warn | DB has shrunk by >50% since last doctor run (the phantom-empty-DB signature) |
 | `reindex_in_progress` | info / warn | A reindex is currently running (or appears stuck) |
+| `projection_current` | warn | Indexed chunks still derived under an older current-text projection (or none) — retired facts can still rank |
 
 #### `chunks_match_md_count`
 
@@ -230,12 +231,22 @@ Queries the API's `/status` endpoint and reports whether a reindex is running. S
 
 This check is also load-bearing as context for `chunks_match_md_count`: a low chunk count during an active reindex is normal, not a fault.
 
+#### `projection_current`
+
+The indexer derives each chunk's search text through a versioned current-text projection that removes the consolidation executor's retirement tombstones (`~~old~~ [superseded …]` / `[RETRACTED …]`) before FTS5 and the embedder see it, and stamps the row with the `PROJECTION_VERSION` it used. This check opens the DB read-only and counts chunks whose stamp is missing or older. Tagged `fast`.
+
+- Pass: every indexed chunk is on the current projection version (or the store is empty / not yet initialised). The count is reported.
+- Warn: some chunks are behind — a store indexed before the projection existed, or before a rules change. Those chunks still carry retired wording in the keyword and vector index, so an old assertion can rank beside its successor. Reconcile re-derives them as their files are visited (a save, the watcher, `palinode reindex`), so the number is migration progress; a chunk whose stored text already equals its projection is stamped in place without re-embedding. A schema without the column at all (the API has not started since the upgrade) reports every chunk behind.
+
+Remediation: `palinode reindex` finishes the migration in one pass. If the embedder is cold, rows are re-derived keyword-searchable first and re-embedded on the next warm pass — the same deferral the save path reports.
+
 ### Disk and backup
 
 | Check | Severity | Catches |
 |---|---|---|
 | `git_commit_ready` | warn | `git.auto_commit` is on but `memory_dir` is not a git repo, or no commit identity resolves there — every save reports `git_committed: false` |
 | `git_remote_health` | warn | Memory store has no offsite backup, or unpushed drift > 50 commits |
+| `store_tree_clean` | warn | More than 10 modified or untracked files in `memory_dir` — a writer is skipping its commit |
 | `audit_log_writable` | warn | `audit.log_path` is relative (logs scatter across cwds) or unwritable |
 
 #### `git_commit_ready`
@@ -253,6 +264,25 @@ Runs `git -C ${memory_dir} ls-remote origin HEAD` with an 8s timeout. Tagged `de
 - Pass: remote reachable; reports unpushed commit count.
 - Warn: remote unreachable (DNS, SSH key, URL, transient network) or unpushed count > 50.
 - Info: `memory_dir` is not a git repo, or has no remote configured. This is not a failure — offline-only stores are valid — but the check surfaces the absence of an offsite backup channel as a forward-looking risk.
+
+#### `store_tree_clean`
+
+Runs `git -C ${memory_dir} status --porcelain --untracked-files=all` and counts modified and untracked files. Tagged `fast` (local, no network).
+
+- Pass: the tree is clean, or has at most 10 uncommitted files (an operator's in-progress config edit is not drift). The count is reported either way.
+- Warn: more than 10 uncommitted files. Every store write is supposed to commit with provenance, so a growing count means some writer is skipping its commit. `git status` stops being a "what changed" signal, and a `git checkout` or `git stash` would discard the drift.
+- Info: `memory_dir` is not a git repository, or git is unavailable.
+
+The complement to `git_remote_health`, which counts unpushed *commits* and says nothing about uncommitted *files*. The case that motivated it: the deferred description backfill wrote frontmatter without committing for two weeks, 572 files, on a store whose doctor was otherwise green.
+
+To commit an existing backlog in one step on a live store:
+
+```bash
+git -C "$PALINODE_DIR" add -A -- people projects decisions insights research inbox daily
+git -C "$PALINODE_DIR" commit -m "palinode: commit uncommitted store writes"
+```
+
+Then re-run doctor. If the count climbs again, find the writer: every store write must go through `palinode.core.git_tools`.
 
 #### `audit_log_writable`
 

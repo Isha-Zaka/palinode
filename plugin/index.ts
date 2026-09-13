@@ -35,6 +35,11 @@ const PALINODE_TIERS = [
   "overview",
   "full",
 ] as const;
+const PALINODE_RESOLVE_MODES = [
+  "none",
+  "linked",
+  "full",
+] as const;
 
 function literalUnion(
   values: readonly string[],
@@ -459,6 +464,15 @@ const palinodePlugin = {
                 "for the default snippet view.",
             }),
           ),
+          resolve: Type.Optional(
+            literalUnion(PALINODE_RESOLVE_MODES, {
+              description:
+                "Attach evidence around each hit: linked (follow superseded_by / " +
+                "contradicts / backed_by both ways under fixed budgets) or full " +
+                "(also bounded unlinked discovery). Each hit reports coverage. " +
+                "Default none.",
+            }),
+          ),
         }),
         async execute(_toolCallId: string, params: any) {
           try {
@@ -476,6 +490,7 @@ const palinodePlugin = {
             if (params.min_priority !== undefined) body.min_priority = params.min_priority;
             if (params.include_telemetry !== undefined) body.include_telemetry = params.include_telemetry;
             if (params.tier !== undefined) body.tier = params.tier;
+            if (params.resolve !== undefined && params.resolve !== "none") body.resolve = params.resolve;
             const results = await palinodeFetch(
               cfg.palinodeApiUrl,
               "/search",

@@ -62,9 +62,14 @@ def _output_example() -> str:
     return blocks[0]
 
 
-def test_prompt_declares_version_3() -> None:
-    """`palinode doctor` and `prompt sync` compare on this number."""
-    assert frontmatter.load(SOURCE_PROMPT).metadata["version"] == 3
+def test_prompt_declares_a_version_at_or_past_3() -> None:
+    """`palinode doctor` and `prompt sync` compare on this number.
+
+    v3 introduced implicit KEEP; later versions keep that contract (asserted
+    below) and bump the number. The exact current version is pinned in
+    ``test_prompt_op_vocabulary.py``.
+    """
+    assert frontmatter.load(SOURCE_PROMPT).metadata["version"] >= 3
 
 
 def test_output_example_proposes_no_keep() -> None:
@@ -80,7 +85,7 @@ def test_output_example_is_valid_json_with_only_changing_ops() -> None:
     ops = json.loads(_output_example())
     kinds = {op["op"] for op in ops}
     assert kinds == {
-        "UPDATE", "MERGE", "SUPERSEDE", "ARCHIVE", "RETRACT",
+        "UPDATE", "MERGE", "SUPERSEDE", "ARCHIVE", "ARCHIVE_BEFORE", "RETRACT",
         "PROPOSE_CONTRADICTS",
     }
 
@@ -111,19 +116,23 @@ def test_keep_stays_in_the_vocabulary_as_accepted_but_never_required() -> None:
     assert "Never emit one" in text
 
 
-@pytest.mark.parametrize("rule", [
-    "**Never contradict an ACTIVE_DECISION.**",
-    "**Conflict with no winner → PROPOSE_CONTRADICTS, never SUPERSEDE or ARCHIVE.**",
-    "**`contradicts` takes memory refs, not fact ids.**",
-    "**Include rationale.**",
+@pytest.mark.parametrize("number,rule", [
+    (7, "**Include rationale.**"),
+    (8, "ACTIVE_DECISION"),
+    (9, "**Conflict with no winner → PROPOSE_CONTRADICTS, never SUPERSEDE or ARCHIVE.**"),
+    (10, "memory refs, not fact ids"),
 ])
-def test_v3_changes_output_volume_not_judgment(rule: str) -> None:
-    """Rules 7/8/9/10 are unchanged, and keep their numbers.
+def test_v3_changes_output_volume_not_judgment(number: int, rule: str) -> None:
+    """Rules 7/8/9/10 keep their numbers and their subjects.
 
-    The open issue that measures rule 8/9 behaviour cites them by number, so
-    renumbering would silently retarget it.
+    The issue that measures rule 8/9 behaviour cites them by number, so
+    renumbering would silently retarget it. v4 rewords 8 and 9 (a later
+    observation is the PROPOSE_CONTRADICTS case); the numbers stay.
     """
-    assert rule in _prompt_text()
+    rules = _prompt_text().split("## Rules", 1)[1].split("## Output Format", 1)[0]
+    match = re.search(rf"^{number}\. (.*?)(?=^\d+\. |\Z)", rules, re.MULTILINE | re.DOTALL)
+    assert match, f"rule {number} is missing"
+    assert rule in match.group(1)
 
 
 def test_rules_are_still_numbered_one_through_ten() -> None:
@@ -149,6 +158,11 @@ def seeded_store(tmp_path, monkeypatch) -> Path:
     """
     monkeypatch.setattr(config, "memory_dir", str(tmp_path))
     monkeypatch.setattr(config.git, "auto_commit", False)
+    # The deterministic age sweep is off for this module: its subject is
+    # what the *model* proposes and what the writer does with it, and a
+    # fixture dated months back would otherwise be retired by age before
+    # the proposal is ever read. The sweep has its own tests.
+    monkeypatch.setattr(config.consolidation, "status_log_retention_days", 0)
     for sub in ("projects", "daily", "specs/prompts"):
         (tmp_path / sub).mkdir(parents=True, exist_ok=True)
 

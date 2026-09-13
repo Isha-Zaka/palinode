@@ -191,14 +191,18 @@ def test_empty_array_is_a_successful_no_op(store):
     assert "failed_projects" not in result
 
 
-def test_empty_array_still_leaves_unconsolidated_notes_alone(store):
-    """Nothing compacted → nothing archived, which is pre-existing behaviour."""
+def test_empty_array_retires_the_notes_the_model_saw(store):
+    """A group that reached the model and proposed nothing is a decision: its
+    notes retire, and the group is named in the summary rather than vanishing.
+    (Previously nothing compacted meant nothing archived — a quiet store never
+    drained ``daily/``.)"""
     memory_dir, note = store
 
     result = runner.run_consolidation(llm_fn=_returning(EMPTY))
 
-    assert note.exists()
-    assert result["notes_archived"] == 0
+    assert not note.exists()
+    assert result["notes_archived"] == 1
+    assert result["projects_no_ops"] == ["alpha"]
 
 
 def test_real_operations_still_apply(store):

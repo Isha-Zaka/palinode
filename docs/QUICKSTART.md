@@ -194,6 +194,9 @@ Two consequences worth knowing:
 - A release that changes a prompt does not change *your* copy. `palinode doctor`
   reports the gap (`prompts_current`) and `palinode prompt sync` closes it,
   replacing only the files you have not edited.
+- They are config, not memory. Nothing under `specs/` is listed by `/list` or
+  injected at session start, browsable in the UI, reviewed, primed, propagated
+  to, or indexed for search — edit them with an editor or `palinode prompt`.
 
 ## Ports & Services
 

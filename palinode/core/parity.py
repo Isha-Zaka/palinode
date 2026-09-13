@@ -225,6 +225,28 @@ TIERS: tuple[str, ...] = (
     "full",
 )
 
+#: The canonical evidence-resolution enum on search — how much of the
+#: evidence around each hit to gather (``palinode.core.evidence``). ``none``
+#: is what every surface does when the caller says nothing; ``linked``
+#: follows the typed links both ways under fixed budgets; ``full`` adds
+#: bounded unlinked discovery. Read-only on every surface.
+RESOLVE_MODES: tuple[str, ...] = (
+    "none",
+    "linked",
+    "full",
+)
+
+#: The canonical intent enum on the bounded-resolution operation — what the
+#: caller is asking the store to answer. ``current_state`` is the only value
+#: and every surface defaults to it; the field exists so an as-of / known-at
+#: question has somewhere to land once the temporal-assertion work defines
+#: those semantics. Until then no surface advertises them, because a
+#: parameter a caller can pass and the resolver cannot honour is worse than
+#: the absence of one.
+RESOLVE_INTENTS: tuple[str, ...] = (
+    "current_state",
+)
+
 #: The canonical prompt-task enum.  Single source replacing the duplicate
 #: ``"enum"`` keys at ``palinode/mcp.py:624-625``. ADR-010, finding.
 PROMPT_TASKS: tuple[str, ...] = (
@@ -300,6 +322,9 @@ REGISTRY: tuple[Operation, ...] = (
             # How much of each hit to render. Omitted → unchanged
             # behaviour (snippet + content), so tiering is opt-in.
             CanonicalParam(name="tier", type="string", enum=TIERS),
+            # Bounded evidence resolution around each hit. Omitted → no
+            # traversal, so an ordinary request stays byte-identical.
+            CanonicalParam(name="resolve", type="string", enum=RESOLVE_MODES),
         ),
         cli_command="search",
         mcp_tool="palinode_search",
@@ -530,6 +555,38 @@ REGISTRY: tuple[Operation, ...] = (
         api_endpoint=("POST", "/context/prime"),
         known_drift={},
     ),
+    # ── resolve (bounded resolution) ────────────────────────────────────────
+    # The canonical "what stands right now?" operation: seeds, bounded
+    # evidence, the resolution policy, and a budgeted, conflict-preserving
+    # bundle. `query` and `ref` are the two ways in and neither is required on
+    # its own — the operation requires one of them, which no per-param
+    # `required` flag can express, so both are optional here and the surfaces
+    # reject a request carrying neither.
+    #
+    # No `plugin_tool`: the plugin surface is opt-in (ADR-019), and the first
+    # plugin consumer of this operation is a *delivery adapter* — the per-turn
+    # recall path in `plugins/core`, which calls POST /resolve and injects the
+    # rendered bundle. That is not a tool contract, so registering one would
+    # claim an obligation that does not exist.
+    Operation(
+        name="resolve",
+        canonical_params=(
+            CanonicalParam(name="query", type="string"),
+            CanonicalParam(name="ref", type="string"),
+            CanonicalParam(name="context", type="array"),
+            CanonicalParam(
+                name="intent",
+                type="string",
+                enum=RESOLVE_INTENTS,
+            ),
+            CanonicalParam(name="max_items", type="integer"),
+            CanonicalParam(name="max_chars", type="integer"),
+        ),
+        cli_command="resolve",
+        mcp_tool="palinode_resolve",
+        api_endpoint=("POST", "/resolve"),
+        known_drift={},
+    ),
     # ── blame ───────────────────────────────────────────────────────────────
     Operation(
         name="blame",
@@ -588,7 +645,7 @@ REGISTRY: tuple[Operation, ...] = (
     ),
     # ── lint ──────────────────────────────────────────────────────────
     # Registered for the propose parameter — the finding→operation half of the
-    # detect/propose/dispose loop, which has to read the same on every surface
+    # lint review/apply flow, which has to read the same on every surface
     # or an agent and an operator disagree about what lint offers.
     #
     # `apply` is deliberately NOT a canonical param. It is the human gate on a

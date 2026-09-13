@@ -169,6 +169,62 @@ def test_unparseable_state_file_falls_back_to_running(memory_dir):
     assert activity_gate.evaluate("weekly").should_run is True
 
 
+# ── The cadence boundary ─────────────────────────────────────────────────────
+#
+# A daily cron against a 24 h minimum. The elapsed values elsewhere in this
+# file (1, 11, 30, 48, 169, 200 h) never sit near the floor, which is exactly
+# where the dogfood store's nightly went every-other-night.
+
+
+def test_runs_just_under_the_floor(memory_dir):
+    """23.9 h with sessions to spare: a daily tick is a daily tick."""
+    now = datetime.now(UTC)
+    _record_last_run(memory_dir, now - timedelta(hours=23.9), mode="nightly")
+    _write_sessions(memory_dir, [now - timedelta(hours=n) for n in (1, 2, 3, 4, 5, 6)])
+
+    decision = activity_gate.evaluate("nightly", now=now)
+
+    assert decision.should_run is True
+    assert decision.reason == "6 sessions / 5, 24 h / 24 h"
+
+
+def test_runs_at_exactly_the_cadence_after_a_slow_prior_pass(memory_dir):
+    """The dogfood case: yesterday's 11:00Z tick spent 62 s in the LLM and
+    stamped 11:01:02Z; today's 11:00Z tick sees 23.98 h. It must run."""
+    now = datetime.now(UTC)
+    _record_last_run(memory_dir, now - timedelta(hours=24) + timedelta(seconds=62), mode="nightly")
+    _write_sessions(memory_dir, [now - timedelta(hours=n) for n in (1, 2, 3, 4, 5)])
+
+    decision = activity_gate.evaluate("nightly", now=now)
+
+    assert decision.should_run is True
+    assert decision.hours_since_last_run < 24.0
+
+
+def test_slack_is_one_hour_not_unbounded(memory_dir):
+    now = datetime.now(UTC)
+    _record_last_run(memory_dir, now - timedelta(hours=22), mode="nightly")
+    _write_sessions(memory_dir, [now - timedelta(hours=n) for n in (1, 2, 3, 4, 5)])
+
+    decision = activity_gate.evaluate("nightly", now=now)
+
+    assert decision.should_run is False
+    assert decision.reason == "deferred: 5 sessions / 5, 22 h / 24 h"
+
+
+def test_ceiling_has_no_slack(memory_dir):
+    """The slack is on the floor only: half an hour short of the ceiling with
+    no sessions is still a deferral."""
+    now = datetime.now(UTC)
+    _record_last_run(memory_dir, now - timedelta(hours=167.5))
+
+    decision = activity_gate.evaluate("weekly", now=now)
+
+    assert decision.should_run is False
+    assert decision.sessions_since_last_run == 0
+    assert "ceiling" not in decision.reason
+
+
 # ── Recording a run ──────────────────────────────────────────────────────────
 
 
@@ -219,6 +275,68 @@ def test_nightly_run_records_only_the_nightly_clock(memory_dir):
 
     state = json.loads(activity_gate.state_path().read_text(encoding="utf-8"))
     assert set(state["modes"]) == {"nightly"}
+
+
+def test_recorded_run_is_stamped_at_the_start_not_the_end(memory_dir, monkeypatch):
+    """Yesterday's stamp must be the tick that fired the pass, not a minute
+    later — otherwise today's tick is always a minute short."""
+    start = datetime(2026, 9, 11, 11, 0, 1, tzinfo=UTC)
+    clock = {"now": start}
+    monkeypatch.setattr(activity_gate, "_utc_now", lambda: clock["now"])
+
+    def slow_pass(**kwargs):
+        # The 62 s the dogfood pass spent in the LLM call.
+        clock["now"] = start + timedelta(seconds=62)
+        return {"status": "success", "projects_failed": 0, "projects_compacted": 1}
+
+    monkeypatch.setattr(runner, "_run_nightly_unlocked", slow_pass)
+
+    runner.run_nightly()
+
+    state = json.loads(activity_gate.state_path().read_text(encoding="utf-8"))
+    assert state["modes"]["nightly"]["last_run_at"] == _iso(start)
+
+
+def _partial_pass_store(memory_dir: Path) -> None:
+    """One tagged project and one note that names it; with a prose-only LLM
+    reply the runner counts the group as failed and returns ``partial``
+    without raising — the shape the dogfood store produced on 2026-09-11."""
+    (memory_dir / "projects").mkdir()
+    (memory_dir / "specs" / "prompts").mkdir(parents=True)
+    for prompt in ("compaction.md", "nightly-consolidation.md"):
+        (memory_dir / "specs" / "prompts" / prompt).write_text(
+            "Return consolidation operations as a JSON array.\n", encoding="utf-8"
+        )
+    (memory_dir / "projects" / "alpha.md").write_text(
+        "---\nid: projects-alpha\ncategory: project\n---\n\n# alpha\n\n"
+        "- [2026-06-01] Old alpha fact. <!-- fact:a1 -->\n",
+        encoding="utf-8",
+    )
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    (memory_dir / "daily" / f"{today}-alpha.md").write_text(
+        "---\nid: alpha\ncategory: daily\n---\n\nWorked on project/alpha today.\n",
+        encoding="utf-8",
+    )
+
+
+def test_partial_run_does_not_reset_the_counters(memory_dir, caplog):
+    now = datetime.now(UTC)
+    _record_last_run(memory_dir, now - timedelta(hours=30), mode="nightly")
+    _partial_pass_store(memory_dir)
+    before = activity_gate.evaluate("nightly", now=now)
+
+    def prose_only(system_prompt: str, user_prompt: str) -> tuple[str, str]:
+        return "I need more context before I can decide.", "fake-model"
+
+    with caplog.at_level(logging.INFO, logger="palinode.consolidation"):
+        result = runner.run_nightly(llm_fn=prose_only)
+
+    assert result["status"] == "partial"
+    assert result["projects_failed"] == 1
+    after = activity_gate.evaluate("nightly", now=now)
+    assert after.last_run_at == before.last_run_at
+    assert "nightly pass was partial" in caplog.text
+    assert "alpha" in caplog.text
 
 
 # ── The cron entry point ─────────────────────────────────────────────────────

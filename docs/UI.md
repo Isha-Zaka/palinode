@@ -102,6 +102,14 @@ therefore needs an index and reachable embedding backend. If that backend is
 unavailable, the page keeps working and displays a `search unavailable`
 notice instead of failing the whole view.
 
+Each search hit shows two labels the browse list does not: `index matches
+source` / `⚠ index stale` (whether the indexed chunk still agrees with the file
+— a different question from the list's age-based `fresh` / `aging` / `stale`)
+and, when there is something to warn about, `⚠ retired: …` or `⚠ contested`
+(whether the assertion is still in force). Agreement never implies currency: a
+chunk that still holds a superseded fact's struck-through text matches its
+source and is labelled retired.
+
 ### Fact detail and provenance
 
 Selecting a memory renders its Markdown body and useful frontmatter fields,
