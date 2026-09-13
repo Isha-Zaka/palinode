@@ -44,6 +44,7 @@ from typing import Any, Callable, Deque
 
 import httpx
 
+from palinode.core.auth import load_embedding_api_key
 from palinode.core.config import config
 
 logger = logging.getLogger(__name__)
@@ -679,6 +680,7 @@ class OllamaClient:
         model: str | None,
         op: str,
         base_url: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """POST ``payload`` to ``{role_url}{path}``, returning parsed JSON.
 
@@ -711,7 +713,12 @@ class OllamaClient:
         for attempt in range(max_retries + 1):
             t0 = self._monotonic()
             try:
-                resp = self._client.post(url, json=payload, timeout=timeout)
+                resp = self._client.post(
+                url,
+                json=payload,
+                timeout=timeout,
+                headers=headers,
+                )
                 resp.raise_for_status()
                 try:
                     data = resp.json()
@@ -1106,12 +1113,24 @@ class OllamaClient:
         typed form of Ollama's HTTP-200 error body, which these servers do
         not emit.
         """
+        endpoint_path = config.embeddings.primary.endpoint_path
+
+        if endpoint_path:
+            path = "/" + endpoint_path.lstrip("/")
+            base_url = _resolve_base_url(OllamaRole.EMBED).rstrip("/")
+        else:
+            path = _OPENAI_EMBED_PATH
+            base_url = _openai_embed_base_url()
+
         text_len = sum(len(text) for text in texts)
+        api_key = load_embedding_api_key()
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         try:
             data = self._request_json(
-                OllamaRole.EMBED, _OPENAI_EMBED_PATH, {"model": model, "input": texts},
+                OllamaRole.EMBED, path, {"model": model, "input": texts},
                 timeout=timeout, retries=retries, model=model, op=op,
-                base_url=_openai_embed_base_url(),
+                base_url=base_url,
+                headers=headers,
             )
         except OllamaInputError as e:
             raise EmbeddingInputError(

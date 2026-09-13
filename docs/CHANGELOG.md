@@ -6,6 +6,13 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
 
 ### Added
 
+- **Hosted OpenAI-compatible embedding endpoints support bearer authentication
+  and configurable paths.** Set `PALINODE_EMBEDDING_API_KEY` (or
+  `PALINODE_EMBEDDING_API_KEY_FILE`) for `Authorization: Bearer` on the
+  `openai` embedding dialect only, and use `embeddings.primary.endpoint_path`
+  when a provider does not serve `/v1/embeddings`. Existing Ollama and
+  `/v1/embeddings` configurations are unchanged.
+
 ### Changed
 
 ### Fixed
