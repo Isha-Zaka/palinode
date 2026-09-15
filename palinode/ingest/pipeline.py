@@ -22,6 +22,7 @@ from pathlib import Path
 import httpx
 import yaml
 import urllib.parse
+import urllib.request
 import socket
 import ipaddress
 
@@ -31,29 +32,180 @@ from palinode.core.hashing import stable_md5_hexdigest
 
 logger = logging.getLogger("palinode.ingest")
 
-def is_safe_url(url: str) -> bool:
-    """Validates URL for SSRF protection."""
+# Redirect statuses whose Location the fetcher follows itself, one vetted
+# hop at a time, and the cap on how many it will follow.
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_MAX_REDIRECT_HOPS = 5
+
+
+def _is_fetchable_address(addr: str) -> bool:
+    """True only for an address the ingester is allowed to connect to.
+
+    Policy rather than enumeration: ``is_global`` is false for private,
+    loopback, link-local, carrier-grade NAT (100.64.0.0/10), reserved,
+    unspecified, and documentation ranges, in both IPv4 and IPv6. Multicast is
+    the one class ``ipaddress`` still reports as global, so it is excluded
+    explicitly.
+    """
+    try:
+        # A scoped IPv6 literal (``fe80::1%en0``) carries a zone id that
+        # ``ip_address`` rejects; the address itself is what we vet.
+        ip = ipaddress.ip_address(addr.partition("%")[0])
+    except ValueError:
+        return False
+    return ip.is_global and not ip.is_multicast
+
+
+def _vetted_addresses(url: str) -> list[str] | None:
+    """Every address *url*'s host resolves to, or ``None`` if it may not be fetched.
+
+    The host is resolved with ``getaddrinfo``, so IPv6-only hosts resolve (and
+    IPv6 non-global literals are rejected on policy rather than by accident of
+    an IPv4-only lookup). *Every* answer must be fetchable: a host that returns
+    one public and one internal address is refused outright, since which one a
+    later connect picks is not ours to choose.
+
+    The addresses are returned rather than discarded so the connection can be
+    made to one of them. Resolving a name, approving it, and then handing the
+    *name* to the HTTP client is check-then-use: the client resolves again, and
+    the second answer is not the one that was vetted.
+    """
     try:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https"):
-            return False
-            
+            return None
+
         hostname = parsed.hostname
         if not hostname:
-            return False
-            
+            return None
+
         try:
-            ip = socket.gethostbyname(hostname)
-        except socket.gaierror:
-            return False
-            
-        ip_obj = ipaddress.ip_address(ip)
-        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast:
-            return False
-            
-        return True
+            infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+        except (OSError, ValueError, UnicodeError):
+            return None
+
+        # De-duplicated, in the order the resolver returned them.
+        addresses = list(dict.fromkeys(info[4][0] for info in infos))
+        if not addresses or not all(_is_fetchable_address(a) for a in addresses):
+            return None
+        return addresses
     except Exception:
+        return None
+
+
+def is_safe_url(url: str) -> bool:
+    """Validates URL for SSRF protection.
+
+    A pre-flight check for callers that want to refuse a URL before starting an
+    ingest. The authoritative check is the one :func:`_fetch_vetted_url` runs
+    per hop, because only that one pins the connection to what it approved.
+    """
+    return _vetted_addresses(url) is not None
+
+
+def _tunnels_through_http_proxy(parsed: urllib.parse.ParseResult) -> bool:
+    """True when an https request for *parsed* would ride an HTTP CONNECT tunnel.
+
+    ``httpcore`` hardcodes the TLS ``server_hostname`` of a tunnelled
+    connection to the CONNECT target and ignores the ``sni_hostname``
+    extension, so a pinned request through one would have its certificate
+    verified against the IP literal instead of the hostname. Rather than
+    weaken verification, pinning is skipped for that case (see the warning in
+    :func:`_fetch_vetted_url`). SOCKS proxies honour the extension and are
+    unaffected.
+    """
+    if parsed.scheme != "https":
         return False
+    proxies = urllib.request.getproxies()
+    proxy = proxies.get("https") or proxies.get("all")
+    if not proxy or proxy.partition("://")[0].lower().startswith("socks"):
+        return False
+    try:
+        return not urllib.request.proxy_bypass(parsed.hostname or "")
+    except (OSError, ValueError):
+        return True
+
+
+def _get_pinned(
+    client: httpx.Client, parsed: urllib.parse.ParseResult, addresses: list[str]
+) -> httpx.Response:
+    """GET *parsed* over a connection to one of its already-vetted *addresses*.
+
+    The request URL carries the vetted address as a literal, so nothing
+    re-resolves the name between the check and the connect. ``Host`` and the
+    TLS ``sni_hostname`` extension keep the request — and certificate
+    verification — pointed at the original hostname. Addresses are tried in
+    resolution order, so a host whose first record is unreachable is still
+    reached; unlike the socket layer's own iteration, which shared one deadline
+    across the set, the timeout now applies per attempt.
+    """
+    credentials, at, authority = parsed.netloc.rpartition("@")
+    last_error: Exception | None = None
+    for address in addresses:
+        literal = f"[{address}]" if ":" in address else address
+        netloc = literal if parsed.port is None else f"{literal}:{parsed.port}"
+        pinned = urllib.parse.urlunparse(
+            parsed._replace(netloc=f"{credentials}{at}{netloc}")
+        )
+        try:
+            return client.get(
+                pinned,
+                headers={"Host": authority},
+                extensions={"sni_hostname": parsed.hostname},
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            # Only a failure to establish the connection falls through to the
+            # next address; past that point the request has already been sent.
+            last_error = e
+    raise last_error  # type: ignore[misc]  # addresses is never empty
+
+
+def _fetch_vetted_url(url: str) -> httpx.Response | None:
+    """GET *url*, vetting the address behind every redirect hop and connecting to it.
+
+    ``httpx`` is told not to follow redirects: a guard that runs once on the
+    submitted URL says nothing about where a ``Location`` header points. Each
+    hop is resolved and vetted before it is requested, and the chain is bounded
+    so a server cannot walk the fetcher through an unbounded list of targets.
+
+    Each hop then connects to the address it vetted, not to the name, so a host
+    whose second answer differs from its first — DNS rebinding — cannot be
+    reached through the window between the two.
+
+    Returns the final response, or ``None`` when a hop is refused (nothing is
+    fetched from it and the caller writes nothing).
+    """
+    current = url
+    with httpx.Client(timeout=30.0, follow_redirects=False) as client:
+        for _ in range(_MAX_REDIRECT_HOPS + 1):
+            addresses = _vetted_addresses(current)
+            if addresses is None:
+                logger.error(f"URL fetch blocked by SSRF protection: {current}")
+                return None
+
+            parsed = urllib.parse.urlparse(current)
+            if _tunnels_through_http_proxy(parsed):
+                logger.warning(
+                    "Connecting by name through an HTTPS proxy, which cannot carry a "
+                    f"pinned address without breaking certificate verification: {current}"
+                )
+                response = client.get(current)
+            else:
+                response = _get_pinned(client, parsed, addresses)
+
+            if response.status_code not in _REDIRECT_STATUSES:
+                return response
+
+            location = response.headers.get("location", "")
+            if not location:
+                logger.error(f"Redirect without a location header: {current}")
+                return None
+            # Relative targets resolve against the hop we are on, then get
+            # vetted like any other.
+            current = urllib.parse.urljoin(current, location)
+
+    logger.error(f"Too many redirects while fetching: {url}")
+    return None
 
 
 def process_inbox() -> None:
@@ -251,12 +403,10 @@ def ingest_url(url: str, name: str) -> str | None:
     Returns:
         str | None: Path to the saved research file, or None.
     """
-    if not is_safe_url(url):
-        logger.error(f"URL fetch blocked by SSRF protection: {url}")
-        return None
-
     try:
-        response = httpx.get(url, timeout=30.0, follow_redirects=True)
+        response = _fetch_vetted_url(url)
+        if response is None:
+            return None
         response.raise_for_status()
         html = response.text
 

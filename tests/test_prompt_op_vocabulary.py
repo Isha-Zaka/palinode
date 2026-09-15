@@ -87,9 +87,20 @@ def test_propose_contradicts_is_allowed_by_default_on_both_passes() -> None:
     assert "PROPOSE_CONTRADICTS" in NightlyConfig().allowed_ops
 
 
+def test_archive_before_is_weekly_only() -> None:
+    """A range retirement is a weekly concern, like every other retiring op.
+
+    The nightly pass is UPDATE/SUPERSEDE/MERGE/PROPOSE_CONTRADICTS — additive,
+    same-day, small — and a bulk retirement proposed against one day's notes
+    is precisely the unreviewed sweep that restriction exists to prevent.
+    """
+    assert "ARCHIVE_BEFORE" in ConsolidationConfig().allowed_ops
+    assert "ARCHIVE_BEFORE" not in NightlyConfig().allowed_ops
+
+
 @pytest.mark.parametrize(
     "prompt,expected_version",
-    [("compaction.md", 3), ("nightly-consolidation.md", 2)],
+    [("compaction.md", 5), ("nightly-consolidation.md", 2)],
 )
 def test_consolidation_prompts_declare_a_version(prompt: str, expected_version: int) -> None:
     """A prompt with no `version:` cannot be reported as stale.
@@ -98,7 +109,10 @@ def test_consolidation_prompts_declare_a_version(prompt: str, expected_version: 
     packaged copy, so an undeclared version means the one file whose contract
     just changed is the one the check cannot warn about. v1 named the six
     reachable ops; v2 adds `PROPOSE_CONTRADICTS`; compaction v3 makes KEEP
-    implicit, so the model emits only ops that change something.
+    implicit, so the model emits only ops that change something; compaction v4
+    names a later observation as the PROPOSE_CONTRADICTS case and requires
+    RETRACT to cite its evidence in `falsified_by`; compaction v5 adds
+    `ARCHIVE_BEFORE`, so a run of stale dated status lines is one operation.
     """
     meta = frontmatter.load(PROMPTS_DIR / prompt).metadata
     assert meta.get("version") == expected_version

@@ -28,6 +28,14 @@ Three consumers, one accessor:
 ``shipped-hashes.json`` records every sha256 palinode has ever shipped for each
 prompt. It is what lets ``palinode prompt sync`` tell a stale-but-pristine
 store copy (safe to replace) from one the operator edited (never replace).
+Those hashes are over the prompt **body**, frontmatter stripped: a store is a
+memory store, and its own machinery decorates prompt frontmatter
+(``cross_refs:``, ``description:``, key order, quote style), which a whole-file
+hash cannot tell apart from an operator rewriting the instructions. The body is
+what consolidation sends the model, so it is the only part whose provenance
+``prompt sync`` needs. ``hash_domain: "body"`` in the manifest records which
+domain the numbers are in, so a palinode reading a manifest from the other era
+fails loudly instead of declaring every store prompt edited.
 
 Standard library only, deliberately: ``palinode init`` and the doctor check
 both reach for this before any config or database is guaranteed to exist.
@@ -41,6 +49,7 @@ from importlib import resources
 from pathlib import Path
 
 __all__ = [
+    "PromptCatalogueUnsupported",
     "PromptUnavailable",
     "STORE_PROMPTS_SUBPATH",
     "content_hash",
@@ -48,6 +57,8 @@ __all__ = [
     "packaged_prompt_names",
     "packaged_prompt_path",
     "packaged_prompts_dir",
+    "prompt_body",
+    "prompt_body_hash",
     "resolve_prompt",
     "shipped_hashes",
     "store_prompts_dir",
@@ -59,6 +70,22 @@ __all__ = [
 STORE_PROMPTS_SUBPATH = ("specs", "prompts")
 
 _HASH_MANIFEST = "shipped-hashes.json"
+
+#: The only hash domain ``shipped-hashes.json`` may be in. Manifests before
+#: this marker existed listed whole-file hashes; comparing those against a body
+#: hash matches nothing, which reads as "the operator edited every prompt" —
+#: the exact silent failure this marker turns into a loud one.
+_HASH_DOMAIN = "body"
+
+
+class PromptCatalogueUnsupported(RuntimeError):
+    """``shipped-hashes.json`` is readable but not in the body-hash domain.
+
+    Its own type because the caller must stop rather than compare: a whole-file
+    manifest read as a body manifest agrees with nothing, and ``prompt sync``
+    would report every store prompt as operator-edited — advice to run
+    ``--force``, which discards real edits, in response to a version skew.
+    """
 
 
 class PromptUnavailable(RuntimeError):
@@ -149,19 +176,56 @@ def content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def prompt_body(text: str) -> str:
+    """The part of a prompt file the model is sent — frontmatter stripped.
+
+    The one definition: ``palinode.consolidation.runner`` calls this to build
+    the system prompt and ``palinode prompt sync`` hashes its result, so the
+    bytes whose provenance ``sync`` vouches for are exactly the bytes
+    consolidation runs. Two readers that disagreed about where the body starts
+    would let a prompt be "pristine" and still behave differently.
+
+    A file with no parseable frontmatter is returned whole, which is what every
+    prompt did before any of them had frontmatter.
+    """
+    from palinode.core.parser import split_frontmatter
+
+    _, body = split_frontmatter(text)
+    return body.lstrip("\n")
+
+
+def prompt_body_hash(text: str) -> str:
+    """The sha256 of *text*'s prompt body — the domain ``prompt sync`` compares in."""
+    return content_hash(prompt_body(text).encode("utf-8"))
+
+
 def shipped_hashes() -> dict[str, list[str]]:
-    """Every sha256 palinode has shipped, per prompt filename, newest first.
+    """Every prompt-body sha256 palinode has shipped, per filename, newest first.
 
     An unreadable or absent manifest yields ``{}`` — which makes
     ``palinode prompt sync`` treat every store copy as operator-edited and
     refuse to overwrite it. Failing closed is the right direction for a
     command whose only irreversible act is replacing a file.
+
+    A manifest that *is* readable but declares another hash domain (or none,
+    as every manifest before this one did) raises
+    :class:`PromptCatalogueUnsupported`. Silence is not available there: the
+    numbers would all mismatch, and "nothing matches" is this command's word
+    for "you edited it".
     """
     path = packaged_prompts_dir() / _HASH_MANIFEST
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    domain = data.get("hash_domain")
+    if domain != _HASH_DOMAIN:
+        raise PromptCatalogueUnsupported(
+            f"{path} declares hash_domain {domain!r}, but this palinode compares "
+            f"prompt {_HASH_DOMAIN} hashes. The manifest and the install are from "
+            f"different eras: reinstall palinode, or regenerate the manifest with "
+            f"scripts/regen-prompt-hashes.py."
+        )
     prompts = data.get("prompts")
     if not isinstance(prompts, dict):
         return {}

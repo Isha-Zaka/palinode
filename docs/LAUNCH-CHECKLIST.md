@@ -70,7 +70,7 @@ is checked AND `mcp-tool-coverage` CI is green on the release SHA.**
 - [ ] MCP tool count assertion test (`tests/test_mcp_tool_count.py`) green
 
 ## Platform parity
-- [ ] All 25 MCP tools verified working on Claude Code, Claude Desktop, Cursor
+- [ ] Every MCP tool in the [MCP-SETUP.md](MCP-SETUP.md#available-tools) table verified working on Claude Code, Claude Desktop, Cursor (that table is the inventory; a count written here goes stale every release)
 - [ ] Codex CLI MCP config documented and smoke-tested
 - [ ] Antigravity IDE MCP config documented
 - [ ] `palinode mcp-config --diagnose` covers all supported client paths

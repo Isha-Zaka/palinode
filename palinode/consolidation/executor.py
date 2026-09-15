@@ -17,7 +17,9 @@ from datetime import UTC, datetime
 
 
 from palinode.core import git_tools
+from palinode.core.lifecycle import parse_moment
 from palinode.core.parser import split_frontmatter
+from palinode.consolidation.log_lines import older_than
 from palinode.consolidation.op_parse import op_kind
 
 logger = logging.getLogger("palinode.consolidation.executor")
@@ -155,7 +157,8 @@ def _atomic_write_text(file_path: str, content: str) -> None:
 
 def apply_operations(file_path: str, operations: list[dict], *,
                      nightly_policy: bool = False,
-                     applied_merges: list[int] | None = None) -> dict:
+                     applied_merges: list[int] | None = None,
+                     applied_ranges: list[int] | None = None) -> dict:
     """Apply a list of operations to a memory file.
 
     Args:
@@ -171,11 +174,22 @@ def apply_operations(file_path: str, operations: list[dict], *,
             (the runner's Consolidation Log) can then record the outcome
             rather than the proposal — a MERGE that retired nothing must not
             leave a line saying a merge happened.
+        applied_ranges: The same out-parameter for ARCHIVE_BEFORE, and for the
+            same reason: a range that matched no log line retired nothing, and
+            a log line claiming it did would be the only trace of an op that
+            did nothing.
 
     Returns:
-        Stats dict: {kept, updated, merged, superseded, archived, retracted,
+        Stats dict: {kept, updated, merged, superseded, archived,
+                     archived_by_range, retracted,
                      merge_rejected, protected_rejected, contradicts_proposed,
-                     unmatched}. ``unmatched`` counts UPDATE/MERGE/SUPERSEDE/
+                     unmatched}. ``archived_by_range`` is the subset of
+                     ``archived`` that an ARCHIVE_BEFORE retired — the range op
+                     is counted with every other archive so no summary
+                     undercounts what left the file, and separately so an
+                     operator can see which retirements were argued by date
+                     rather than named one by one.
+                     ``unmatched`` counts UPDATE/MERGE/SUPERSEDE/
                      ARCHIVE/RETRACT ops that were dropped without effect —
                      either a required field (e.g. ``new_text``) was
                      missing/empty, or the op's fact id(s) were not found in
@@ -187,7 +201,8 @@ def apply_operations(file_path: str, operations: list[dict], *,
                      ops the target document's own declared regime refused:
                      the ADR-015 ``update_policy: replace`` guard, and the
                      ADR-020 guard that forbids retiring an identity/profile
-                     document by age (an ARCHIVE with no ``superseded_by``).
+                     document without evidence (an ARCHIVE with no
+                     ``superseded_by``, or a RETRACT with no ``falsified_by``).
     """
     with open(file_path, encoding="utf-8") as f:
         content = f.read()
@@ -219,11 +234,15 @@ def apply_operations(file_path: str, operations: list[dict], *,
     # op that removes a fact from recall with no retrievable trace in the main
     # file, and the compaction prompt's staleness rule is what proposes it, so
     # ARCHIVE here is allowed only when the op names a successor
-    # (`superseded_by`). SUPERSEDE and RETRACT are untouched: both state a
-    # reason that is not age.
+    # (`superseded_by`). RETRACT is the other sanctioned retirement path, and
+    # the compaction model has been seen fabricating one ("known to be
+    # incorrect", nothing in context) against an identity fact, so RETRACT
+    # here is allowed only when the op names the memory or fact that falsifies
+    # the retracted one (`falsified_by`). SUPERSEDE is untouched: it carries
+    # its evidence as `new_text`.
     superseded_only_signal = _superseded_only_signal(file_path, content)
 
-    stats = {"kept": 0, "updated": 0, "merged": 0, "superseded": 0, "archived": 0, "retracted": 0, "merge_rejected": 0, "protected_rejected": 0, "contradicts_proposed": 0, "unmatched": 0, "review_flagged": 0}
+    stats = {"kept": 0, "updated": 0, "merged": 0, "superseded": 0, "archived": 0, "archived_by_range": 0, "retracted": 0, "merge_rejected": 0, "protected_rejected": 0, "contradicts_proposed": 0, "unmatched": 0, "review_flagged": 0}
 
     # Every op that retires a fact's current text — SUPERSEDE, ARCHIVE, RETRACT,
     # MERGE — is recorded here as (kind, fact ids, reason) so that, once the
@@ -246,7 +265,7 @@ def apply_operations(file_path: str, operations: list[dict], *,
         # fact in place AND appends a `-history.md` sibling — exactly the stale-
         # snapshot fork this axis forbids. A provably-wrong value in a living
         # document must be corrected with UPDATE, not tombstoned; guard RETRACT.
-        if is_replace_doc and op_type in ("SUPERSEDE", "ARCHIVE", "RETRACT"):
+        if is_replace_doc and op_type in ("SUPERSEDE", "ARCHIVE", "ARCHIVE_BEFORE", "RETRACT"):
             logger.warning(
                 "%s rejected by update_policy=replace guard (living document): "
                 "%s on %s",
@@ -272,6 +291,48 @@ def apply_operations(file_path: str, operations: list[dict], *,
                 "(%s): age/staleness is not a retirement reason for this "
                 "document — use SUPERSEDE, RETRACT, or an ARCHIVE naming "
                 "superseded_by: %s on %s (rationale: %r)",
+                superseded_only_signal,
+                op.get("id"),
+                file_path,
+                op.get("rationale", op.get("reason", "")),
+            )
+            stats["protected_rejected"] += 1
+            continue
+
+        # ADR-020, ARCHIVE_BEFORE. A range op argues purely from date — that
+        # is its entire content — so there is no field that could turn it into
+        # a stated supersession the way `superseded_by` does for a single
+        # ARCHIVE. On a superseded-only document it is refused outright.
+        if superseded_only_signal is not None and op_type == "ARCHIVE_BEFORE":
+            logger.warning(
+                "ARCHIVE_BEFORE rejected by retirement_policy=superseded-only "
+                "guard (%s): a date range is an age argument, and age is not a "
+                "retirement reason for this document — use SUPERSEDE, RETRACT, "
+                "or an ARCHIVE naming superseded_by: before=%r on %s "
+                "(rationale: %r)",
+                superseded_only_signal,
+                op.get("before"),
+                file_path,
+                op.get("rationale", op.get("reason", "")),
+            )
+            stats["protected_rejected"] += 1
+            continue
+
+        # ADR-020 evidence-gated RETRACT. `falsified_by` is the
+        # RETRACT analogue of `superseded_by`: naming the memory or fact in
+        # context that falsifies the retracted one is the whole test. The
+        # rationale text is never parsed — there is no deterministic tell
+        # between "retract: stale" and "retract: false" in prose.
+        if (
+            superseded_only_signal is not None
+            and op_type == "RETRACT"
+            and not str(op.get("falsified_by") or "").strip()
+        ):
+            logger.warning(
+                "RETRACT rejected by retirement_policy=superseded-only guard "
+                "(%s): a retraction on this document must name the memory or "
+                "fact that falsifies it — add falsified_by, or use SUPERSEDE: "
+                "%s on %s (rationale: %r)",
                 superseded_only_signal,
                 op.get("id"),
                 file_path,
@@ -369,10 +430,12 @@ def apply_operations(file_path: str, operations: list[dict], *,
             fact_id = op.get("id")
             reason = op.get("rationale", op.get("reason", ""))
             if fact_id:
-                archived_body = _archive_fact(body, fact_id, reason, file_path)
-                if archived_body != body:
+                archived_body, removed = _archive_fact(body, fact_id, reason, file_path)
+                if removed:
                     body = archived_body
-                    stats["archived"] += 1
+                    # Lines, not ops: a duplicated id names more than one line
+                    # and all of them are gone.
+                    stats["archived"] += removed
                     retirements.append(("archive", [fact_id], reason))
                 else:
                     logger.warning(
@@ -386,6 +449,63 @@ def apply_operations(file_path: str, operations: list[dict], *,
                     file_path,
                 )
                 stats["unmatched"] += 1
+
+        elif op_type == "ARCHIVE_BEFORE":
+            # Bulk retirement of dated status log lines: one op, one rationale,
+            # a whole date range. The proposal size is then O(reasons) rather
+            # than O(facts), which is the difference between a proposal that
+            # fits the token cap and one that cannot be returned at all.
+            before = str(op.get("before") or "").strip()
+            reason = op.get("rationale", op.get("reason", ""))
+            cutoff = parse_moment(before) if before else None
+            if cutoff is None:
+                logger.warning(
+                    "ARCHIVE_BEFORE dropped: `before` is missing or is not a "
+                    "YYYY-MM-DD date (before=%r) in %s",
+                    op.get("before"), file_path,
+                )
+                stats["unmatched"] += 1
+                continue
+            in_range = older_than(body, cutoff)
+            if not in_range:
+                logger.warning(
+                    "ARCHIVE_BEFORE unmatched: no dated log line older than %s "
+                    "in %s",
+                    before, file_path,
+                )
+                stats["unmatched"] += 1
+                continue
+            archived_ids: list[str] = []
+            archived_lines = 0
+            # By id, in document order, each id once: on a document carrying
+            # duplicate ids the first removal takes every line that id names,
+            # and a second pass over the same id would find nothing.
+            for fact_id in dict.fromkeys(line.fact_id for line in in_range):
+                archived_body, removed = _archive_fact(body, fact_id, reason, file_path)
+                if removed:
+                    body = archived_body
+                    archived_ids.append(fact_id)
+                    archived_lines += removed
+            if not archived_ids:
+                # The recognizer found the lines, so this cannot happen short
+                # of a bug in one of the two; say so rather than counting a
+                # silent success.
+                logger.warning(
+                    "ARCHIVE_BEFORE unmatched: %d line(s) older than %s were "
+                    "recognized but none could be removed from %s",
+                    len(in_range), before, file_path,
+                )
+                stats["unmatched"] += 1
+                continue
+            stats["archived"] += archived_lines
+            stats["archived_by_range"] += archived_lines
+            retirements.append(("archive", archived_ids, reason))
+            if applied_ranges is not None:
+                applied_ranges.append(op_index)
+            logger.info(
+                "ARCHIVE_BEFORE %s: retired %d dated log line(s) from %s",
+                before, archived_lines, file_path,
+            )
 
         elif op_type == "RETRACT":
             fact_id = op.get("id")
@@ -579,22 +699,32 @@ def _supersede_fact(content: str, fact_id: str, new_text: str,
     return updated_content
 
 
-def _archive_fact(content: str, fact_id: str, reason: str, file_path: str) -> str:
-    """Remove a fact from the file and append it to the history file."""
-    # Extract the fact text before removing
+def _archive_fact(
+    content: str, fact_id: str, reason: str, file_path: str
+) -> tuple[str, int]:
+    """Remove a fact from the file and append it to the history file.
+
+    Returns ``(content, lines_removed)``. An id addresses *every* line carrying
+    it — that has always been the removal semantics here — so on a document with
+    duplicate ids one op retires several lines, and the count says so rather
+    than leaving the caller to report one. Each removed line is written to
+    history separately: a 6-hex id can collide across genuinely different text,
+    and recording only the first match would drop the others with no trace.
+    """
     pattern = re.compile(
         r'^([\s]*[-*]\s+)(.*?)(<!-- fact:' + re.escape(fact_id) + r' -->)\n?',
         re.MULTILINE
     )
-    match = pattern.search(content)
-    if match:
+    removed = 0
+    for match in pattern.finditer(content):
+        removed += 1
         archived_text = match.group(2).strip()
         append_to_history(file_path, fact_id,
                           f"Archived: {archived_text} (reason: {reason})")
 
     # Remove from main file
     content = pattern.sub('', content)
-    return content
+    return content, removed
 
 
 def _retract_fact(content: str, fact_id: str, reason: str, file_path: str) -> str:

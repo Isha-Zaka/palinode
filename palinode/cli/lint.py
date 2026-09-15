@@ -196,6 +196,23 @@ def lint(fmt, deep_contradictions, max_llm_calls, similarity_threshold, propose,
 
     console.print("")
 
+    oversized_core = data.get("oversized_core", [])
+    if oversized_core:
+        console.print(
+            f"[bold yellow]Core memories over gist size ({len(oversized_core)})[/bold yellow]"
+        )
+        for item in oversized_core:
+            console.print(
+                f"  - {item['file']}: {item['chars']} chars "
+                f"(~{item['tokens']} tokens est.), limit {item['limit']} — "
+                f"{item['remediation']}",
+                markup=False,
+            )
+    else:
+        console.print("[green]✓ All core memories are gist-sized[/green]")
+
+    console.print("")
+
     wiki_drift = data.get("wiki_drift", [])
     if wiki_drift:
         console.print(f"[bold yellow]Wiki Drift ({len(wiki_drift)})[/bold yellow]")

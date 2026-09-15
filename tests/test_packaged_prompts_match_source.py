@@ -13,7 +13,10 @@ CI fails here, naming the file and telling you to copy it across.
 ``shipped-hashes.json`` is the second half of the contract. ``palinode prompt
 sync`` uses it to tell a stale-but-pristine store copy from an operator-edited
 one, so a prompt whose new hash was never recorded would be indistinguishable
-from someone's local tuning and would never be refreshed.
+from someone's local tuning and would never be refreshed. The hashes are over
+the prompt **body** — frontmatter stripped — because a store writes prompt
+frontmatter itself; ``scripts/regen-prompt-hashes.py`` derives them from git
+history rather than asking anyone to remember to prepend one.
 """
 from __future__ import annotations
 
@@ -23,10 +26,10 @@ from pathlib import Path
 import pytest
 
 from palinode.prompts import (
-    content_hash,
     iter_packaged_prompts,
     packaged_prompt_names,
     packaged_prompts_dir,
+    prompt_body_hash,
     shipped_hashes,
 )
 
@@ -75,20 +78,21 @@ def test_packaged_copy_is_byte_identical_to_source(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", EXPECTED_PROMPTS)
-def test_current_hash_is_recorded_as_shipped(name: str) -> None:
-    """Every prompt palinode ships must be in the hash manifest.
+def test_current_body_hash_is_recorded_as_shipped(name: str) -> None:
+    """Every prompt body palinode ships must be in the hash manifest.
 
     Without this, ``palinode prompt sync`` sees the *next* release's store
     copies as unrecognised — i.e. edited — and refuses to ever refresh them
     again.
     """
-    digest = content_hash((SOURCE_PROMPTS / name).read_bytes())
+    digest = prompt_body_hash((SOURCE_PROMPTS / name).read_text(encoding="utf-8"))
     known = shipped_hashes().get(name, [])
     assert digest in known, (
-        f"{name} changed but palinode/prompts/shipped-hashes.json does not list "
-        f'its new hash. Prepend "{digest}" to the "{name}" list — the previous '
-        f"hash stays, it is how a store still on the old copy is recognised as "
-        f"pristine."
+        f"{name}'s body changed but palinode/prompts/shipped-hashes.json does not "
+        f'list its new hash ("{digest}"). Run `python '
+        f"scripts/regen-prompt-hashes.py` — it re-derives the manifest from git "
+        f"history and keeps every hash already there, which is how a store still "
+        f"on an older copy stays recognisable as pristine."
     )
 
 
@@ -105,8 +109,21 @@ def test_manifest_is_valid_json_with_a_schema_version() -> None:
     raw = json.loads(
         (packaged_prompts_dir() / "shipped-hashes.json").read_text(encoding="utf-8")
     )
-    assert raw["schema"] == 1
+    assert raw["schema"] == 2
     assert isinstance(raw["prompts"], dict)
+
+
+def test_manifest_declares_the_body_hash_domain() -> None:
+    """The marker that keeps two eras of palinode from silently disagreeing.
+
+    Whole-file hashes and body hashes are both 64 hex characters and never
+    match each other, and "no hash matches" is ``prompt sync``'s phrase for
+    "the operator edited this". The marker turns that into a refusal.
+    """
+    raw = json.loads(
+        (packaged_prompts_dir() / "shipped-hashes.json").read_text(encoding="utf-8")
+    )
+    assert raw["hash_domain"] == "body"
 
 
 def test_iter_packaged_prompts_yields_readable_files() -> None:

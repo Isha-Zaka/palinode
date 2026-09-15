@@ -121,6 +121,21 @@ _ACTION_ADDED = "added"
 _ACTION_UNCHANGED = "unchanged"
 
 
+def _store_body_hash(path: Path) -> str | None:
+    """The body hash of a store prompt, or None when it will not read as text.
+
+    None means "cannot claim this is a release's copy": an unreadable or
+    non-UTF-8 file is not provably pristine, and overwriting one is the only
+    irreversible thing this command does.
+    """
+    from palinode.prompts import prompt_body_hash
+
+    try:
+        return prompt_body_hash(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def sync_plan(store_dir: Path, force: bool = False) -> list[dict[str, str]]:
     """Decide, per packaged prompt, what `prompt sync` would do to *store_dir*.
 
@@ -133,24 +148,37 @@ def sync_plan(store_dir: Path, force: bool = False) -> list[dict[str, str]]:
     that list is provably a pristine copy of some release and safe to replace;
     anything else is the operator's and is left alone with a report.
 
-    A missing file is provisioned (``added``); a copy already matching the
-    packaged one is ``unchanged``. ``force`` is the deliberate "yes, discard my
-    edits" escape hatch — nothing else can reach an edited file.
+    Both sides are hashed **body-only**, frontmatter stripped
+    (:func:`palinode.prompts.prompt_body_hash`). A store is a memory store and
+    its own machinery decorates prompt frontmatter — the cross-reference updater
+    and the description backfill both rewrote ``specs/prompts/*.md`` in place —
+    so a whole-file hash reported an untouched prompt as operator-edited on every
+    store whose watcher had ever run over it. The body is what the model is sent,
+    which makes it the part whose provenance this decision is about.
+
+    A missing file is provisioned (``added``); a copy whose body already matches
+    the packaged one is ``unchanged``. ``force`` is the deliberate "yes, discard
+    my edits" escape hatch — nothing else can reach an edited file.
+
+    Raises :class:`palinode.prompts.PromptCatalogueUnsupported` when the shipped
+    manifest is not in the body-hash domain.
     """
-    from palinode.prompts import content_hash, iter_packaged_prompts, shipped_hashes
+    from palinode.prompts import iter_packaged_prompts, prompt_body_hash, shipped_hashes
 
     history = shipped_hashes()
     plan: list[dict[str, str]] = []
     for source in iter_packaged_prompts():
         dest = store_dir / source.name
-        packaged_hash = content_hash(source.read_bytes())
+        packaged_hash = prompt_body_hash(source.read_text(encoding="utf-8"))
         if not dest.is_file():
             action = _ACTION_ADDED
         else:
-            store_hash = content_hash(dest.read_bytes())
+            store_hash = _store_body_hash(dest)
             if store_hash == packaged_hash:
                 action = _ACTION_UNCHANGED
-            elif force or store_hash in history.get(source.name, []):
+            elif force or (
+                store_hash is not None and store_hash in history.get(source.name, [])
+            ):
                 action = _ACTION_REFRESHED
             else:
                 action = _ACTION_EDITED
@@ -260,10 +288,14 @@ def prompt_sync(dry_run: bool, force: bool, fmt: str | None) -> None:
     operation, so it has no MCP or REST counterpart to stay in parity with.
     """
     from palinode.core.config import config
-    from palinode.prompts import store_prompts_dir
+    from palinode.prompts import PromptCatalogueUnsupported, store_prompts_dir
 
     store_dir = store_prompts_dir(config.memory_dir)
-    plan = sync_plan(store_dir, force=force)
+    try:
+        plan = sync_plan(store_dir, force=force)
+    except PromptCatalogueUnsupported as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise click.Abort()
     outcome: dict[str, object] = {"committed": False, "commit_message": None}
     if not dry_run:
         outcome = apply_sync_plan(plan, store_dir, force=force)

@@ -49,6 +49,12 @@ SUPERSEDED_ONLY = "superseded-only"
 
 VALID_POLICIES = (AGE_ELIGIBLE, SUPERSEDED_ONLY)
 
+#: The ``signal`` :func:`classify` returns when the document declared its own
+#: regime. Callers that must treat a declaration differently from an inferred
+#: regime (a proposer whose own conservatism yields to it) compare against this
+#: rather than re-reading the frontmatter, so there is one classifier.
+DECLARED_SIGNAL = f"declared:{POLICY_FIELD}"
+
 #: Top-level memory directories whose ``.md`` files are identity documents.
 _IDENTITY_DIRS = frozenset({"people"})
 
@@ -156,7 +162,7 @@ def classify(
 
     declared = _declared(fm)
     if declared is not None:
-        return declared, f"declared:{POLICY_FIELD}"
+        return declared, DECLARED_SIGNAL
 
     signal = _frontmatter_signal(fm) or _path_signal(_memory_relpath(path))
     if signal is not None:

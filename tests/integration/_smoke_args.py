@@ -34,6 +34,9 @@ TOOL_SMOKE_ARGS: dict[str, tuple[dict, bool]] = {
     "palinode_trigger":           ({"action": "list"}, False),
     "palinode_prompt":            ({"action": "list"}, False),
     "palinode_depends":           ({"unblocked": True}, False),
+    # Bounded resolution — read-only; on a near-empty store it answers
+    # "nothing in memory answers this", which is a result, not an error.
+    "palinode_resolve":           ({"query": "smoke resolve question"}, False),
 
     # Write tools — exercise happy path against isolated tmp dir
     "palinode_save":              ({"content": "smoke save body", "type": "Insight",

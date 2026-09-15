@@ -230,7 +230,7 @@ Where things live. Paths, repos, docs.
 
 The **identity sections** (What This Is, People, Architecture, Key Files) change slowly and should survive consolidation intact. The **status sections** (Status, Current Work, Recent Changes, Blockers) get updated by the weekly consolidation from daily notes.
 
-**Retirement is document-relative:** identity documents — `people/{slug}.md`, a project's profile document, and anything declaring `update_policy: replace` or `core: true` — are retired only by SUPERSEDE (the fact changed) or RETRACT (the fact was never true), never by age, while the episodic kinds (`daily/`, `insights/`, `research/`, `projects/{slug}-status.md`, `inbox/`) are the ones a TTL expiry or a staleness `ARCHIVE` may retire; a document can state its own regime with `retirement_policy: age-eligible | superseded-only`, which wins over the default for its kind.
+**Retirement is document-relative:** identity documents — `people/{slug}.md`, a project's profile document, and anything declaring `update_policy: replace` or `core: true` — are retired only by SUPERSEDE (the fact changed) or RETRACT (the fact was never true — and on these documents the RETRACT must name what falsifies it, `falsified_by: <ref>`), never by age, while the episodic kinds (`daily/`, `insights/`, `research/`, `projects/{slug}-status.md`, `inbox/`) are the ones a TTL expiry or a staleness `ARCHIVE` may retire; a document can state its own regime with `retirement_policy: age-eligible | superseded-only`, which wins over the default for its kind.
 
 ### Decision → `decisions/{slug}.md`
 
@@ -586,6 +586,10 @@ Files with `core: true` in frontmatter are loaded at EVERY session start without
 - Research references
 - Historical insights
 - People you haven't interacted with in 30+ days
+
+### Core is a gist and a pointer
+
+A `core: true` memory is an index entry, not the document. Write the gist — the claim in a line or two — and a pointer to the file that holds the detail; recall fetches that file on demand via search. Core memories are injected at every session start, so their size is spent whether or not anyone wanted it, and a core set that grows into documents crowds out the working context it was meant to orient. `palinode lint` flags any core memory over `context.core_gist_max_chars` with the remediation *core = gist + pointer; move detail to the full file*, and the injected digest itself is capped by `context.injection_max_chars` / `injection_max_tokens` — over budget it demotes rows to gist-and-pointer and reports what it withheld rather than trimming silently.
 
 ### Acting state carries an expiry
 

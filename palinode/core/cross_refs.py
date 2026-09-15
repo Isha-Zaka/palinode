@@ -44,6 +44,11 @@ logger = logging.getLogger("palinode.cross_refs")
 # watcher ignore set + lint skip set). ``daily`` notes are excluded as both
 # source and target — they are episodic and would create churn. Matched against
 # EVERY directory segment of a path, not just the first — see :func:`_is_skipped`.
+#
+# Deliberately NOT :data:`palinode.core.skip_dirs.ALWAYS_SKIP`: that set excludes
+# all of ``specs/``, while cross-linking excludes only the ``prompts`` segment
+# inside it, so a hand-written ``specs/amr.md`` stays linkable. The every-segment
+# match is what both need, and that is what is shared.
 SKIP_DIRS: frozenset[str] = frozenset(
     {"daily", "archive", "logs", "inbox", "prompts", ".obsidian", ".git"}
 )

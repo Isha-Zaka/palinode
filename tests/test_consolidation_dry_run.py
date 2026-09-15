@@ -30,6 +30,10 @@ def _seed_memory_repo(memory_dir: Path, monkeypatch, *, facts: str = SEED_FACTS)
     monkeypatch.setattr(config, "memory_dir", str(memory_dir))
     monkeypatch.setattr(config, "db_path", str(memory_dir / ".palinode.db"))
     monkeypatch.setattr(config.git, "auto_commit", True)
+    # The deterministic age sweep is off here: this module's subject is the
+    # preview-vs-write path for a *proposed* op, and a fixture fact dated
+    # months back would otherwise be retired by age first.
+    monkeypatch.setattr(config.consolidation, "status_log_retention_days", 0)
 
     for name in ("daily", "projects", "specs/prompts"):
         (memory_dir / name).mkdir(parents=True, exist_ok=True)

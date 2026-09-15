@@ -58,6 +58,14 @@ _SESSION_HEADING = re.compile(
     r"^##[ \t]+Session End[ \t]+[—–-][ \t]+(\S+)[ \t]*$", re.MULTILINE
 )
 
+#: Slack on the elapsed-time floor. A daily cron must be able to satisfy a
+#: 24 h minimum: two ticks a day apart differ by cron jitter of a second or so
+#: either way, so an exact ``>= min_hours_elapsed`` comparison is a coin flip
+#: and the nightly silently degrades to every other night. One hour absorbs
+#: the jitter and is still far short of the next tick. The floor only — the
+#: ``max_hours_elapsed`` ceiling is compared exactly.
+_CADENCE_SLACK_HOURS = 1.0
+
 
 @dataclass(frozen=True)
 class GateDecision:
@@ -245,7 +253,8 @@ def evaluate(
             f"ceiling reached: {hours_elapsed:.0f} h / {gate.max_hours_elapsed:.0f} h max",
         )
 
-    if hours_elapsed >= gate.min_hours_elapsed and sessions >= gate.min_sessions:
+    elapsed_met = hours_elapsed >= gate.min_hours_elapsed - _CADENCE_SLACK_HOURS
+    if elapsed_met and sessions >= gate.min_sessions:
         return decide(
             True,
             f"{sessions} sessions / {gate.min_sessions}, "
@@ -264,11 +273,17 @@ def record_run(
     memory_dir: str | os.PathLike[str] | None = None,
     now: datetime | None = None,
 ) -> None:
-    """Record that a ``mode`` pass completed, resetting the gate's counters.
+    """Record that a ``mode`` pass ran, resetting the gate's counters.
 
-    Called only for a real (non-dry-run) pass that returned without raising.
-    A pass that raised leaves the previous timestamp in place, so its work is
-    retried on the next tick rather than waiting out a fresh interval.
+    Called only for a real (non-dry-run) pass that was a full success — every
+    project group compacted. A pass that raised, *or* that returned ``partial``
+    (one or more project groups failed without raising), leaves the previous
+    timestamp in place, so its work is retried on the next tick rather than
+    waiting out a fresh interval.
+
+    ``now`` is the pass's *start* time, so the state file carries the tick that
+    fired it. Stamping completion instead put ``last_run_at`` a minute past the
+    tick, and every following tick then arrived a minute short of the minimum.
     ``sessions_at_run`` is stored for observability only — the live counter is
     derived from ``last_run_at``, so a hand-edited or missing state file cannot
     put the two out of step.

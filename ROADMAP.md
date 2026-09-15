@@ -28,8 +28,7 @@ Concretely, that means a memory record can carry:
   here is the hash proving the words have not changed
 - a **git commit** recording who wrote it and when, so it can be diffed and reverted
 
-…and that the model **never writes any of it directly**. It proposes operations; a
-deterministic executor validates and applies them.
+Memory changes are validated, recorded in git, and available for review or rollback.
 
 Being the *reference* implementation is the goal, not a consolation prize. Palinode is
 not trying to out-scale hosted memory services or win on install base. It is trying to
@@ -71,8 +70,8 @@ time from record time is what turns "what did the file say on this date" into "w
 we believe was true as of this date" — the second being the question an auditor asks.
 
 **[Idle-time consolidation](https://github.com/phasespace-labs/palinode/issues/77).** Compaction is currently invoked explicitly. Running it
-during idle periods is low-risk here specifically because the deterministic executor
-already gates every write.
+during idle periods is low-risk here because every write already passes the same
+validation and commit path.
 
 **Abstention quality.** Knowing when to return *nothing* is a memory behaviour in its
 own right. Weak-match recall where the honest answer is "no relevant memory" is a bug,

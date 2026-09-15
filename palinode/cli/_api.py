@@ -108,12 +108,22 @@ class PalinodeAPI:
         include_daily: bool | None = None,
         include_telemetry: bool | None = None,
         tier: str | None = None,
-    ) -> list[dict[str, Any]]:
+        resolve: str | None = None,
+        receipt: bool = False,
+    ) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Search memory. ``receipt=True`` returns ``(results, receipt)`` instead.
+
+        The receipt is the delivery receipt (``palinode.core.receipt``) for
+        this response. A bare list back from the server means an API older than
+        receipts: the receipt is then ``None`` and callers render without it.
+        """
         # ADR-010: forward the full canonical search surface.
         # Non-None params land in the body verbatim; None means "API default".
         payload: dict = {"query": query, "limit": limit}
         if tier:
             payload["tier"] = tier
+        if resolve and resolve != "none":
+            payload["resolve"] = resolve
         if category:
             payload["category"] = category
         if context:
@@ -134,10 +144,17 @@ class PalinodeAPI:
             payload["include_daily"] = True
         if include_telemetry:
             payload["include_telemetry"] = True
+        if receipt:
+            payload["receipt"] = True
 
         response = self.client.post("/search", json=payload)
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        if not receipt:
+            return data
+        if isinstance(data, dict):
+            return data.get("results") or [], data.get("receipt")
+        return data, None
 
     def save(
         self,
@@ -265,6 +282,37 @@ class PalinodeAPI:
         # run an LLM check. Both outlast the report-only timeout.
         timeout = 300.0 if (apply or deep_contradictions) else 30.0
         response = self.client.post("/lint", params=params or None, timeout=timeout)
+        response.raise_for_status()
+        return response.json()
+
+    def resolve(
+        self,
+        query: str | None = None,
+        ref: str | None = None,
+        context: list[str] | None = None,
+        intent: str | None = None,
+        max_items: int | None = None,
+        max_chars: int | None = None,
+    ) -> dict[str, Any]:
+        """Bounded resolution via the API.  ADR-010.
+
+        Raises ``RequestError`` if the API is unreachable; the CLI catches
+        this and resolves in-process instead (the operation needs no model).
+        """
+        body: dict[str, Any] = {}
+        if query:
+            body["query"] = query
+        if ref:
+            body["ref"] = ref
+        if context:
+            body["context"] = list(context)
+        if intent:
+            body["intent"] = intent
+        if max_items is not None:
+            body["max_items"] = max_items
+        if max_chars is not None:
+            body["max_chars"] = max_chars
+        response = self.client.post("/resolve", json=body, timeout=60.0)
         response.raise_for_status()
         return response.json()
 

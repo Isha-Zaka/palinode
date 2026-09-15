@@ -9,6 +9,23 @@ similar existing memories. Runs asynchronously via an in-process asyncio queue
 Errors in the check are logged but never propagate to the save caller. The
 save-never-fails invariant is load-bearing — see ADR-004 for rationale.
 
+A disk marker is the durable record of a job, so it outlives the enqueue: the
+sweep hands a copy to the worker and leaves the file in place, and only a
+completed run deletes it. A worker that times out, dies, or takes the process
+down with it therefore leaves the job pending for the next sweep instead of
+consuming it. Retries are bounded by ``write_time.max_attempts`` (3), counted
+in the marker itself so a restart cannot reset the bound; past it the marker
+is retired to ``.failed.json`` with the reason logged, because a poison job
+that loops forever and a marker that can never be cleared are both outages.
+
+The queue carries one other job kind. A ``revalidate`` item (written by
+:func:`palinode.core.revalidation.enqueue_revalidation`) is deterministic
+deferred work: it calls no LLM, re-derives its decision from live disk, and
+records a record's current backing state in its frontmatter. It rides this
+queue because this is where deferred memory writes already go — the same
+marker format, the same startup and idle sweeps, the same ``.failed.json``
+surface when one cannot be applied, and the same ``git_tools`` commit path.
+
 Public API:
     schedule_contradiction_check(file_path, item, *, sync=False, llm_fn=None) -> dict | None
     sweep_pending_markers() -> int
@@ -41,6 +58,13 @@ if TYPE_CHECKING:
     # every annotation in this module to strings.
     from palinode.consolidation.runner import LlmFn
 
+#: Marker item kind for the deterministic backing-revalidation job. Spelled
+#: out rather than imported so the save hot path does not pull in the
+#: resolution stack to enqueue a contradiction check; mirrors
+#: :data:`palinode.core.revalidation.MARKER_KIND`, and
+#: ``tests/test_write_time.py`` pins the two together.
+_REVALIDATE_KIND = "revalidate"
+
 logger = logging.getLogger("palinode.write_time")
 # Ensure INFO logs propagate even if the parent logger tree hasn't been
 # configured yet (e.g., when imported before the API logging setup).
@@ -53,6 +77,13 @@ logger.propagate = True
 # started from the API lifespan. Bounded at config.write_time.queue_max_size;
 # when full, new jobs fall through to disk-backed markers instead of blocking.
 _queue: asyncio.Queue | None = None
+
+#: Marker paths handed to the worker and not yet resolved. Deleting the marker
+#: at enqueue used to be what stopped a job being processed twice; now that the
+#: marker survives until the run reports success, this set is that guard. It is
+#: in-memory on purpose — a process that dies holds no claims, so its markers
+#: are free for the next startup sweep.
+_inflight: set[str] = set()
 
 
 def _get_queue() -> asyncio.Queue:
@@ -120,14 +151,21 @@ def schedule_contradiction_check(
 
 
 def sweep_pending_markers() -> int:
-    """Drain the disk-backed marker queue on API startup.
+    """Hand the disk-backed marker queue to the worker, oldest first.
 
     Reads all *.json files under {PALINODE_DIR}/{pending_dir}/ in timestamp
-    order, re-enqueues each one onto the in-process queue, and deletes the
-    marker on successful enqueue. If enqueue fails (queue full, etc.) the
-    marker is left in place and will be retried on the next sweep.
+    order and enqueues each one onto the in-process queue. The marker file is
+    **left on disk**: it is the job's durable record, and only a completed run
+    deletes it (`_consume_marker`, from the worker). A job whose worker times
+    out or dies is therefore still pending when the next sweep runs, which is
+    the retry ADR-004 describes.
 
-    Returns the number of markers successfully recovered.
+    Each handoff increments the marker's ``attempts`` counter before the job
+    goes on the queue. Past ``max_attempts`` the marker is retired to
+    ``.failed.json`` with the reason logged rather than retried forever. A
+    marker already in flight is skipped, not enqueued twice.
+
+    Returns the number of markers handed to the worker this pass.
     """
     cfg = config.consolidation.write_time
     if not cfg.sweep_on_startup:
@@ -141,44 +179,77 @@ def sweep_pending_markers() -> int:
         p for p in glob.glob(os.path.join(pending_dir, "*.json"))
         if not p.endswith(".failed.json")
     )
+    if not markers:
+        return 0
+
+    try:
+        queue = _get_queue()
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"write-time: sweep could not reach the queue: {e}")
+        return 0
+
+    max_attempts = max(1, cfg.max_attempts)
     recovered = 0
 
     for marker_path in markers:
+        if marker_path in _inflight:
+            continue
+
         try:
             with open(marker_path, encoding="utf-8") as f:
                 job = json.load(f)
         except (OSError, json.JSONDecodeError) as e:
-            logger.error(
-                f"write-time: corrupt marker {marker_path}: {e} — renaming to .failed.json"
-            )
-            _mark_failed(marker_path)
+            _mark_failed(marker_path, f"corrupt marker: {e}")
             continue
 
         file_path = job.get("file_path")
         item = job.get("item")
         if not file_path or not item:
-            logger.error(
-                f"write-time: marker missing file_path or item: {marker_path}"
-            )
-            _mark_failed(marker_path)
+            _mark_failed(marker_path, "marker missing file_path or item")
             continue
 
-        try:
-            queue = _get_queue()
-            queue.put_nowait({"file_path": file_path, "item": item})
-            os.remove(marker_path)
-            recovered += 1
-        except asyncio.QueueFull:
-            # Queue is full; leave marker on disk for next sweep
+        attempts = _attempts(job)
+        if attempts >= max_attempts:
+            _mark_failed(
+                marker_path,
+                f"no successful run after {attempts} attempt(s) "
+                f"(max_attempts={max_attempts})",
+            )
+            continue
+
+        # Checked before the counter is written so a full queue costs the job
+        # a sweep, not an attempt. Nothing awaits between here and put_nowait,
+        # so no other coroutine can take the slot.
+        if queue.full():
             logger.warning(
                 f"write-time: queue full during sweep, leaving marker: {marker_path}"
             )
             break
-        except Exception as e:  # noqa: BLE001
-            logger.error(
-                f"write-time: sweep enqueue failed for {marker_path}: {e}"
+
+        job["attempts"] = attempts + 1
+        try:
+            _record_attempt(marker_path, job)
+        except OSError as e:
+            # The persisted count is what bounds the retry. Unable to write it,
+            # this job would be retried forever — retire it instead.
+            _mark_failed(marker_path, f"could not record attempt: {e}")
+            continue
+
+        try:
+            queue.put_nowait(
+                {
+                    "file_path": file_path,
+                    "item": item,
+                    "marker_path": marker_path,
+                    "attempt": job["attempts"],
+                }
             )
-            _mark_failed(marker_path)
+        except Exception as e:  # noqa: BLE001
+            _mark_failed(marker_path, f"sweep enqueue failed: {e}")
+            continue
+
+        _inflight.add(marker_path)
+        recovered += 1
 
     if recovered:
         logger.info(f"write-time: recovered {recovered} pending markers")
@@ -194,6 +265,11 @@ async def start_worker(app_state: Any) -> None:
     if not config.consolidation.write_time.enabled:
         logger.info("write-time: disabled in config, not starting worker")
         return
+
+    # A starting worker owns nothing yet: any claim left by a previous one
+    # died with it, and holding it here would make those markers permanently
+    # unsweepable.
+    _inflight.clear()
 
     # Sweep first so recovered markers are in the queue before the worker starts
     sweep_pending_markers()
@@ -258,7 +334,11 @@ def _write_marker(file_path: str, item: dict[str, Any]) -> str:
     """Atomically write a disk marker for a pending check.
 
     Format: {PALINODE_DIR}/.palinode/pending/{utc_iso}-{uuid}.json
-    Content: {"file_path": ..., "item": ..., "enqueued_at": ...}
+    Content: {"file_path": ..., "item": ..., "enqueued_at": ..., "attempts": 0}
+
+    ``attempts`` is the number of times the sweep has handed this job to a
+    worker. It lives here, not in memory, because the bound it feeds has to
+    survive the restart that a crashed worker causes.
 
     Atomic via write-to-tmp + rename.
     """
@@ -275,6 +355,7 @@ def _write_marker(file_path: str, item: dict[str, Any]) -> str:
         "file_path": file_path,
         "item": item,
         "enqueued_at": datetime.now(UTC).isoformat(),
+        "attempts": 0,
     }
 
     with open(tmp_path, "w", encoding="utf-8") as f:
@@ -283,17 +364,69 @@ def _write_marker(file_path: str, item: dict[str, Any]) -> str:
     return marker_path
 
 
-def _mark_failed(marker_path: str) -> None:
+def _attempts(job: dict[str, Any]) -> int:
+    """How many times this job has already been handed to a worker.
+
+    Markers written before the counter existed have no ``attempts`` key; they
+    start at zero and get the full bound.
+    """
+    try:
+        return max(0, int(job.get("attempts", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _record_attempt(marker_path: str, job: dict[str, Any]) -> None:
+    """Rewrite a marker in place with its updated attempt count.
+
+    Same write-to-tmp + rename as `_write_marker`, and the same file name, so
+    the marker keeps its position in the oldest-first sweep order. Raises
+    OSError to its caller: an attempt that cannot be recorded is not bounded,
+    and the caller retires the marker rather than retry it blind.
+    """
+    tmp_path = marker_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(job, f)
+    os.rename(tmp_path, marker_path)
+
+
+def _consume_marker(marker_path: str | None) -> None:
+    """Delete the marker of a job that ran to completion.
+
+    Success is what retires a pending marker — enqueue is not (ADR-004). A
+    marker that survives its run is retried by the next sweep, so failing to
+    delete one costs a duplicate pass, not a lost job.
+    """
+    if not marker_path:
+        return
+    try:
+        os.remove(marker_path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.error(
+            f"write-time: could not remove completed marker {marker_path}: {e}"
+        )
+
+
+def _mark_failed(marker_path: str, reason: str = "") -> None:
     """Rename a corrupt or permanently-failed marker to .failed.json.
 
     Fail-loud design: failed markers are preserved for operator review
-    rather than retried silently forever.
+    rather than retried silently forever. The reason is logged at ERROR so
+    the rename is never the only record of why the job stopped.
     """
+    if reason:
+        logger.error(
+            f"write-time: retiring marker {marker_path} to .failed.json: {reason}"
+        )
     failed_path = marker_path.replace(".json", ".failed.json")
     try:
         os.rename(marker_path, failed_path)
     except OSError as e:
         logger.error(f"write-time: could not rename failed marker: {e}")
+    finally:
+        _inflight.discard(marker_path)
 
 
 def _pending_dir() -> str:
@@ -339,6 +472,7 @@ async def _worker_loop(queue: asyncio.Queue) -> None:
 
         file_path = job.get("file_path", "<missing>")
         item = job.get("item", {})
+        marker_path = job.get("marker_path")
 
         try:
             # Run the actual LLM call in a thread — _check_contradictions is
@@ -352,12 +486,34 @@ async def _worker_loop(queue: asyncio.Queue) -> None:
                 f"write-time: file={os.path.basename(file_path)} "
                 f"ops={len(ops)} applied={result.get('applied_stats', {})}"
             )
+            # The run completed. Only now is the job's durable record spent.
+            _consume_marker(marker_path)
         except asyncio.TimeoutError:
-            logger.error(f"write-time: timeout on {file_path}")
+            logger.error(f"write-time: timeout on {file_path}{_retry_note(job)}")
         except Exception as e:  # noqa: BLE001
-            logger.error(f"write-time: job failed for {file_path}: {e}")
+            logger.error(
+                f"write-time: job failed for {file_path}: {e}{_retry_note(job)}"
+            )
         finally:
+            if marker_path:
+                _inflight.discard(marker_path)
             queue.task_done()
+
+
+def _retry_note(job: dict[str, Any]) -> str:
+    """The retry clause for a failed job's log line.
+
+    A marker-backed job is left pending for the next sweep; an in-memory one
+    has no durable record and is genuinely gone, which the log should say
+    rather than imply a recovery that will not happen.
+    """
+    if not job.get("marker_path"):
+        return " (no pending marker — job not retried)"
+    max_attempts = max(1, config.consolidation.write_time.max_attempts)
+    return (
+        f" (attempt {job.get('attempt', '?')}/{max_attempts}; "
+        f"marker left pending for the next sweep)"
+    )
 
 
 # ── Internal: actual work (sync path and worker both call this) ────────────
@@ -382,8 +538,23 @@ def _run_check_and_apply(
 
     Returns:
         {"operations": [...], "applied_stats": {...}}
-        "applied_stats" is empty dict when no ops were applied.
+        "applied_stats" is empty dict when the check proposed nothing
+        actionable. Otherwise it carries `translation_skipped` — the
+        actionable ops `_translate_ops` dropped as malformed — plus, once
+        anything was routed, the executor's stats summed across every file
+        the ops were routed to (see `_route_ops`) and this applier's own
+        `ROUTE_STATS`.
     """
+    # A `revalidate` job is not a contradiction check: it is deterministic,
+    # calls no LLM, and re-derives its own decision from live disk. It rides
+    # this queue because this is where deferred memory writes already go —
+    # same marker, same sweep, same failure surface, same commit path.
+    if item.get("kind") == _REVALIDATE_KIND:
+        from palinode.core import revalidation
+
+        stats = revalidation.apply_revalidation(file_path, item)
+        return {"operations": [], "applied_stats": stats, "llm_latency_ms": 0}
+
     # Import here to avoid circular import at module load time
     from palinode.consolidation.runner import _check_contradictions
     from palinode.consolidation.executor import apply_operations
@@ -402,20 +573,39 @@ def _run_check_and_apply(
         if op_kind(op) not in ("NOOP", "ADD")
     ]
 
+    # The candidate rows each proposal was generated against. Popped so the
+    # returned `operations` keep the shape callers (the sync save result, the
+    # CLI's summary line) already print — the rows are routing input, not
+    # part of the proposal.
+    candidates: list[dict] = []
+    for op in operations:
+        candidates.extend(op.pop("candidates", None) or [])
+
     applied_stats: dict[str, int] = {}
     if actionable:
         # Translate _check_contradictions output to executor input format.
         # _check_contradictions returns {"operation": "UPDATE", "item": {...}, ...}
         # apply_operations expects {"op": "UPDATE", "id": ..., ...}
         executor_ops = _translate_ops(actionable, file_path)
+        # An actionable op the translator produced nothing for was malformed
+        # (no target id, an unknown kind, or an UPDATE with no replacement
+        # text). Counted so a pass that applied nothing still says why.
+        applied_stats["translation_skipped"] = len(actionable) - len(executor_ops)
         if executor_ops:
-            try:
-                applied_stats = apply_operations(file_path, executor_ops)
-                _git_commit_dedup(file_path)
-            except Exception as e:  # noqa: BLE001
-                logger.error(
-                    f"write-time: executor apply failed for {file_path}: {e}"
-                )
+            routed, route_stats = _route_ops(executor_ops, file_path, candidates)
+            applied_stats.update(route_stats)
+            for target, target_ops in routed:
+                try:
+                    file_stats = apply_operations(target, target_ops)
+                    for key, value in file_stats.items():
+                        applied_stats[key] = applied_stats.get(key, 0) + value
+                    _git_commit_dedup(target)
+                    if _mutated(file_stats):
+                        _reindex(target)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(
+                        f"write-time: executor apply failed for {target}: {e}"
+                    )
 
     logger.debug(
         f"write-time: check complete file={file_path} "
@@ -441,13 +631,26 @@ def _translate_ops(
         {"op": "UPDATE"|"SUPERSEDE"|..., "id": "...", ...}
 
     Mappings:
-        "UPDATE"  → {"op": "UPDATE", ...}  (update the matched existing line)
-        "DELETE"  → {"op": "SUPERSEDE", ...}  (we don't delete; supersede instead)
+        "UPDATE"  → {"op": "UPDATE", ...}  when the op carries ``new_text``
+                    (rewrite the matched existing line with exactly that text)
+        "UPDATE"  → nothing when it carries none: the op is malformed and is
+                    skipped, with a warning naming the target id
+        "DELETE"  → {"op": "SUPERSEDE", ...}  when the op carries ``new_text``
+                    (we don't delete; the text is the successor line)
+        "DELETE"  → {"op": "ARCHIVE", ...}  when it carries none: a retirement
+                    with no replacement, retired into history
         Everything else is filtered out by the caller.
 
-    Both mappings carry ``new_text`` — the executor's guard on each op
-    requires it (a missing/empty ``new_text`` is treated as a malformed op
-    and dropped without mutation, stats increment, or log line).
+    The replacement text is never synthesised from the saved item. The item's
+    ``content`` is the whole body of the file that triggered the check; a
+    SUPERSEDE inserts ``new_text`` verbatim as one fact line after the
+    tombstone and an UPDATE rewrites the target line with it — a multi-line
+    save used to land in the target as a single line carrying every fact id
+    it contained, duplicating each of them. A text-less DELETE is what the
+    checker means by "this fact is retired"; the executor's ARCHIVE is that
+    op, and its ADR-020 guard rejects it on a superseded-only (identity)
+    document rather than forging a successor. A text-less UPDATE says nothing
+    the executor could apply, so it is dropped rather than guessed at.
     """
     translated = []
     for op in contradiction_ops:
@@ -458,37 +661,161 @@ def _translate_ops(
             continue
 
         if operation == "UPDATE":
+            new_text = op.get("new_text")
+            if not new_text:
+                logger.warning(
+                    "write-time: UPDATE skipped — fact id=%r carries no new_text; "
+                    "the saved body is never used as the replacement",
+                    target_id,
+                )
+                continue
             translated.append(
                 {
                     "op": "UPDATE",
                     "id": target_id,
-                    "new_text": op.get("new_text")
-                    or op.get("item", {}).get("content", ""),
+                    "new_text": new_text,
                     "reason": op.get("reason", "write-time dedup"),
                 }
             )
         elif operation == "DELETE":
-            translated.append(
-                {
-                    "op": "SUPERSEDE",
-                    "id": target_id,
-                    # The executor's SUPERSEDE writes `new_text` as the
-                    # replacement fact line inserted after the strikethrough
-                    # of the old one (see executor._supersede_fact) — it is
-                    # not optional. A write-time DELETE means the new item
-                    # (op["item"]) is what superseded the target fact, so its
-                    # content is the replacement text, mirroring how
-                    # `superseded_by` below already sources the new item's id.
-                    # Without this key the executor's `if fact_id and new_text`
-                    # guard silently drops the op — the write-time-DELETE bug
-                    # this translation exists to fix.
-                    "new_text": op.get("new_text")
-                    or op.get("item", {}).get("content", ""),
-                    "superseded_by": op.get("item", {}).get("id", ""),
-                    "reason": op.get("reason", "write-time: superseded"),
-                }
-            )
+            new_text = op.get("new_text")
+            if new_text:
+                translated.append(
+                    {
+                        "op": "SUPERSEDE",
+                        "id": target_id,
+                        # Inserted verbatim as the successor fact line after
+                        # the tombstone (see executor._supersede_fact).
+                        "new_text": new_text,
+                        "superseded_by": op.get("item", {}).get("id", ""),
+                        "reason": op.get("reason", "write-time: superseded"),
+                    }
+                )
+            else:
+                translated.append(
+                    {
+                        "op": "ARCHIVE",
+                        "id": target_id,
+                        "reason": op.get("reason", "write-time: retired"),
+                    }
+                )
     return translated
+
+
+#: Executor stats that mean the target file's body changed. The rejection and
+#: no-op counters (``unmatched``, ``*_rejected``, ``kept``) are excluded so a
+#: dropped op never triggers a reindex of an untouched file.
+_MUTATION_STATS = ("updated", "merged", "superseded", "archived", "retracted",
+                   "contradicts_proposed")
+
+#: Stats this applier adds to the executor's, always present once ops were
+#: routed so a quiet pass reports ``0`` rather than omitting the key.
+ROUTE_STATS: tuple[str, ...] = ("ambiguous_rejected", "stale_rejected")
+
+
+def _mutated(stats: dict[str, int]) -> bool:
+    return any(stats.get(key, 0) for key in _MUTATION_STATS)
+
+
+def _route_ops(
+    executor_ops: list[dict], file_path: str, candidates: list[dict]
+) -> tuple[list[tuple[str, list[dict]]], dict[str, int]]:
+    """Group executor ops by the file that owns each op's target fact.
+
+    The contradiction check retrieves candidates across every stored file,
+    but ``apply_operations`` is per-file and used to be called on the
+    just-saved file only. A proposal naming a fact that lives in another file
+    was therefore dropped as ``unmatched`` (the fact is not in the saved
+    file), and one naming an id that happens to exist in *both* the saved
+    file and a candidate mutated the saved file's copy — the wrong target.
+
+    Ownership is resolved against the candidate rows the proposal was
+    generated from, not a store-wide lookup: the model could only name a fact
+    it saw. Three outcomes per op:
+
+    * exactly one candidate file carries the id → the op goes to that file,
+      **provided** the candidate section it was proposed against is still
+      what is on disk (``store.check_freshness`` against the row's
+      ``content_hash``). A stale section means the target changed between
+      proposal and application; the op is rejected as ``stale_rejected``
+      rather than applied last-write-wins.
+    * more than one candidate file carries the id → ``ambiguous_rejected``.
+      The executor could only ever pick one, and there is no deterministic
+      way to know which the model meant.
+    * no candidate carries the id → the op goes to the saved file, exactly
+      as before. The executor reports it ``unmatched`` if the id is not there
+      either.
+
+    Returns ``(routed, stats)``: ``routed`` is ``[(target_path, ops), …]`` in
+    first-seen order, ``stats`` holds the two rejection counters.
+    """
+    from palinode.consolidation.status_doc import fact_ids
+    from palinode.core import store
+
+    stats = {key: 0 for key in ROUTE_STATS}
+
+    # fact id → {realpath: (spelling, [candidate rows carrying the id])}
+    owners: dict[str, dict[str, tuple[str, list[dict]]]] = {}
+    for row in candidates:
+        path = row.get("file_path") or ""
+        if not path:
+            continue
+        if not os.path.isabs(path):
+            path = os.path.join(config.palinode_dir, path)
+        key = os.path.realpath(path)
+        for fid in fact_ids(row.get("content") or ""):
+            spelling, rows = owners.setdefault(fid, {}).setdefault(key, (path, []))
+            rows.append(row)
+
+    saved_key = os.path.realpath(file_path)
+    routed: dict[str, list[dict]] = {}
+    for op in executor_ops:
+        fid = op.get("id")
+        files = owners.get(fid, {})
+        if len(files) > 1:
+            logger.warning(
+                "write-time: %s rejected — fact id=%r is present in %d candidate "
+                "files, target is ambiguous: %s",
+                op.get("op"), fid, len(files),
+                ", ".join(sorted(os.path.relpath(p, config.palinode_dir) for p, _ in files.values())),
+            )
+            stats["ambiguous_rejected"] += 1
+            continue
+        if files:
+            key, (spelling, rows) = next(iter(files.items()))
+            target = file_path if key == saved_key else spelling
+            fresh = store.check_freshness([dict(r) for r in rows])
+            if any(r.get("freshness") == "stale" for r in fresh):
+                logger.warning(
+                    "write-time: %s rejected — fact id=%r in %s changed on disk "
+                    "since the proposal was generated (stale precondition)",
+                    op.get("op"), fid, os.path.relpath(target, config.palinode_dir),
+                )
+                stats["stale_rejected"] += 1
+                continue
+        else:
+            target = file_path
+        routed.setdefault(target, []).append(op)
+
+    return list(routed.items()), stats
+
+
+def _reindex(file_path: str) -> None:
+    """Re-index a file this pass mutated, so the store's row (and the
+    ``content_hash`` the next proposal's precondition is checked against)
+    reflects what is on disk without waiting for the watcher. Best-effort:
+    a failure is logged, never raised — the file is on disk and reaches the
+    index when the watcher next sees it."""
+    try:
+        from palinode.indexer.index_file import index_file
+
+        outcome = index_file(file_path)
+        if outcome.get("error"):
+            logger.warning(
+                "write-time: reindex reported %s for %s", outcome["error"], file_path,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("write-time: reindex failed for %s: %s", file_path, exc)
 
 
 def _git_commit_dedup(file_path: str) -> None:
@@ -496,11 +823,18 @@ def _git_commit_dedup(file_path: str) -> None:
 
     Keeps history clean: you can blame a memory line back to either the
     original user save or the subsequent write-time dedup pass. Through the
-    git_tools choke point (commit_memory_file) rather than a raw
+    git_tools choke point (commit_memory_files) rather than a raw
     subprocess.run — that primitive already no-ops when
     config.git.auto_commit is off and already logs its own I/O failures, so
-    this is now a thin wrapper for the dedup-specific commit message.
+    this is a thin wrapper for the dedup-specific commit message.
+
+    Stages the target's ``-history.md`` sibling with it when one exists: a
+    SUPERSEDE appends the retired text there, and the runner's compaction
+    commit (``runner._touched_files``) already treats the pair as one
+    mutation. Left out, the sibling sat untracked until some later sweep.
     """
+    from palinode.consolidation.runner import _touched_files
+
     rel = os.path.relpath(file_path, config.palinode_dir)
     msg = f"{config.git.commit_prefix} write-time dedup: {rel}"
-    git_tools.commit_memory_file(file_path, msg)
+    git_tools.commit_memory_files(_touched_files(file_path), msg)

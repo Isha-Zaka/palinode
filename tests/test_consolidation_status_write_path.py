@@ -45,6 +45,11 @@ def _seed(memory_dir: Path, monkeypatch) -> Path:
     monkeypatch.setattr(config, "memory_dir", str(memory_dir))
     monkeypatch.setattr(config, "db_path", str(memory_dir / ".palinode.db"))
     monkeypatch.setattr(config.git, "auto_commit", True)
+    # The deterministic age sweep is off for this module: its subject is
+    # what the *model* proposes and what the writer does with it, and a
+    # fixture dated months back would otherwise be retired by age before
+    # the proposal is ever read. The sweep has its own tests.
+    monkeypatch.setattr(config.consolidation, "status_log_retention_days", 0)
 
     for sub in ("projects", "specs/prompts", "daily"):
         (memory_dir / sub).mkdir(parents=True, exist_ok=True)
@@ -80,6 +85,13 @@ def _fake_llm(ops: list[dict]):
 
 def _log_lines(text: str) -> list[str]:
     return re.findall(r"^- \[[A-Z_]+\].*$", text, re.MULTILINE)
+
+
+def _elision_line(text: str) -> str:
+    """The single ``- _[log elided] …_`` bullet, whole, marker included."""
+    found = re.findall(r"^- _\[log elided\].*$", text, re.MULTILINE)
+    assert len(found) == 1, f"expected exactly one elision bullet, got {found}"
+    return found[0]
 
 
 def _frontmatter(text: str) -> dict:
@@ -236,7 +248,12 @@ def test_merge_that_retired_nothing_writes_no_merge_line(tmp_path, monkeypatch):
 def test_preview_and_write_agree_on_rationale(tmp_path, monkeypatch):
     """The regression that let this ship: preview and write must render the same
     rationale for the same operation."""
-    ops = [{"op": "RETRACT", "id": "f1", "rationale": "Measured wrong."}]
+    # Cites today's note, which the prompt renders: the propose-side guard
+    # downgrades a RETRACT that names nothing in context, and this test is
+    # about the rationale of one that is applied.
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    ops = [{"op": "RETRACT", "id": "f1", "rationale": "Measured wrong.",
+            "falsified_by": f"daily/{today}"}]
 
     preview_dir = tmp_path / "preview"
     preview_dir.mkdir()
@@ -292,6 +309,53 @@ def test_log_stays_bounded_across_many_runs(tmp_path, monkeypatch):
     assert len(elision) == 1
     assert "15 operation line(s) across 15 date block(s)" in elision[0]
     assert "2026-06-01 → 2026-06-15" in elision[0]
+
+
+def test_elision_rewrite_keeps_the_same_fact_marker(tmp_path, monkeypatch):
+    """Absorbing one more date block must not un-tag the elision bullet.
+
+    The elision line is an ordinary body bullet, so ``bootstrap-ids`` stamps it
+    a ``<!-- fact:… -->`` marker like every other one. The re-render parsed the
+    counters off the front of the line and rebuilt it from those alone, so the
+    marker fell off every time the counts moved. The id is what
+    ``backed_by``/blame references point at: the assertion is that it is the
+    *same* id, not merely that some marker is present — a fresh one each time
+    the text changes is the failure this prevents.
+    """
+    target = _seed(tmp_path, monkeypatch)
+    ops = [{"op": "UPDATE", "id": "f1", "rationale": "another day, another op"}]
+    start = datetime(2026, 6, 1, tzinfo=UTC)
+    elided_id = "proj-status-65b9c4"
+
+    def _run_on_day(day: int) -> None:
+        monkeypatch.setattr(
+            runner, "_utc_now", lambda d=day: start + timedelta(days=d)
+        )
+        runner._update_status_summary(str(target), ops, known_fact_ids={"f1"})
+
+    # One block past the cap, so exactly one block is elided.
+    for day in range(config.consolidation.status_log_max_blocks + 1):
+        _run_on_day(day)
+
+    text = target.read_text(encoding="utf-8")
+    first_render = _elision_line(text)
+    assert "across 1 date block(s)" in first_render
+
+    # What `bootstrap-ids` does to an untagged body bullet.
+    target.write_text(
+        text.replace(first_render, f"{first_render} <!-- fact:{elided_id} -->"),
+        encoding="utf-8",
+    )
+
+    # One more day: a second block is absorbed, so the bullet is re-rendered.
+    _run_on_day(config.consolidation.status_log_max_blocks + 1)
+
+    text = target.read_text(encoding="utf-8")
+    rerendered = _elision_line(text)
+    assert "across 2 date block(s)" in rerendered
+    assert rerendered.endswith(f"<!-- fact:{elided_id} -->")
+    assert status_doc.fact_ids(text) == {"f1", elided_id}
+    assert _frontmatter(text)["memory_count"] == 2
 
 
 def test_same_day_reruns_do_not_duplicate_the_heading(tmp_path, monkeypatch):

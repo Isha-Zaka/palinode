@@ -282,6 +282,13 @@ def test_deep_contradiction_already_recorded_is_not_reproposed(memdir):
             {},
             "proposer: conservative class (decisions/)",
         ),
+        # A decision that declares the *other* way is stopped by the invariant,
+        # and the reason names the declaration, not the conservative list.
+        (
+            "decisions/declared-protected.md",
+            {"retirement_policy": "superseded-only"},
+            "retirement_policy: superseded-only (declared:retirement_policy)",
+        ),
     ],
 )
 def test_excluded_document_classes_are_never_age_archived(memdir, rel, extra, reason):
@@ -318,6 +325,48 @@ def test_a_declared_age_eligible_person_document_becomes_proposable(memdir):
     assert [s for s in result["skipped"] if s["file"] == "people/ada.md"] == []
 
 
+def test_a_declared_age_eligible_decision_overrides_proposer_conservatism(memdir):
+    """The declaration wins: ``decisions/`` conservatism speaks only for the unclassified.
+
+    An explicit ``retirement_policy: age-eligible`` is the operator saying the
+    decision is episodic. It already outranks every inferred signal in the
+    classifier; it outranks the proposer's own caution for the same reason.
+    """
+    _write(memdir, "decisions/x.md", days_old=900, extra={"retirement_policy": "age-eligible"})
+    _write(memdir, "decisions/y.md", days_old=900)
+
+    result = _proposals(memdir)
+
+    archives = _for(result, "stale_files")
+    assert [op["file"] for op in archives] == ["decisions/x.md"]
+    assert archives[0]["op"] == "ARCHIVE"
+    assert archives[0]["applicable"] is True
+    assert [s for s in result["skipped"] if s["file"] == "decisions/x.md"] == []
+    # The undeclared sibling is still skipped, and the reason names the lever.
+    skipped = [s for s in result["skipped"] if s["file"] == "decisions/y.md"]
+    assert len(skipped) == 1
+    assert "proposer: conservative class (decisions/)" in skipped[0]["reason"]
+    assert "declare `retirement_policy: age-eligible` to opt in" in skipped[0]["reason"]
+
+
+def test_archive_exclusion_reads_the_declaration_through_the_classifier():
+    """No second parser: the override is the classifier's own declared signal."""
+    from palinode.consolidation.retirement import DECLARED_SIGNAL, classify
+
+    assert classify("decisions/x.md", {"retirement_policy": "age-eligible"}) == (
+        "age-eligible", DECLARED_SIGNAL
+    )
+    assert propose_mod._archive_exclusion(
+        "decisions/x.md", {"retirement_policy": "age-eligible"}
+    ) is None
+    # An invalid value is no declaration: the classifier falls back to the
+    # inferred regime, and so the proposer's conservatism still applies.
+    reason = propose_mod._archive_exclusion(
+        "decisions/x.md", {"retirement_policy": "sometimes"}
+    )
+    assert reason is not None and "proposer: conservative class (decisions/)" in reason
+
+
 def test_no_archive_is_ever_proposed_against_a_superseded_only_document(memdir):
     """The invariant, over a mixed store: propose ARCHIVE ⇒ not superseded-only.
 
@@ -334,6 +383,7 @@ def test_no_archive_is_ever_proposed_against_a_superseded_only_document(memdir):
         ("projects/alpha-status.md", {}),
         ("projects/beta-status.md", {"retirement_policy": "superseded-only"}),
         ("decisions/keep-it.md", {}),
+        ("decisions/episodic.md", {"retirement_policy": "age-eligible"}),
         ("insights/rotting.md", {}),
         ("insights/identity.md", {"type": "PersonMemory"}),
         ("insights/personal.md", {"category": "person"}),

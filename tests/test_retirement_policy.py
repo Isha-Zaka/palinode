@@ -11,7 +11,10 @@ Three surfaces, one rule:
   in place and still archives an episodic one;
 - the executor refuses an age-argued ARCHIVE against a superseded-only
   document, applies one that names ``superseded_by``, and is a strict no-op for
-  an episodic document.
+  an episodic document;
+- the executor refuses an uncited RETRACT against a superseded-only document,
+  applies one that names ``falsified_by``, and leaves RETRACT on an
+  episodic document exactly as it was.
 
 Real files under ``tmp_path``, real SQLite for the sweep — no mocks.
 """
@@ -249,21 +252,149 @@ def test_executor_applies_the_same_age_archive_to_an_episodic_document(tmp_path)
     assert "fact:f1" not in open(path, encoding="utf-8").read()
 
 
-def test_executor_leaves_supersede_and_retract_alone_on_a_profile_document(tmp_path):
+def test_executor_leaves_supersede_alone_on_a_profile_document(tmp_path):
     path = _write(
         tmp_path, "people/alice.md", "id: person-alice\ncategory: person",
-        "# Alice\n\n- [2024-01-01] Dog is Rex <!-- fact:f1 -->\n"
-        "- [2024-01-02] Lives in Berlin <!-- fact:f2 -->\n",
+        "# Alice\n\n- [2024-01-01] Dog is Rex <!-- fact:f1 -->\n",
     )
 
     stats = apply_operations(path, [
         {"op": "SUPERSEDE", "id": "f1", "new_text": "Dog is Fido", "reason": "the dog changed"},
-        {"op": "RETRACT", "id": "f2", "reason": "never true — that was her sister"},
     ])
 
     assert stats["superseded"] == 1
+    assert stats["protected_rejected"] == 0
+
+
+# ── evidence-gated RETRACT ───────────────────────────────────────────────────
+
+_UNCITED_RETRACT = {
+    "op": "RETRACT", "id": "f1",
+    "rationale": "known to be incorrect",  # the shape the rig smoke saw fabricated
+}
+
+
+def test_executor_rejects_uncited_retract_on_a_profile_document(tmp_path, caplog):
+    path = _write(tmp_path, "people/alice.md", "id: person-alice\ncategory: person", _PROFILE_BODY)
+    before = open(path, encoding="utf-8").read()
+
+    with caplog.at_level(logging.WARNING, logger="palinode.consolidation.executor"):
+        stats = apply_operations(path, [dict(_UNCITED_RETRACT)])
+
+    assert stats["retracted"] == 0
+    assert stats["protected_rejected"] == 1
+    assert open(path, encoding="utf-8").read() == before
+    assert not os.path.exists(_history_path(path))
+    assert "RETRACT rejected by retirement_policy=superseded-only" in caplog.text
+    assert "(category:person)" in caplog.text
+    assert "falsified_by" in caplog.text
+    assert "'known to be incorrect'" in caplog.text
+
+
+@pytest.mark.parametrize("falsified_by", ["", "   ", None])
+def test_executor_treats_a_blank_falsified_by_as_absent(tmp_path, falsified_by):
+    path = _write(tmp_path, "people/alice.md", "id: person-alice\ncategory: person", _PROFILE_BODY)
+    before = open(path, encoding="utf-8").read()
+
+    stats = apply_operations(path, [dict(_UNCITED_RETRACT, falsified_by=falsified_by)])
+
+    assert stats["retracted"] == 0 and stats["protected_rejected"] == 1
+    assert open(path, encoding="utf-8").read() == before
+    assert not os.path.exists(_history_path(path))
+
+
+def test_executor_applies_retract_naming_falsified_by(tmp_path):
+    path = _write(
+        tmp_path, "people/alice.md", "id: person-alice\ncategory: person",
+        "# Alice\n\n- [2024-01-01] Alice's dog is named Rex <!-- fact:f1 -->\n"
+        "- [2024-03-01] Alice has never owned a dog; Rex is her sister's <!-- fact:f9 -->\n",
+    )
+
+    stats = apply_operations(path, [
+        {"op": "RETRACT", "id": "f1", "reason": "never true — Rex is her sister's dog",
+         "falsified_by": "f9"},
+    ])
+
     assert stats["retracted"] == 1
     assert stats["protected_rejected"] == 0
+    after = open(path, encoding="utf-8").read()
+    assert "~~[2024-01-01] Alice's dog is named Rex~~ [RETRACTED" in after
+    assert "<!-- fact:f1 -->" in after
+    assert "fact:f9" in after  # the evidence is untouched
+    assert os.path.exists(_history_path(path))
+    # Mirrors ARCHIVE's `superseded_by`: the field gates, it is not written.
+    assert "falsified_by" not in after
+    assert "f9" not in open(_history_path(path), encoding="utf-8").read()
+
+
+def test_executor_accepts_a_memory_ref_as_falsified_by(tmp_path):
+    # The evidence may live in another memory, not just a fact in this file.
+    path = _write(tmp_path, "people/alice.md", "id: person-alice\ncategory: person", _PROFILE_BODY)
+    stats = apply_operations(path, [
+        dict(_UNCITED_RETRACT, falsified_by="daily/2024-03-01.md"),
+    ])
+    assert stats["retracted"] == 1 and stats["protected_rejected"] == 0
+
+
+def test_executor_retract_guard_covers_every_superseded_only_signal(tmp_path):
+    for rel, fm in (
+        ("projects/alpha.md", "id: project-alpha\ncategory: project"),
+        ("insights/pinned.md", "id: insight-pinned\ncore: true"),
+        ("insights/house-rules.md", "id: insight-rules\nretirement_policy: superseded-only"),
+    ):
+        path = _write(tmp_path, rel, fm, _PROFILE_BODY)
+        assert apply_operations(path, [dict(_UNCITED_RETRACT)])["protected_rejected"] == 1
+        assert apply_operations(
+            path, [dict(_UNCITED_RETRACT, falsified_by="f9")]
+        )["retracted"] == 1
+
+
+def test_executor_retract_on_an_episodic_document_is_unchanged(tmp_path):
+    # The pass-through: no evidence field, no guard, exactly the old behaviour.
+    path = _write(
+        tmp_path, "projects/alpha-status.md", "id: project-alpha-status\ncategory: project",
+        "# Alpha status\n\n- [2024-01-01] Sprint 1 closed <!-- fact:f1 -->\n",
+    )
+
+    stats = apply_operations(path, [dict(_UNCITED_RETRACT)])
+
+    assert stats["retracted"] == 1
+    assert stats["protected_rejected"] == 0
+    assert "~~[2024-01-01] Sprint 1 closed~~ [RETRACTED" in open(path, encoding="utf-8").read()
+    # A status layer's history sibling is its project's: `alpha-history.md`.
+    assert os.path.exists(str(tmp_path / "projects" / "alpha-history.md"))
+
+
+def test_executor_retract_guard_honours_the_age_eligible_override(tmp_path):
+    path = _write(
+        tmp_path, "people/former.md",
+        "id: person-former\ncategory: person\nretirement_policy: age-eligible",
+        "# Former\n\n- [2024-01-01] Contract fact <!-- fact:f1 -->\n",
+    )
+    stats = apply_operations(path, [dict(_UNCITED_RETRACT)])
+    assert stats["retracted"] == 1 and stats["protected_rejected"] == 0
+
+
+def test_executor_replace_guard_still_rejects_retract_first(tmp_path, caplog):
+    # A living doc is both `update_policy: replace` and superseded-only. The
+    # ADR-015 guard fires first and its message is the one logged; naming
+    # `falsified_by` does not reopen a path that guard closed.
+    path = _write(tmp_path, "inbox/uptime.md", "id: uptime\nupdate_policy: replace", _PROFILE_BODY)
+    with caplog.at_level(logging.WARNING, logger="palinode.consolidation.executor"):
+        stats = apply_operations(path, [dict(_UNCITED_RETRACT, falsified_by="f9")])
+    assert stats["retracted"] == 0 and stats["protected_rejected"] == 1
+    assert "update_policy=replace guard" in caplog.text
+    assert "retirement_policy=superseded-only" not in caplog.text
+
+
+def test_executor_retract_guard_is_deterministic_across_repeat_runs(tmp_path):
+    path = _write(tmp_path, "people/alice.md", "id: person-alice\ncategory: person", _PROFILE_BODY)
+    before = open(path, encoding="utf-8").read()
+
+    runs = [apply_operations(path, [dict(_UNCITED_RETRACT)]) for _ in range(3)]
+
+    assert all(s["protected_rejected"] == 1 and s["retracted"] == 0 for s in runs)
+    assert open(path, encoding="utf-8").read() == before
 
 
 def test_executor_guard_applies_to_a_project_profile_but_not_its_status_layer(tmp_path):

@@ -624,6 +624,7 @@ from palinode.api.routers.git_history import router as _git_history_router  # no
 from palinode.api.routers.health import router as _health_router  # noqa: E402
 from palinode.api.routers.maintenance import router as _maintenance_router  # noqa: E402
 from palinode.api.routers.memory import router as _memory_router  # noqa: E402
+from palinode.api.routers.resolve import router as _resolve_router  # noqa: E402
 from palinode.api.routers.search import router as _search_router  # noqa: E402
 from palinode.api.routers.session import router as _session_router  # noqa: E402
 from palinode.api.routers.triggers import router as _triggers_router  # noqa: E402
@@ -632,6 +633,7 @@ app.include_router(_consolidation_router)
 app.include_router(_git_history_router)
 app.include_router(_memory_router)
 app.include_router(_search_router)
+app.include_router(_resolve_router)
 app.include_router(_health_router)
 app.include_router(_maintenance_router)
 app.include_router(_session_router)

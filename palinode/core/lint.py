@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import glob
 import re
@@ -10,7 +11,14 @@ import frontmatter as _frontmatter
 
 from palinode.core.config import config
 from palinode.core import parser
+from palinode.core import revalidation
+from palinode.core import typed_links
+from palinode.core.packing import estimate_tokens
 from palinode.core.relative_dates import anchor_for, find_relative_dates
+
+#: What to do about a `core: true` memory that has grown past a gist. Carried
+#: on every finding so the instruction reaches whichever surface renders it.
+CORE_GIST_REMEDIATION = "core = gist + pointer; move detail to the full file"
 
 # Marker written by Deliverable C (palinode_save auto-footer plumbing).
 # Wikilinks that appear under this marker count as satisfying the entity
@@ -401,6 +409,10 @@ def run_lint_pass() -> dict[str, Any]:
     # away leaves a `stale_backing` entry on each dependent; the memory is
     # still live but its support was withdrawn, so it wants a second look.
     stale_backing: list[dict[str, Any]] = []
+    # A `core: true` memory is injected at every session start, so it is the
+    # one tier whose size is spent whether or not anyone wanted it. Past
+    # `context.core_gist_max_chars` it has stopped being an index entry.
+    oversized_core: list[dict[str, Any]] = []
     core_count = 0
 
     now = datetime.now(timezone.utc)
@@ -436,14 +448,34 @@ def run_lint_pass() -> dict[str, Any]:
                 "path": rel_path,
                 "metadata": metadata,
                 "body": body_text,
+                # The whole-file revision (``file_sha256``), computed from the
+                # bytes already in hand: what a revalidation receipt names, so
+                # the support pass below can compare without a second read.
+                "revision": hashlib.sha256(content.encode()).hexdigest(),
             })
         except Exception:
             pass
 
+    # The reader the support pass (10) checks backing through: the files this
+    # scan already read, falling back to disk for the ones it skipped —
+    # `archive/` above all, where a source retired *by location* lives and
+    # where the map would otherwise report it merely missing.
+    _scanned = {
+        revalidation.normalize_ref(f["path"]): (
+            f["metadata"], f.get("revision"), f["path"].replace(os.sep, "/")
+        )
+        for f in all_files
+    }
+    _from_scan = revalidation.mapping_reader(_scanned, now=now)
+    _from_disk = revalidation.disk_reader(base_dir, now=now)
+
+    def _support_read(ref: str) -> revalidation.SourceView | None:
+        return _from_scan(ref) or _from_disk(ref)
+
     for f in all_files:
         path = f["path"]
         meta = f["metadata"]
-        
+
         # 1. Missing fields — memory files only.
         #
         # `daily/` notes are the structural log tier, not a memory tier: they
@@ -500,6 +532,19 @@ def run_lint_pass() -> dict[str, Any]:
             # forever. Advisory — nothing is disabled here.
             if not meta.get("expires_at"):
                 missing_expiry.append(path)
+            # Gist discipline: core carries the gist and the pointer; the
+            # detail lives in the file the pointer names. Measured on the body
+            # in the same units the injection budget uses.
+            gist_limit = config.context.core_gist_max_chars
+            body_chars = len(f.get("body", "").strip())
+            if gist_limit > 0 and body_chars > gist_limit:
+                oversized_core.append({
+                    "file": path,
+                    "chars": body_chars,
+                    "tokens": estimate_tokens(f.get("body", "").strip()),
+                    "limit": gist_limit,
+                    "remediation": CORE_GIST_REMEDIATION,
+                })
 
         # 6. Missing human priority on core and decision memories.
         if (meta.get("core") is True or meta.get("type") == "Decision") and "priority" not in meta:
@@ -627,14 +672,39 @@ def run_lint_pass() -> dict[str, Any]:
         if _contradicts:
             open_contradictions.append({"file": path, "contradicts": _contradicts})
 
-        # 10. Stale backing — the dependent side of `backed_by` propagation.
-        # Reported until the memory is re-saved (which rebuilds its frontmatter
-        # and so clears the flag). Archived dependents assert nothing in recall
-        # and are not reported.
+        # 10. Stale backing — the dependent side of `backed_by` propagation,
+        # plus the read-time support check over the same record.
+        #
+        # The persisted half is what a retirement wrote and is reported until
+        # the memory is re-saved (which rebuilds its frontmatter and so clears
+        # the flag). The live half re-derives support from current state
+        # (`palinode.core.revalidation`): a source retired since the last pass,
+        # a second-hop source propagation never walked, or a source whose
+        # revision no longer matches the one this record recorded as
+        # revalidated. Findings for a ref the record is already flagged for add
+        # nothing — the entry is already there. Archived dependents assert
+        # nothing in recall and are not reported either way.
         from palinode.consolidation.propagate import parse_stale_backing
         _stale = parse_stale_backing(meta)
-        if _stale and meta.get("status") != "archived":
-            stale_backing.append({"file": path, "stale_backing": _stale})
+        if meta.get("status") != "archived":
+            _check = None
+            _found: list[dict[str, Any]] = []
+            if typed_links.parse_link_refs(meta, "backed_by"):
+                _check = revalidation.check_support(
+                    revalidation.normalize_ref(path), meta,
+                    read=_support_read, now=now, revision=f.get("revision"),
+                )
+                _found = revalidation.new_stale_entries(meta, _check, at=now)
+            if _stale or _found:
+                finding: dict[str, Any] = {
+                    "file": path,
+                    # Persisted first, then what the live check adds: an
+                    # existing consumer reads this list unchanged.
+                    "stale_backing": [*_stale, *_found],
+                }
+                if _check is not None:
+                    finding["support"] = _check.to_dict()
+                stale_backing.append(finding)
 
     # 4. Contradictions heuristics
     # Simple check: Any entity that has multiple active files
@@ -685,6 +755,7 @@ def run_lint_pass() -> dict[str, Any]:
         "stale_open_questions": stale_open_questions,
         "open_contradictions": open_contradictions,
         "stale_backing": stale_backing,
+        "oversized_core": oversized_core,
         # Refs that look like aliases of one another. Detection only — the
         # report is a question for a human, never an instruction to merge.
         "entity_aliases": check_entity_aliases(entity_references),

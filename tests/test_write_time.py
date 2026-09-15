@@ -11,9 +11,12 @@ makes faked at the infra boundary) — see that section's comment for why.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 import os
 import tempfile
+import time
 from unittest.mock import patch
 
 import pytest
@@ -38,6 +41,7 @@ def tmp_palinode_dir(monkeypatch):
         monkeypatch.setattr(config.consolidation.write_time, "queue_max_size", 10)
         # Reset module-level queue state between tests
         monkeypatch.setattr(write_time, "_queue", None)
+        monkeypatch.setattr(write_time, "_inflight", set())
         yield tmp
 
 
@@ -133,7 +137,12 @@ def test_sweep_empty_pending_dir_returns_zero(tmp_palinode_dir):
 
 
 def test_sweep_recovers_markers_to_queue(tmp_palinode_dir, tmp_memory_file, sample_item):
-    """Sweeper finds marker files and re-enqueues them."""
+    """Sweeper finds marker files and enqueues them — and leaves them on disk.
+
+    Enqueue is not the point of no return (ADR-004): the marker is the job's
+    durable record, so it survives the handoff and is only spent by a run that
+    completes. The sweep records the handoff as an attempt.
+    """
 
     async def run():
         # Pre-create a marker on disk (simulates a CLI save from before API startup)
@@ -143,15 +152,37 @@ def test_sweep_recovers_markers_to_queue(tmp_palinode_dir, tmp_memory_file, samp
         recovered = write_time.sweep_pending_markers()
         assert recovered == 1
 
-        # Marker should be deleted after successful enqueue
-        assert not os.path.exists(marker)
+        # Marker stays pending until a worker reports the job done
+        assert os.path.exists(marker)
+        assert _marker(marker)["attempts"] == 1
 
-        # Queue should have the job
+        # Queue should have the job, carrying the marker it came from
         queue = write_time._get_queue()
         assert queue.qsize() == 1
         job = queue.get_nowait()
         assert job["file_path"] == tmp_memory_file
         assert job["item"] == sample_item
+        assert job["marker_path"] == marker
+        assert job["attempt"] == 1
+
+    asyncio.run(run())
+
+
+def test_sweep_does_not_hand_out_a_marker_already_in_flight(
+    tmp_palinode_dir, tmp_memory_file, sample_item
+):
+    """The marker outliving the enqueue must not mean the job runs twice.
+
+    Deleting it at enqueue used to be the de-dup guard; the in-flight claim is
+    what replaces it.
+    """
+
+    async def run():
+        write_time._write_marker(tmp_memory_file, sample_item)
+
+        assert write_time.sweep_pending_markers() == 1
+        assert write_time.sweep_pending_markers() == 0
+        assert write_time._get_queue().qsize() == 1
 
     asyncio.run(run())
 
@@ -209,6 +240,149 @@ def test_sweep_processes_markers_in_timestamp_order(tmp_palinode_dir, tmp_memory
 
         queue = write_time._get_queue()
         assert queue.qsize() == 3
+
+    asyncio.run(run())
+
+
+# ── Marker lifecycle: a job survives its worker ────────────────────────────
+#
+# ADR-004: a job whose worker times out leaves its marker in pending and is
+# retried by the next sweep. The marker is therefore retired by exactly two
+# events — a run that completed, or the attempt bound — and never by the
+# handoff itself. These drive the real `_worker_loop` against a real marker
+# file; only `_run_check_and_apply` (the LLM + executor payload) is stood in
+# for, because the unit under test is the job's lifecycle, not the check.
+
+
+def _marker(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _pending(tmp_dir: str) -> list[str]:
+    d = write_time._pending_dir()
+    if not os.path.isdir(d):
+        return []
+    return sorted(
+        n for n in os.listdir(d)
+        if n.endswith(".json") and not n.endswith(".failed.json")
+    )
+
+
+async def _drain(timeout: float = 10.0) -> None:
+    """Run the real worker loop until every queued job has been accounted for."""
+    queue = write_time._get_queue()
+    task = asyncio.create_task(write_time._worker_loop(queue))
+    try:
+        await asyncio.wait_for(queue.join(), timeout=timeout)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+def _hangs(*_args, **_kwargs):
+    """A payload that outlives the worker's check timeout."""
+    time.sleep(0.3)
+    return {"operations": [], "applied_stats": {}}
+
+
+def test_a_timed_out_job_stays_pending_and_the_next_sweep_retries_it(
+    tmp_palinode_dir, tmp_memory_file, sample_item, monkeypatch
+):
+    """Enqueue → worker timeout → the marker is still pending, and the next
+    sweep hands it out again. Before this fix the sweep deleted the marker at
+    enqueue, so the timeout consumed the job and nothing re-queued it."""
+    from palinode.core.config import config
+
+    monkeypatch.setattr(config.consolidation.write_time, "check_timeout_seconds", 0.05)
+    marker = write_time._write_marker(tmp_memory_file, sample_item)
+
+    async def run():
+        assert write_time.sweep_pending_markers() == 1
+        assert os.path.exists(marker), "enqueue must not consume the marker"
+
+        with patch.object(write_time, "_run_check_and_apply", _hangs):
+            await _drain()
+
+        # The worker timed out. The job is untouched and still pending.
+        assert os.path.exists(marker)
+        assert _marker(marker)["attempts"] == 1
+        assert not os.path.exists(marker.replace(".json", ".failed.json"))
+
+        # The next sweep picks it up — this is the retry ADR-004 promises.
+        assert write_time.sweep_pending_markers() == 1
+        assert _marker(marker)["attempts"] == 2
+        job = write_time._get_queue().get_nowait()
+        assert job["file_path"] == tmp_memory_file
+        assert job["item"] == sample_item
+
+    asyncio.run(run())
+
+
+def test_retries_stop_at_max_attempts_and_the_marker_is_retired(
+    tmp_palinode_dir, tmp_memory_file, sample_item, monkeypatch, caplog
+):
+    """A job that never succeeds is retried a bounded number of times and then
+    retired to .failed.json with the reason logged — a poison job must not
+    loop forever."""
+    from palinode.core.config import config
+
+    monkeypatch.setattr(config.consolidation.write_time, "max_attempts", 2)
+    marker = write_time._write_marker(tmp_memory_file, sample_item)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("check exploded")
+
+    async def run():
+        with patch.object(write_time, "_run_check_and_apply", _boom):
+            for expected_attempts in (1, 2):
+                assert write_time.sweep_pending_markers() == 1
+                await _drain()
+                assert os.path.exists(marker)
+                assert _marker(marker)["attempts"] == expected_attempts
+
+            # Bound reached: the third sweep retires it instead of retrying.
+            with caplog.at_level(logging.ERROR):
+                assert write_time.sweep_pending_markers() == 0
+
+        assert not os.path.exists(marker)
+        failed = marker.replace(".json", ".failed.json")
+        assert os.path.exists(failed)
+        assert _marker(failed)["attempts"] == 2
+        assert _marker(failed)["item"] == sample_item  # preserved for review
+        assert "no successful run after 2 attempt(s)" in caplog.text
+        assert write_time._get_queue().qsize() == 0
+
+        # And it stays retired — a .failed.json is never swept again.
+        assert write_time.sweep_pending_markers() == 0
+
+    asyncio.run(run())
+
+
+def test_a_completed_job_clears_its_marker(
+    tmp_palinode_dir, tmp_memory_file, sample_item
+):
+    """The no-regression half: a run that completes still consumes the marker,
+    leaving nothing pending and nothing failed."""
+    marker = write_time._write_marker(tmp_memory_file, sample_item)
+    ran: list[str] = []
+
+    def _ok(file_path, item):
+        ran.append(file_path)
+        return {"operations": [], "applied_stats": {"updated": 1}}
+
+    async def run():
+        assert write_time.sweep_pending_markers() == 1
+        assert os.path.exists(marker)
+
+        with patch.object(write_time, "_run_check_and_apply", _ok):
+            await _drain()
+
+        assert ran == [tmp_memory_file]
+        assert not os.path.exists(marker)
+        assert not os.path.exists(marker.replace(".json", ".failed.json"))
+        assert _pending(tmp_palinode_dir) == []
 
     asyncio.run(run())
 
@@ -302,9 +476,11 @@ def _fake_llm(op_json: str):
 def test_sync_path_applies_real_write_time_delete_end_to_end(
     tmp_palinode_dir, sample_item
 ):
-    """A write-time DELETE, driven through the real pipeline with a fake
-    llm_fn, produces a visible supersession in the target file. `embedder.embed`
-    and `store.search_internal` are faked at the infra boundary (network
+    """A text-less write-time DELETE, driven through the real pipeline with a
+    fake llm_fn, retires the target fact into history (ARCHIVE) and leaves an
+    audit trail — it is neither silently dropped nor turned into a SUPERSEDE
+    carrying the saved item's body. `embedder.embed` and
+    `store.search_internal` are faked at the infra boundary (network
     embedder, vector DB) — everything downstream of the LLM call (parse,
     translate, apply_operations, file write) is real."""
     target = _seed_contradiction_check_files(tmp_palinode_dir)
@@ -326,17 +502,18 @@ def test_sync_path_applies_real_write_time_delete_end_to_end(
         )
 
     assert result is not None
-    assert result["applied_stats"]["superseded"] == 1
+    assert result["applied_stats"]["archived"] == 1
+    assert result["applied_stats"]["superseded"] == 0
+    assert result["applied_stats"]["unmatched"] == 0
     body = open(target).read()
-    # The old fact is tombstoned (struck through), not silently dropped —
-    # the visible supersession the executor's SUPERSEDE guard used to
-    # discard for lack of `new_text`.
-    assert "~~" in body
-    assert "[superseded" in body
-    # The replacement text comes from the item that superseded it (the
-    # `_check_contradictions` per-item loop overwrites `operation["item"]`
-    # with the item actually being checked — see runner._check_contradictions).
-    assert sample_item["content"] in body
+    assert "fact:f-old" not in body
+    # The saved item's content is never written into the target as a
+    # successor line.
+    assert sample_item["content"] not in body
+    history = open(target.replace(".md", "-history.md")).read()
+    assert "Archived: [2026-06-01] Old fact needing update." in history
+    assert "contradicted by new save" in history
+    assert "<!-- fact:f-old -->" in history
 
 
 def test_sync_path_swallows_check_errors(tmp_palinode_dir, sample_item):
@@ -371,14 +548,53 @@ def test_translate_ops_filters_ops_without_target_id():
     assert translated[0]["id"] == "f1"
 
 
-def test_translate_ops_delete_becomes_supersede():
-    """DELETE from _check_contradictions maps to SUPERSEDE (we never delete).
+def test_translate_ops_update_without_text_is_skipped(caplog):
+    """An UPDATE carrying no ``new_text`` is malformed: it produces no executor
+    op, and the item's content is never used as the replacement. (Previously
+    it became an UPDATE whose ``new_text`` was the whole saved body.) The
+    warning names the target id."""
+    ops = [
+        {
+            "operation": "UPDATE",
+            "target_id": "f-old",
+            "reason": "revised",
+            "item": {"id": "decision-new", "content": "The new content."},
+        }
+    ]
+    with caplog.at_level(logging.WARNING):
+        translated = write_time._translate_ops(ops, "/tmp/fake.md")
+    assert translated == []
+    assert "write-time: UPDATE skipped — fact id='f-old'" in caplog.text
 
-    The executor's SUPERSEDE guard (executor.py) requires ``new_text`` to be
-    truthy or the op is dropped with no mutation, no stats increment, and no
-    log line — assert the translator actually produces it, not just the
-    id/superseded_by shape the prior version of this test pinned.
-    """
+
+def test_translate_ops_update_with_text_is_unchanged():
+    """An UPDATE carrying ``new_text`` maps to UPDATE with exactly that text;
+    the item's content is not consulted."""
+    ops = [
+        {
+            "operation": "UPDATE",
+            "target_id": "f-old",
+            "new_text": "explicit replacement text",
+            "reason": "revised",
+            "item": {"id": "decision-new", "content": "The new content."},
+        }
+    ]
+    translated = write_time._translate_ops(ops, "/tmp/fake.md")
+    assert translated == [
+        {
+            "op": "UPDATE",
+            "id": "f-old",
+            "new_text": "explicit replacement text",
+            "reason": "revised",
+        },
+    ]
+
+
+def test_translate_ops_delete_without_text_becomes_archive():
+    """A DELETE carrying no ``new_text`` is a retirement with no replacement:
+    it maps to ARCHIVE, and the item's content is never used as a successor
+    line. (Previously it became a SUPERSEDE whose ``new_text`` was the whole
+    saved body.)"""
     ops = [
         {
             "operation": "DELETE",
@@ -388,18 +604,14 @@ def test_translate_ops_delete_becomes_supersede():
         }
     ]
     translated = write_time._translate_ops(ops, "/tmp/fake.md")
-    assert len(translated) == 1
-    op = translated[0]
-    assert op["op"] == "SUPERSEDE"
-    assert op["id"] == "f-old"
-    assert op["superseded_by"] == "decision-new"
-    # Falls back to the superseding item's content when the op carries no
-    # explicit new_text of its own.
-    assert op["new_text"] == "The new content that superseded it."
+    assert translated == [
+        {"op": "ARCHIVE", "id": "f-old", "reason": "contradicted by new"},
+    ]
 
 
-def test_translate_ops_delete_prefers_explicit_new_text_over_item_content():
-    """An explicit ``new_text`` on the op wins over the item's content."""
+def test_translate_ops_delete_with_text_becomes_supersede():
+    """A DELETE carrying ``new_text`` maps to SUPERSEDE with exactly that text
+    as the successor line; the item's content is not consulted."""
     ops = [
         {
             "operation": "DELETE",
@@ -409,4 +621,107 @@ def test_translate_ops_delete_prefers_explicit_new_text_over_item_content():
         }
     ]
     translated = write_time._translate_ops(ops, "/tmp/fake.md")
-    assert translated[0]["new_text"] == "explicit replacement text"
+    assert len(translated) == 1
+    op = translated[0]
+    assert op["op"] == "SUPERSEDE"
+    assert op["id"] == "f-old"
+    assert op["superseded_by"] == "decision-new"
+    assert op["new_text"] == "explicit replacement text"
+
+
+# ── The `revalidate` job kind ──────────────────────────────────────────────
+#
+# The queue carries one other kind of job: deterministic backing revalidation
+# (`palinode.core.revalidation`). It rides this marker path so deferred
+# memory writes have one sweep, one recovery story and one failure surface —
+# which means the sweep must carry it unchanged and the applier must be
+# reachable from the same entry point the worker uses.
+
+
+def _revalidate_item():
+    return {
+        "kind": write_time._REVALIDATE_KIND,
+        "ref": "decisions/test-decision",
+        "findings": [{"ref": "insights/gone", "hop": 1,
+                      "reason": "support_withdrawn", "via": "decisions/test-decision",
+                      "detail": "status:archived"}],
+        "cleared": [],
+    }
+
+
+def test_the_marker_kind_matches_the_module_that_writes_it():
+    """Two spellings, pinned: the enqueuer's and the router's."""
+    from palinode.core import revalidation
+
+    assert write_time._REVALIDATE_KIND == revalidation.MARKER_KIND
+
+
+def test_sweep_carries_a_revalidate_marker_through_unchanged(
+    tmp_palinode_dir, tmp_memory_file
+):
+    """A revalidate job survives the disk round trip with its item intact."""
+
+    async def run():
+        item = _revalidate_item()
+        marker = write_time._write_marker(tmp_memory_file, item)
+
+        assert write_time.sweep_pending_markers() == 1
+        assert os.path.exists(marker)  # spent by a completed run, not by enqueue
+
+        job = write_time._get_queue().get_nowait()
+        assert job["file_path"] == tmp_memory_file
+        assert job["item"] == item
+
+    asyncio.run(run())
+
+
+def test_a_revalidate_job_is_applied_without_calling_the_llm(
+    tmp_palinode_dir, tmp_memory_file
+):
+    """The deterministic branch: no propose seam, no contradiction check."""
+    source = os.path.join(tmp_palinode_dir, "insights", "gone.md")
+    os.makedirs(os.path.dirname(source), exist_ok=True)
+    with open(source, "w") as f:
+        f.write("---\nid: insights-gone\nstatus: archived\n---\n\n# Gone\n")
+    with open(tmp_memory_file, "w") as f:
+        f.write("---\nid: decision-test\ncategory: decision\nstatus: active\n"
+                "backed_by:\n  - insights/gone\n---\n\n# Test Decision\n")
+
+    with patch("palinode.consolidation.runner._check_contradictions") as llm:
+        result = write_time._run_check_and_apply(tmp_memory_file, _revalidate_item())
+
+    llm.assert_not_called()
+    assert result["operations"] == []
+    assert result["applied_stats"]["flagged"] == 1
+
+    import frontmatter
+
+    entry = frontmatter.load(tmp_memory_file).metadata["stale_backing"][0]
+    assert entry["ref"] == "insights/gone"
+    assert entry["op"] == "revalidate-check"
+
+
+def test_a_revalidate_job_for_a_vanished_target_reports_rather_than_raises(
+    tmp_palinode_dir
+):
+    """A marker can outlive its target. That is a skip, counted and logged."""
+    missing = os.path.join(tmp_palinode_dir, "decisions", "vanished.md")
+    result = write_time._run_check_and_apply(missing, _revalidate_item())
+    assert result["applied_stats"] == {"flagged": 0, "cleared": 0, "skipped": 1}
+
+
+def test_a_corrupt_revalidate_marker_is_preserved_for_an_operator(tmp_palinode_dir):
+    """Partial or failed application stays visible: `.failed.json`, not silence."""
+
+    async def run():
+        pending_dir = write_time._pending_dir()
+        os.makedirs(pending_dir, exist_ok=True)
+        marker = os.path.join(pending_dir, "20260912T110000-feedface.json")
+        with open(marker, "w") as f:
+            json.dump({"item": _revalidate_item()}, f)  # no file_path
+
+        assert write_time.sweep_pending_markers() == 0
+        assert not os.path.exists(marker)
+        assert os.path.exists(marker.replace(".json", ".failed.json"))
+
+    asyncio.run(run())

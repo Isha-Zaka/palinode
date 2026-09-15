@@ -228,10 +228,8 @@ Output: fixed default (`yaml`); not TTY-aware.
 palinode consolidate [OPTIONS]
 ```
 
-Run or preview memory compaction. The LLM proposes structured operations
-(KEEP / UPDATE / MERGE / SUPERSEDE / ARCHIVE) and a deterministic executor
-validates and applies them, then commits — so every pass is a git commit you
-can review or revert. Full description in
+Run or preview memory compaction. Applied changes are validated and committed
+to git, so you can review or revert them. Full description in
 [HOW-MEMORY-WORKS.md §4](HOW-MEMORY-WORKS.md#4-weekly-consolidation-sunday-3am-utc)
 and [EXECUTOR-SPEC.md](EXECUTOR-SPEC.md). `palinode dream` is an alias.
 
@@ -493,6 +491,20 @@ Fetch a URL and save it as a research reference, or process every file
 dropped in the store's inbox directory (`inbox/raw/` by default; processed
 files move to `inbox/processed/`). One of `--url` or `--inbox` is required.
 
+Before each request — the submitted URL and every redirect target, five hops at
+most — the host is resolved and every returned address must be globally
+routable; a redirect into a private, loopback, link-local, or carrier-grade NAT
+address is refused rather than followed. The connection is then made to the
+address that was checked, not by name, so a host that answers with a public
+address and then a private one cannot be reached through the gap between the
+two. TLS is unaffected: the certificate is still verified against the hostname.
+
+One exception, and it is logged when it applies: with an `HTTPS_PROXY` set, the
+request is tunnelled and the connection is made by name, because a tunnel
+verifies the certificate against its own target and a pinned address there
+would mean checking the certificate against an IP. The address check still
+runs; only the pinning is skipped.
+
 | Option | Default | Meaning |
 |---|---|---|
 | `--url TEXT` | none | URL to fetch and save under `research/` |
@@ -573,8 +585,7 @@ with the reason. Falls back to a local scan if the
 API is down. `--deep-contradictions` adds an LLM-confirmed semantic pass over
 Decision memories. Check catalog in [DOCTOR.md — lint](DOCTOR.md#palinode-lint).
 
-`--propose` closes the loop from *detect* to *dispose*: the deterministic
-findings become consolidation operations in the executor's own vocabulary, each
+`--propose` translates supported lint findings into consolidation operations, each
 carrying its rationale and the finding it came from. It is a dry run — nothing
 is written. `--apply` (which implies `--propose`) hands the applicable ones to
 the existing deterministic write paths, stamped with an actor of `lint` so the
@@ -841,6 +852,10 @@ Show the session-start context digest for a project: recent project snapshots,
 core memories, recent decisions, and open action items for the resolved scope.
 It is the same digest the SessionStart hook warms and the MCP `session_init`
 tool returns, so it is the quickest way to see what an agent will be handed.
+Retired memories (archived, superseded, deprecated, retracted or expired) never
+appear; a row in open conflict, resting on a retired source, or carrying a
+declared epistemic marker says so inline (`[⚠ contradicts: … | ⚠ stale
+backing: … | epistemic: …]`), and the same fields are keys on the JSON output.
 Scope resolution and the phases of session recall are in
 [HOW-MEMORY-WORKS.md §1](HOW-MEMORY-WORKS.md#1-session-recall-every-agent-turn).
 
@@ -949,6 +964,13 @@ ships the sha256 of every prompt revision it has ever released, so a store copy
 whose hash is in that list is provably untouched; anything else is your edit
 and is reported as `kept-edited` and left alone. A prompt missing from the store
 is provisioned.
+
+The comparison is over the prompt **body** — the frontmatter is not hashed. A
+store is a memory store, and its own machinery writes fields into prompt
+frontmatter (cross-references, descriptions); the body is what consolidation
+sends the model, so it is the part whose provenance this decision is about.
+Adding, reordering or reformatting a frontmatter field therefore leaves a
+prompt refreshable; changing a line of the prompt text is your edit.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -1123,6 +1145,47 @@ palinode retrieval-stats --days 30 --format json
 
 Output: fixed default (`text`); pass `--format json` explicitly when piping.
 
+### `palinode resolve`
+
+```
+palinode resolve [OPTIONS] [QUERY]
+```
+
+Ask what memory holds **right now** — for a question, or for one record. Where
+`search` returns hits and leaves the reading to you, `resolve` gathers the
+evidence around each hit and reports the outcome: the assertions that stand
+(with their source revisions), what replaced what, conflicts with every side
+intact, and what is explicitly unknown. Read-only, and no model is involved —
+with no embedder reachable it seeds from keyword search and says so in the
+coverage line.
+
+Give a `QUERY`, a `--ref`, or both. `--context` names refs you already hold:
+each is checked rather than assumed current, which is how a stale ref you are
+carrying comes back reported as replaced.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--ref TEXT` | — | Exact memory ref (path without `.md`), e.g. `decisions/db` |
+| `--context TEXT` | — | A ref you already hold; repeatable |
+| `--intent [current_state]` | `current_state` | What to answer. Only current state is supported |
+| `--max-items INT` | `8` | Maximum units in the answer |
+| `--max-chars INT` | `2000` | Maximum characters in the rendered answer |
+| `--format [json\|text]` | auto | Output format |
+
+```bash
+palinode resolve "which endpoint does production serve from"
+palinode resolve --ref decisions/endpoint          # is what I'm holding still current?
+palinode resolve "deploy policy" --max-chars 600   # a tight budget for an injected answer
+```
+
+Budget pressure drops whole units in priority order (standing assertions
+first, then conflict groups, then replacements, then unknowns) — a conflict is
+never split. A group that cannot fit is reported by ref with
+`budget_exhausted:conflicts` in the coverage line, so a small answer can never
+read as a settled one.
+
+Output: **auto**.
+
 ### `palinode review`
 
 ```
@@ -1199,7 +1262,7 @@ README; the frontmatter fields are explained in
 | `--claim TEXT::REF::QUOTE` | none | Claim-level source anchor; read back with `blame --claims`; repeatable |
 | `--contradicts REF` | none | Typed conflict link, surfaced by `lint`; repeatable |
 | `--backed-by REF` | none | Typed evidence link; repeatable |
-| `--update-policy [append\|replace]` | `append` | `replace` marks a living document that re-saves update in place |
+| `--update-policy [append\|replace]` | unset | How a re-save to the same slug is written: `append` keeps the existing body and adds beneath it, `replace` overwrites it and marks a living document. Unset overwrites without marking |
 | `--epistemic [fact\|inference\|open_question\|unverified]` | unset | Kind of claim the memory makes |
 | `--sync / --no-sync` | async | Run the write-time contradiction check inline and report it |
 | `--format [json\|text]` | auto | Output format |
@@ -1236,6 +1299,7 @@ store. Filters narrow by directory, type, priority, date, and recency;
 | `--include-daily` | off | Rank `daily/` session notes at full weight (default: penalised) |
 | `--include-telemetry` | off | Include `metadata.kind: telemetry` writes (default: excluded) |
 | `--tier [abstract\|overview\|full]` | snippet | How much of each hit to return |
+| `--resolve [none\|linked\|full]` | none | Attach bounded evidence around each hit (see below) |
 | `--format [json\|text]` | auto | Output format |
 | `--score / --no-score` | off | Show relevance scores |
 | `--no-context` | off | Disable the ambient context boost |
@@ -1243,7 +1307,50 @@ store. Filters narrow by directory, type, priority, date, and recency;
 ```bash
 palinode search "database decision for cache" --limit 5 --score
 palinode search "auth" --category decisions --since-days 30 --format json
+palinode search "which database do we use" --resolve full
 ```
+
+`--resolve linked` follows each hit's `superseded_by`, `contradicts` and
+`backed_by` links forward and in reverse (which records name this one) under
+fixed budgets, with cycle detection, so a replaced hit shows its successor and a
+correction ranked below `--limit` still appears under the hit it corrects.
+`--resolve full` adds bounded unlinked discovery — exact entity / source lookups,
+then a keyword and a neighbour query on the hit's own identifiers and vector.
+Each record is rendered as `↳ replaced by: decisions/x [current, 2026-09-10] …`
+with its own currency; each hit reports `coverage` (`complete`, or `partial` with
+reasons such as `budget_exhausted:edges`, `target_hidden`, `index_lag`,
+`fallback_disabled`) that never names a hidden record. Read-only: nothing is
+written or committed. JSON output carries the block as `evidence` per hit.
+
+Under the evidence, each hit gets one line saying what it resolves to:
+
+```
+⇒ current: decisions/db-v2 [accepted_intent, current] — explicit_replacement, uncontested
+⇒ unresolved conflict — policy_implementation_mismatch
+  · side: decisions/deploy [accepted_intent, current]
+  · side: observations/deploy-seen [observation, current]
+⇒ insufficient evidence — replacement_withdrawn
+```
+
+Exactly one of `current`, `unresolved conflict` or `insufficient evidence`, with
+reasons from a closed vocabulary. Only mechanically explicit changes resolve — a
+`superseded_by` chain ending at a standing successor, a declared retirement, a
+past `expires_at`. A `contradicts` link, a newer date, an `epistemic` label and
+the relevance score can make a conflict visible but never pick a winner, so a
+newer proposal does not replace an accepted decision and a withdrawn replacement
+leaves `insufficient evidence` rather than the value it replaced. Support that
+rests on one named origin (the same `sources[].ref`, claim anchor or `backed_by`
+ref) is grouped and counted once. JSON output carries the block as `resolution`
+per hit; the same decision is rendered identically by the MCP and REST surfaces.
+
+Each hit is labelled with three separate provenance answers — index/source
+agreement (`[index matches source]` / `[⚠ index stale]`, the stored hash against
+the file; never a statement about truth), cited-span integrity (`[⚠ cited
+quote: source_drifted]` when a `sources:` anchor no longer matches), and
+assertion currency (`[⚠ retired: status:archived]`, `[⚠ contested]`; `current`
+and `unmarked` are unlabelled). The JSON output carries them as `freshness`,
+`span_integrity`, `currency` and `currency_reason`; see
+[HOW-MEMORY-WORKS.md §1](HOW-MEMORY-WORKS.md#phase-2-topic-specific-search-per-message).
 
 Output: **auto**.
 
@@ -1352,9 +1459,18 @@ Output: **auto**.
 palinode stop [OPTIONS]
 ```
 
-Stop the systemd services `palinode-api.service` and `palinode-watcher.service`
-via `sudo systemctl stop`. Linux/systemd only; exits 1 where `systemctl` is
-absent. It does not stop a foreground `palinode start` — use Ctrl-C for that.
+Stop the systemd services `palinode-api.service` and the watcher unit.
+Linux/systemd only; exits 1 where `systemctl` is absent. It does not stop a
+foreground `palinode start` — use Ctrl-C for that.
+
+The watcher unit is **resolved, not assumed**: `palinode stop` asks
+`systemctl is-active` on the system manager first and `--user` second for
+`palinode-watcher.service`, `palinode-indexer.service`, and the installer's
+`WATCHER_UNIT_NAME` override when it is exported, then stops whichever answered
+— through `sudo systemctl` for a system unit and `systemctl --user` for a user
+unit. When nothing is active it falls back to `palinode-watcher.service`. This
+is the same resolution `palinode doctor`'s `watcher_alive` check uses, so the
+two cannot disagree about which unit your host runs.
 
 | Option | Default | Meaning |
 |---|---|---|

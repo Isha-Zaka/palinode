@@ -14,9 +14,9 @@ What propagation does, and does not do:
 - **Flags, never rewrites.** Each dependent gains one ``stale_backing`` entry in
   its frontmatter naming the source ref, the retirement kind, the retired fact
   ids, the reason, and a timestamp. The body is untouched, ``status`` is
-  untouched — the dependent stays live in recall, now visibly contested. The
-  LLM never writes this; it is produced by the deterministic path (the executor
-  and the on-demand archive/retract ops) and committed with provenance.
+  untouched — the dependent stays live in recall, now visibly contested. This is
+  produced by the deterministic path (the executor and the on-demand
+  archive/retract ops) and committed with provenance.
 - **One hop.** Dependents of dependents are not walked. A flagged dependent is
   input to the next consolidation pass, which may retire *it*, and only then
   do its own dependents get flagged.
@@ -49,6 +49,7 @@ from typing import Any
 
 from palinode.core import git_tools
 from palinode.core.config import config
+from palinode.core.skip_dirs import is_skipped_path
 from palinode.core.typed_links import parse_link_refs
 
 logger = logging.getLogger("palinode.consolidation.propagate")
@@ -66,10 +67,10 @@ RESTORE_CHECK_OP = "restore-check"
 
 _OP_ORDER: tuple[str, ...] = (*RETIRING_OPS, RESTORE_CHECK_OP)
 
-# Directories that are never dependents (mirrors lint / review / cross_refs).
-_SKIP_DIRS: frozenset[str] = frozenset(
-    {"archive", "logs", ".obsidian", ".git", "daily", "inbox", "prompts"}
-)
+# Directories that are never dependents, on top of the never-memory dirs every
+# surface skips (``skip_dirs.ALWAYS_SKIP`` — ``logs``, ``.obsidian``, ``.git``
+# and the store's own ``specs/prompts`` copies).
+_SKIP_DIRS: frozenset[str] = frozenset({"archive", "daily", "inbox"})
 
 
 def _utc_now() -> datetime:
@@ -125,7 +126,7 @@ def find_dependents(source_refs: list[str], base_dir: str | None = None) -> list
     out: list[str] = []
     for path in sorted(glob.glob(os.path.join(base, "**", "*.md"), recursive=True)):
         rel = os.path.relpath(path, base).replace(os.sep, "/")
-        if rel.split("/")[0] in _SKIP_DIRS or rel.endswith("-history.md"):
+        if is_skipped_path(rel, _SKIP_DIRS) or rel.endswith("-history.md"):
             continue
         if _normalize_ref(rel) in wanted:
             continue  # a memory is not its own dependent
