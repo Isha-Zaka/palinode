@@ -599,6 +599,33 @@ def test_embedder_wraps_transport_failure_as_unavailable(wired, caplog):
     assert any("dialect=openai" in r.getMessage() for r in caplog.records)
 
 
+def test_embedder_redacts_embedding_api_key_from_failure_logs_and_exception(
+    wired, monkeypatch, caplog
+):
+    secret = "super-secret-embedding-key"
+
+    monkeypatch.setenv("PALINODE_EMBEDDING_API_KEY", secret)
+    monkeypatch.delenv("PALINODE_EMBEDDING_API_KEY_FILE", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == f"Bearer {secret}"
+        return httpx.Response(
+            401,
+            text=f"Invalid API key: {secret}",
+        )
+
+    wired(handler)
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(EmbeddingUnavailable) as exc_info:
+            embedder_mod.embed("hi")
+
+    assert secret not in caplog.text
+    assert secret not in str(exc_info.value)
+    assert secret not in exc_info.value.cause
+    assert "[REDACTED]" in exc_info.value.cause
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Integration: save → index → hybrid search on a real SQLite store
 # ──────────────────────────────────────────────────────────────────────────

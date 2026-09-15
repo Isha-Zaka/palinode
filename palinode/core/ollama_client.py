@@ -215,6 +215,34 @@ def _is_input_error_message(message: str) -> bool:
     return any(p in msg_lower for p in _INPUT_ERROR_PATTERNS)
 
 
+def _redact_authorization_secret(
+    text: str,
+    headers: dict[str, str] | None,
+) -> str:
+    """Redact credentials echoed by an authenticated provider response."""
+    if not text or not headers:
+        return text
+
+    authorization = next(
+        (
+            value
+            for key, value in headers.items()
+            if key.lower() == "authorization"
+        ),
+        "",
+    )
+    if not authorization:
+        return text
+
+    redacted = text.replace(authorization, "[REDACTED]")
+
+    parts = authorization.split(maxsplit=1)
+    if len(parts) == 2 and parts[1]:
+        redacted = redacted.replace(parts[1], "[REDACTED]")
+
+    return redacted
+
+
 def _extract_embedding_vector(data: Any) -> list[float] | None:
     """Pull the embedding vector from either Ollama response shape.
 
@@ -762,7 +790,10 @@ class OllamaClient:
                     # body names the rejected input, and `str(e)` alone is just
                     # the status line plus an MDN link.
                     try:
-                        body_4xx = (e.response.text or "").strip()[:300]
+                        body_4xx = _redact_authorization_secret(
+                            e.response.text or "",
+                            headers,
+                        ).strip()[:300]
                     except Exception:
                         body_4xx = ""
                     raise OllamaError(
@@ -788,9 +819,10 @@ class OllamaClient:
                         retry_count=attempt, circuit_state=cb.state.value,
                         outcome=f"http_{status}_input", op=op, level=logging.WARNING,
                     )
+                    safe_body_text = _redact_authorization_secret(body_text, headers)
                     raise OllamaInputError(
                         f"Ollama {op} failed for this input (role={role.value}, "
-                        f"HTTP {status}): {body_text.strip()}",
+                        f"HTTP {status}): {safe_body_text.strip()}",
                         role=role.value, model=model, status_code=status,
                     ) from e
                 # 5xx is transient — fall through to retry handling.
