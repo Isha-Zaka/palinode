@@ -7,12 +7,19 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 
 import pytest
 from click.testing import CliRunner
 
 from palinode.cli import main
-from palinode.cli.worktree import reconcile, _apply, _parse_porcelain, _pid_alive
+from palinode.cli.worktree import (
+    reconcile,
+    _apply,
+    _parse_porcelain,
+    _pid_alive,
+    _under_claude_worktrees,
+)
 
 
 def _run(args, cwd):
@@ -55,7 +62,7 @@ def _add_worktree(root, name, branch, *, lock_pid, push=True, dirty=False):
         (path / "scratch.txt").write_text("uncommitted\n")
     _run(["worktree", "lock", "--reason", f"claude session pid {lock_pid}", str(path)],
          cwd=root)
-    return str(path)
+    return path.as_posix()
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +73,103 @@ def _add_worktree(root, name, branch, *, lock_pid, push=True, dirty=False):
 def test_pid_alive_self_true_and_dead_false():
     assert _pid_alive(os.getpid()) is True
     assert _pid_alive(DEAD_PID) is False
+    assert _pid_alive(0) is False
+    assert _pid_alive(-1) is False
+
+
+def test_pid_alive_child_process_lifecycle():
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
+    try:
+        assert _pid_alive(proc.pid) is True
+    finally:
+        proc.wait()
+    assert _pid_alive(proc.pid) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32-specific error code tests")
+def test_pid_alive_failsafe_on_access_denied_or_error_win32(monkeypatch):
+    import ctypes
+    import palinode.cli.worktree as wt
+
+    monkeypatch.setattr(wt._kernel32, "OpenProcess", lambda *_: 0)
+    # ERROR_ACCESS_DENIED = 5 -> fail-safe alive
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5)
+    assert _pid_alive(12345) is True
+    # Unexpected error (e.g. 999) -> fail-safe alive
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 999)
+    assert _pid_alive(12345) is True
+    # ERROR_INVALID_PARAMETER = 87 -> dead (False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 87)
+    assert _pid_alive(12345) is False
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-specific PermissionError test")
+def test_pid_alive_failsafe_on_access_denied_posix(monkeypatch):
+    def raise_eperm(pid, sig):
+        raise PermissionError("Access denied")
+    monkeypatch.setattr(os, "kill", raise_eperm)
+    assert _pid_alive(12345) is True
+
+
+def test_pid_alive_invalid_types_and_bounds():
+    assert _pid_alive(True) is False
+    assert _pid_alive(False) is False
+    assert _pid_alive(None) is False  # type: ignore
+    assert _pid_alive("12345") is False  # type: ignore
+    assert _pid_alive(3.14) is False  # type: ignore
+    assert _pid_alive(0) is False
+    assert _pid_alive(-100) is False
+    assert _pid_alive(0x1_0000_0000) is False  # > 32-bit DWORD
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32-specific process wait code tests")
+def test_pid_alive_win32_wait_codes(monkeypatch):
+    import palinode.cli.worktree as wt
+
+    closed = []
+    monkeypatch.setattr(wt._kernel32, "OpenProcess", lambda *_: 1234)
+    monkeypatch.setattr(wt._kernel32, "CloseHandle", lambda h: closed.append(h) or True)
+
+    # WAIT_TIMEOUT (0x102) -> running (True)
+    monkeypatch.setattr(wt._kernel32, "WaitForSingleObject", lambda h, ms: 0x00000102)
+    assert _pid_alive(100) is True
+    assert closed == [1234]
+
+    # WAIT_OBJECT_0 (0x0) -> exited (False)
+    closed.clear()
+    monkeypatch.setattr(wt._kernel32, "WaitForSingleObject", lambda h, ms: 0x00000000)
+    assert _pid_alive(100) is False
+    assert closed == [1234]
+
+    # WAIT_FAILED / unexpected -> fail-safe (True)
+    closed.clear()
+    monkeypatch.setattr(wt._kernel32, "WaitForSingleObject", lambda h, ms: 0xFFFFFFFF)
+    assert _pid_alive(100) is True
+    assert closed == [1234]
+
+
+def test_pid_alive_exit_code_259_dead():
+    """Processes exiting with code 259 (STILL_ACTIVE on Windows) must be recognized as DEAD."""
+    proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(259)"])
+    proc.wait()
+    if sys.platform == "win32":
+        assert proc.returncode == 259
+    assert _pid_alive(proc.pid) is False
+
+
+def test_under_claude_worktrees_case_and_boundary():
+    if sys.platform == "win32":
+        # Casing on Windows should match
+        assert _under_claude_worktrees("c:/repo", "C:/repo/.claude/worktrees/dead") is True
+        assert _under_claude_worktrees("C:/repo", "c:/repo/.claude/worktrees/sub/deep") is True
+        assert _under_claude_worktrees("c:/repo", "c:/repo/.claude/worktrees_fake/dead") is False
+        assert _under_claude_worktrees("c:/repo", "c:/repo/.claude/other/dead") is False
+    else:
+        assert _under_claude_worktrees("/repo", "/repo/.claude/worktrees/dead") is True
+        assert _under_claude_worktrees("/repo", "/repo/.claude/worktrees/sub/deep") is True
+        assert _under_claude_worktrees("/repo", "/repo/.claude/worktrees_fake/dead") is False
+        assert _under_claude_worktrees("/repo", "/repo/.claude/other/dead") is False
+
 
 
 def test_parse_porcelain_extracts_locked_and_branch():
