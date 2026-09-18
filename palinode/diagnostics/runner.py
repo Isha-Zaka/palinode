@@ -29,6 +29,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_CHECK_TIMEOUT_S = 15.0
 
 
+def _timeout_remediation(name: str) -> str:
+    """Give the next action for the check that actually exceeded its budget."""
+    if name == "phantom_db_files":
+        return (
+            "The filesystem scan for .palinode.db files exceeded its time budget. "
+            "Limit doctor.search_roots to the store or run "
+            "`palinode doctor --check phantom_db_files` to inspect slow or mounted "
+            "paths. This check does not require Ollama or embeddings."
+        )
+    if name == "ollama_circuit_health":
+        return (
+            "The embedding-service health probe exceeded its time budget. Check the "
+            "configured Ollama/embed host (`curl <ollama-url>/api/version`) or run "
+            "`palinode doctor --check ollama_circuit_health` after it is reachable."
+        )
+    return (
+        f"Run `palinode doctor --check {name}` to isolate this check and inspect the "
+        "resource it uses. `palinode doctor` never blocks on one hang."
+    )
+
+
 def _safe_call(
     check_fn: Callable[[DoctorContext], CheckResult],
     ctx: DoctorContext,
@@ -99,11 +120,7 @@ def _run_with_timeout(
             severity="warn",
             passed=False,
             message=f"Check '{name}' timed out after {timeout_s:.0f}s and was skipped.",
-            remediation=(
-                "A check exceeded its time budget — most often a cold or unreachable "
-                "Ollama/embed host. Check the host (`curl <ollama-url>/api/version`) or "
-                "run this check alone. `palinode doctor` never blocks on one hang."
-            ),
+            remediation=_timeout_remediation(name),
         )
     return box.get(
         "result",

@@ -4,7 +4,7 @@
 {% block content %}
 <div class="dash">
   <h1>Memory health</h1>
-  <p class="lede">A read-only view of what the agent remembers — and whether it holds up.</p>
+  <p class="lede">A read-only view of visible memories — and whether they hold up.</p>
 
   <div class="cards">
     <div class="card accent">
@@ -37,7 +37,7 @@
     </div>
     <div class="card">
       <div class="num">{{ git_commits_7d or 0 }}</div>
-      <div class="lbl">commits / 7d</div>
+      <div class="lbl">visible-file commits / 7d</div>
     </div>
   </div>
 

@@ -8,15 +8,43 @@
 └────────────┘
 ```
 
-**Audit-grade memory for AI agents. Every stored claim can carry an explicit epistemic status (`fact` / `inference` / `open_question` / `unverified`), typed links to the evidence that backs or contradicts it, and a verifiable quote-level citation to its source. MCP-first, so one memory works in every editor.**
+**Inspectable, correctable project memory for repeated work across sessions, agents, and worktrees.**
 
-Agent memory is becoming a commodity. *Auditable* agent memory is not: Palinode is the memory layer where a remembered fact says how strongly it is believed and what evidence backs it — and where every fact is a line in a git-versioned markdown file, readable, diffable, attributable to the commit that recorded it, and revertible when it's wrong. An unmarked memory is unmarked, never silently promoted to fact. No black-box vector store you have to trust.
+Last week, your team chose SQLite for a cache because it avoided operating a
+database. This week, a changed requirement makes PostgreSQL the better choice.
+Without the decision and its reason, a fresh agent can repeat the old approach.
+With Palinode, you can save the replacement, inspect the original and its history,
+and correct the record for the next session.
 
-Your agent's memory is a folder of markdown files. Palinode indexes them with hybrid search, compacts them with an LLM, and serves them through MCP — so the same memory works in Claude Code, Cursor, Windsurf, Zed, VS Code (Continue/Cline), and any other MCP-compatible editor. Bring your own Obsidian vault, or use Palinode as one: `palinode init --obsidian /path/to/vault` scaffolds a full vault with graph defaults, daily-notes wiring, and an LLM-maintained wiki contract. Enterprises can govern AI memory the same way they govern code. If every service crashes, `cat` still works.
+Palinode keeps project memory in Markdown files and Git history under your local
+control. An agent can use its tools to save, search, and inspect that memory.
+Some supported client integrations can also perform configured capture or recall;
+their automatic behavior, scope, and controls vary by client and configuration.
+Nothing is silently promoted from an unmarked note to a fact.
 
 *A palinode is a poem that retracts what was said before and says it better. That's what memory compaction does.*
 
 Built by [Paul Kyle](https://github.com/Paul-Kyle) at [phasespace-labs](https://github.com/phasespace-labs). See [AUTHORS](AUTHORS.md).
+
+---
+
+## Start here
+
+Follow the [canonical Quickstart](docs/QUICKSTART.md) for one complete journey:
+install → start → connect an MCP client → save a decision → open a fresh session
+→ inspect its markdown/provenance → correct it. It keeps the private memory
+store separate from the code checkout and distinguishes the current release
+from source-checkout capabilities.
+
+### Inspect the retired decision
+
+![The fictional Harbor Notes inspector after the initial SQLite decision has been archived; the provenance panel includes the Saved commit.](docs/images/inspector-harbor-notes.png)
+
+The screenshot shows the **archived** initial SQLite decision after the separate
+PostgreSQL replacement was saved and the original was retired. See the
+[local provenance UI guide](docs/UI.md) for the full read-only inspector and
+the correction lifecycle; the guide explains that the image is taken after
+retirement, not before the save steps.
 
 ---
 
@@ -40,7 +68,8 @@ All platforms share the same MCP server — install once on your server, connect
 
 ## The Idea
 
-Most agent memory is a black box. You can't read it, you can't diff it, you can't `grep` it when the vector DB is down. Palinode bets on **plain files as the source of truth** and builds everything else as a derived index.
+Palinode treats **plain files as the source of truth** and builds its index and
+interfaces from those files.
 
 ```
 Files (markdown + YAML frontmatter)
@@ -64,7 +93,7 @@ Palinode doesn't care how you talk to it. The full toolkit — save, search, doc
 |-----------|-----------|----------|
 | **MCP Server** | Streamable HTTP or stdio | Claude Code, Claude Desktop, Cursor, Windsurf, Zed, VS Code (Continue/Cline) |
 | **REST API** | HTTP on :6340 | Scripts, webhooks, custom integrations |
-| **CLI** | Wraps REST API | Cron jobs, SSH, shell scripts (8x fewer tokens than MCP) |
+| **CLI** | Wraps REST API | Cron jobs, SSH, shell scripts |
 | **Plugin** | OpenClaw lifecycle hooks | Agent frameworks with inject/extract patterns |
 
 Set up once on a server. Connect from any machine, any IDE, any agent framework. The MCP server is a pure HTTP client — it holds no state, no database connection, no embedder. Point it at the API and go.
@@ -85,9 +114,9 @@ That's the entire client config. Works with Claude Code, Claude Desktop, Cursor,
 
 **Store** — Typed markdown files (people, projects, decisions, insights) with YAML frontmatter. Git-versioned. Human-readable. Editable in Obsidian, VS Code, vim, or anything.
 
-**Index** — A file watcher embeds with BGE-M3 and indexes with FTS5 as you save. Content-hash dedup skips re-embedding unchanged files (~90% savings). Single SQLite file, zero external services.
+**Index** — A file watcher indexes with FTS5 as you save. Content-hash dedup skips re-embedding unchanged files. The index is a local SQLite file; embeddings can use a local BGE-M3 endpoint or a configured remote provider.
 
-**Search** — Hybrid BM25 + vector search merged with Reciprocal Rank Fusion. The two arms have different jobs: on full-sentence questions the vector arm does nearly all the retrieval (FTS5 requires every query token to co-occur, which questions rarely satisfy), while BM25 catches the exact terms and identifiers embeddings blur. Measured together: 0.981 evidence recall@10 on LongMemEval_S ([benchmarks](docs/BENCHMARKS.md)). Optional associative entity graph and prospective triggers.
+**Search** — Hybrid BM25 + vector search merged with Reciprocal Rank Fusion. The two arms have different jobs: on full-sentence questions the vector arm can retrieve semantic matches while BM25 catches exact terms and identifiers. See [benchmarks](docs/BENCHMARKS.md) for the evaluation context and limitations. Optional associative entity graph and prospective triggers.
 
 **Compact** — Weekly consolidation where an LLM returns structured operations and Palinode validates and applies them. Every compaction is a git commit you can review, blame, or revert.
 
@@ -102,9 +131,11 @@ That's the entire client config. Works with Claude Code, Claude Desktop, Cursor,
 - **Python 3.11+**
 - **Git**
 - **Ollama** with `bge-m3` (`ollama pull bge-m3`, ≈1.2 GB), or another supported
-  embedding endpoint — for search. Saves persist without an embedder, but search
-  returns HTTP 503 until it is reachable (`palinode resolve` degrades to
-  keyword-only and says so). See the
+  embedding endpoint — for hybrid indexing and search. A v0.21-capable source
+  checkout can instead use explicit lexical mode; it is keyword/FTS retrieval,
+  not a fallback when hybrid's endpoint fails. Saves persist without an
+  embedder, but hybrid search returns HTTP 503 until it is reachable
+  (`palinode resolve` degrades to keyword-only and says so). See the
   [Homebrew setup guide](docs/HOMEBREW.md) for installation and verification.
 
 Optional extras: a chat model for weekly consolidation (any 7B+ that outputs JSON), OpenClaw for agent plugin hooks.
@@ -113,46 +144,15 @@ Optional extras: a chat model for weekly consolidation (any 7B+ that outputs JSO
 
 ## Install
 
-**Homebrew (macOS/Linux) — local installation:**
+**Before your first capture:** Palinode stores readable Markdown and Git history. `private`/`restricted` control discovery by scope; a caller with API access can still read a hidden memory by its known path and use full-store maintenance tools. These labels provide no encryption or per-user/per-agent authentication. Protect the store, backups and API credentials; use separate instances or filesystem permissions for stronger separation. See the [privacy contract](docs/PRIVACY.md).
 
-```bash
-brew install phasespace-labs/palinode/palinode
-palinode --version
-```
-
-That installs the CLI, API, watcher, and MCP executables with their Python dependencies.
-Follow the [Homebrew setup guide](docs/HOMEBREW.md) to create your private memory
-directory, start the services, connect your editor, and verify your first saved memory.
-The guide also covers upgrades and service restarts.
-
-**From source — the full-stack path.** Clone, install, point at a memory directory,
-check it worked:
-
-```bash
-# 1. Get the code (lives separately from your memory — never the same directory)
-git clone https://github.com/phasespace-labs/palinode ~/palinode-src && cd ~/palinode-src
-python3 -m venv venv && source venv/bin/activate
-pip install -e .
-
-# 2. Create your memory directory (this is where your data lives — keep it private)
-mkdir -p ~/.palinode && cd ~/.palinode && git init
-cp ~/palinode-src/palinode.config.yaml.example palinode.config.yaml
-# memory_dir stays commented out in the copied config → it inherits PALINODE_DIR below
-
-# 3. Start the services — one command, or each in its own terminal
-PALINODE_DIR=~/.palinode palinode start       # API + watcher from one foreground command
-
-# ...or run them separately (separate logs — or as a service, next section)
-PALINODE_DIR=~/.palinode palinode-api        # REST API on :6340
-PALINODE_DIR=~/.palinode palinode-watcher     # auto-indexes on file save
-
-# 4. Did it work?
-palinode doctor
-```
-
-`palinode doctor` is the single "did it install correctly?" command — run it after every install, upgrade, or server move. On a fresh venv, use the venv's absolute path for the MCP command (`~/palinode-src/venv/bin/palinode-mcp`) so it resolves its own dependencies — see [llms-install.md](llms-install.md) for the wrong-Python trap.
-
-> Your memory directory is **private** — it holds personal data. Never make it public; the code repo contains zero memory files. For a pre-populated demo, copy `examples/sample-memory/` into `~/.palinode/`.
+The [Quickstart](docs/QUICKSTART.md) is the authoritative first-use sequence.
+It covers the separate private store, second-terminal environment, supported
+lexical preview and hybrid model paths, editor connection, fresh-session check,
+inspector, and correction workflow. Do not combine a code checkout and a
+memory store. For a released Homebrew installation, begin with
+[docs/HOMEBREW.md](docs/HOMEBREW.md); for an autonomous agent bootstrap, see
+[llms-install.md](llms-install.md).
 
 ---
 
@@ -173,16 +173,15 @@ With compose, your memory stays on the **host** at `~/.palinode` (override with 
 
 ## Connect your editor
 
-Palinode speaks MCP. Generate the correct config with the CLI instead of hand-pasting JSON (which drifts):
+Palinode speaks MCP. Follow the connection step in the
+[Quickstart](docs/QUICKSTART.md): v0.21 generates a native fragment for the
+selected client, while the current release's recipes retain the supported
+manual configuration. `palinode mcp-config` is read-only; it never edits a
+client configuration file. Full per-harness detail:
+[docs/MCP-INSTALL-RECIPES.md](docs/MCP-INSTALL-RECIPES.md).
 
-| Editor / harness | One command |
-|---|---|
-| **Claude Code (CLI)** | `claude mcp add palinode -- palinode-mcp` |
-| **Claude Desktop** | `palinode mcp-config --stdio` → paste into the config it prints (quit Desktop first) |
-| **Cursor / Windsurf / other MCP clients** | `palinode mcp-config --stdio` (local) or `--http` (remote / streamable-HTTP) |
-| **Diagnose an existing setup** | `palinode mcp-config --diagnose` |
-
-`palinode mcp-config` never writes your editor's config file — it prints a ready-to-paste block (pipe it straight to the target). Full per-harness detail: [docs/MCP-INSTALL-RECIPES.md](docs/MCP-INSTALL-RECIPES.md).
+Merge the Palinode entry into existing settings; redirecting generated output
+onto an existing configuration file would overwrite it.
 
 ---
 
@@ -339,7 +338,7 @@ The `canonical_question` field anchors the file to the question it answers, impr
 Palinode stores every memory as a plain markdown file — which means your memory directory is already a valid Obsidian vault. Point Obsidian at the folder and you get graph view, backlinks, and Bases on top of Palinode's hybrid search and compaction. No sync job, no plugin to install, no two-source-of-truth problem.
 
 ```bash
-palinode init --obsidian ~/palinode-vault
+palinode init --obsidian --dir ~/palinode-vault
 ```
 
 This scaffolds the vault directory layout, an `_index.md` Map of Content, a `_README.md` orientation page, and an opinionated `.obsidian/` config (graph view colour-coded by category, daily-notes wired to `daily/`). Then open the directory in Obsidian.

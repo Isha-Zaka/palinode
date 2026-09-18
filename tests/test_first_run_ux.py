@@ -141,6 +141,21 @@ def test_run_with_timeout_reports_timeout_and_returns_promptly():
     assert "timed out" in r.message.lower()
 
 
+def test_filesystem_timeout_advice_does_not_blame_embedding_service():
+    from palinode.diagnostics.runner import _run_with_timeout
+
+    def _slow_filesystem_check(ctx):
+        time.sleep(0.3)
+        return CheckResult(name="phantom_db_files", severity="info", passed=True, message="done")
+
+    _slow_filesystem_check.__name__ = "phantom_db_files"
+    r = _run_with_timeout(_slow_filesystem_check, _ctx(), 0.01)
+
+    assert r.name == "phantom_db_files"
+    assert "filesystem scan" in (r.remediation or "").lower()
+    assert "does not require ollama" in (r.remediation or "").lower()
+
+
 def test_safe_call_converts_exception_to_error_result():
     from palinode.diagnostics.runner import _safe_call
     r = _safe_call(_raising_check, _ctx())

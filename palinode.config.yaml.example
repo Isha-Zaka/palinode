@@ -138,6 +138,10 @@ auto_summary:
 # Search Defaults
 # -----------------------------------------------------------------------------
 search:
+  # lexical: keyword recall and indexing with no embedding/chat service.
+  # See docs/lexical-retrieval.md for setup, diagnostics, and limitations.
+  # Restart after changing mode; run palinode reindex when enabling hybrid.
+  retrieval_mode: hybrid
   # Hybrid search combines vector similarity with BM25 keyword matching.
   # This catches exact terms (model names, IDs, code) that vectors miss.
   hybrid_enabled: true
@@ -189,8 +193,10 @@ consolidation:
   enabled: true
   # Informational — actual schedule lives in crontab (see above)
   schedule: "0 11 * * 0"  # Sunday 4am PT (11:00 UTC)
-  # How many days of daily notes to process (weekly full pass)
-  lookback_days: 7
+  # How many days of daily notes the weekly full pass reads. Keep this equal
+  # to the `--days N` in your crontab — the cron argument overrides this value
+  # silently, and `palinode doctor` reports the effective number if they differ.
+  lookback_days: 3
 
   # LLM API for consolidation (any OpenAI-compatible endpoint)
   llm_url: "http://localhost:8000"  # vLLM, Ollama, etc.

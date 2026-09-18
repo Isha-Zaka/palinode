@@ -49,6 +49,7 @@
 
 import { basename } from "node:path";
 import {
+  automaticAllowed,
   buildCoreDigest,
   buildRecallContext,
   buildSessionCapture,
@@ -220,6 +221,11 @@ export function createPalinodePlugin(options: PalinodePluginOptions = {}): Cline
           // recall injected into every subagent's every request is a cost
           // multiplier with no memory upside.
           if (snapshot.parentAgentId) return undefined;
+          if (!await withDeadline(automaticAllowed(cfg, "recall", cwd, fetchFn), deadlineMs)) {
+            ledger.clear();
+            primed = false;
+            return undefined;
+          }
 
           const prompt = lastUserPrompt(request.messages);
           if (prompt && !ledger.has(prompt.id)) {
@@ -253,6 +259,11 @@ export function createPalinodePlugin(options: PalinodePluginOptions = {}): Cline
               changed = true;
             }
           }
+          if (changed && !await withDeadline(automaticAllowed(cfg, "recall", cwd, fetchFn), deadlineMs)) {
+            ledger.clear();
+            primed = false;
+            return undefined;
+          }
           return changed ? { messages } : undefined;
         } catch {
           return undefined; // fail-open: Palinode trouble never blocks a turn
@@ -261,7 +272,8 @@ export function createPalinodePlugin(options: PalinodePluginOptions = {}): Cline
 
       async afterRun({ snapshot, result }) {
         try {
-          if (snapshot.parentAgentId) return;
+          if (snapshot.parentAgentId || !cfg.captureOn ||
+            !await withDeadline(automaticAllowed(cfg, "capture", cwd, fetchFn), deadlineMs)) return;
           const entries = [...(result.messages ?? snapshot.messages ?? [])].filter(
             (m) => m.metadata?.kind !== INJECTED_KIND,
           );
@@ -280,8 +292,7 @@ export function createPalinodePlugin(options: PalinodePluginOptions = {}): Cline
             cwd,
           });
           if (!payload) return;
-          capturedAt = count;
-          await withDeadline(postSessionCapture(payload, cfg, fetchFn), deadlineMs);
+          if (await withDeadline(postSessionCapture(payload, cfg, fetchFn), deadlineMs)) capturedAt = count;
         } catch {
           // fail-open
         }

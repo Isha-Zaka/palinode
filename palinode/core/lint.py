@@ -5,7 +5,7 @@ import os
 import glob
 import re
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Collection
 
 import frontmatter as _frontmatter
 
@@ -383,8 +383,14 @@ def check_relative_dates(body: str, anchor: date | None = None) -> list[dict[str
     ]
 
 
-def run_lint_pass() -> dict[str, Any]:
-    """Return every deterministic lint finding and the scanned-file total."""
+def run_lint_pass(*, file_paths: Collection[str] | None = None) -> dict[str, Any]:
+    """Return deterministic lint findings for the selected files.
+
+    The default is privileged full-store maintenance. A discovery caller can
+    supply its live, visible relative paths: selection happens before entity
+    aggregation and backing checks, and support reads stay within that set.
+    An empty collection selects nothing; it never falls back to the full store.
+    """
     base_dir = getattr(config, 'memory_dir', config.palinode_dir)
     pattern = os.path.join(base_dir, "**/*.md")
     
@@ -422,9 +428,19 @@ def run_lint_pass() -> dict[str, Any]:
     
     skip_dirs = {"archive", "logs", ".obsidian"}
     
-    for filepath in glob.glob(pattern, recursive=True):
+    candidates = glob.glob(pattern, recursive=True)
+    if file_paths is not None:
+        candidates = sorted(
+            p for p in candidates if os.path.relpath(p, base_dir) in file_paths
+        )
+    for filepath in candidates:
         rel_path = os.path.relpath(filepath, base_dir)
         parts = rel_path.split(os.sep)
+        if file_paths is not None and any(
+            os.path.islink(os.path.join(base_dir, *parts[:depth]))
+            for depth in range(1, len(parts) + 1)
+        ):
+            continue
         if parts[0] in skip_dirs:
             continue
             
@@ -470,7 +486,10 @@ def run_lint_pass() -> dict[str, Any]:
     _from_disk = revalidation.disk_reader(base_dir, now=now)
 
     def _support_read(ref: str) -> revalidation.SourceView | None:
-        return _from_scan(ref) or _from_disk(ref)
+        found = _from_scan(ref)
+        if found is not None or file_paths is not None:
+            return found
+        return _from_disk(ref)
 
     for f in all_files:
         path = f["path"]

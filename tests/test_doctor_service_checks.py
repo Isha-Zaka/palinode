@@ -272,7 +272,7 @@ class TestWatcherAlive:
         assert result.passed is True
         assert "active" in result.message
 
-    def test_passes_linux_ps_fallback_when_systemctl_inactive(self, tmp_path: Path, monkeypatch) -> None:
+    def test_rejects_linux_ps_fallback_without_store_identity(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setattr(sys, "platform", "linux")
         ctx = _ctx(tmp_path)
 
@@ -285,8 +285,8 @@ class TestWatcherAlive:
         with mock.patch("subprocess.run", side_effect=_fake_run):
             result = watcher_alive(ctx)
 
-        assert result.passed is True
-        assert "PID" in result.message
+        assert result.passed is False
+        assert "store-scoped" in result.message
 
     def test_fails_linux_when_neither_found(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setattr(sys, "platform", "linux")
@@ -304,7 +304,7 @@ class TestWatcherAlive:
         assert result.severity == "error"
         assert result.remediation is not None
 
-    def test_passes_macos_via_ps(self, tmp_path: Path, monkeypatch) -> None:
+    def test_rejects_macos_ps_substring_without_store_identity(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setattr(sys, "platform", "darwin")
         ctx = _ctx(tmp_path)
 
@@ -314,7 +314,7 @@ class TestWatcherAlive:
         with mock.patch("subprocess.run", side_effect=_fake_run):
             result = watcher_alive(ctx)
 
-        assert result.passed is True
+        assert result.passed is False
 
     def test_fails_macos_when_no_process(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setattr(sys, "platform", "darwin")
@@ -330,12 +330,13 @@ class TestWatcherAlive:
         assert result.severity == "error"
         assert "macOS" in result.message
 
-    def test_remediation_is_none_on_pass(self, tmp_path: Path, monkeypatch) -> None:
+    def test_macos_missing_identity_has_restart_remediation(self, tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setattr(sys, "platform", "darwin")
         ctx = _ctx(tmp_path)
         with mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout=_ps_output_with_watcher(), stderr="")):
             result = watcher_alive(ctx)
-        assert result.remediation is None
+        assert result.passed is False
+        assert result.remediation is not None
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +432,7 @@ class TestWatcherAliveUnitProbing:
         assert "--user" not in calls[0]
         assert "--user" in calls[1]
 
-    def test_install_advice_only_when_no_unit_is_active(
+    def test_no_unit_and_unassociated_process_is_not_healthy(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         self._linux(monkeypatch)
@@ -439,13 +440,11 @@ class TestWatcherAliveUnitProbing:
         with mock.patch("subprocess.run", side_effect=fake):
             result = watcher_alive(_ctx(tmp_path))
 
-        assert result.passed is True
-        assert "PID 4242" in result.message
-        assert "consider installing the unit" in result.message
+        assert result.passed is False
         assert "palinode-indexer.service" in result.message
         assert result.remediation is not None
 
-    def test_missing_systemctl_binary_falls_back_to_ps(
+    def test_missing_systemctl_binary_does_not_trust_ps_substring(
         self, tmp_path: Path, monkeypatch
     ) -> None:
         self._linux(monkeypatch)
@@ -456,8 +455,7 @@ class TestWatcherAliveUnitProbing:
         with mock.patch("subprocess.run", side_effect=fake):
             result = watcher_alive(_ctx(tmp_path))
 
-        assert result.passed is True
-        assert "PID 777" in result.message
+        assert result.passed is False
 
     def test_both_managers_erroring_falls_through_cleanly(
         self, tmp_path: Path, monkeypatch
@@ -486,7 +484,7 @@ class TestWatcherAliveUnitProbing:
         with mock.patch("subprocess.run", side_effect=fake):
             result = watcher_alive(_ctx(tmp_path))
 
-        assert result.passed is True
+        assert result.passed is False
         assert all(c[0] != "systemctl" for c in calls)
 
     def test_watcher_unit_name_override_is_probed_first(

@@ -5,242 +5,277 @@ category: documentation
 
 # Palinode Quickstart
 
-## Prerequisites
+This is the canonical first-use path: install, start, inspect controls, save a
+decision, connect a client, open a fresh session, inspect its source, then
+correct it. Your **memory store** is a private Git-backed markdown directory;
+it is not the Palinode code checkout.
 
-- Python 3.11+
-- Ollama with BGE-M3 on a reachable host (default: localhost:11434)
-- Git
+## Before you start
 
-## Setup
+The model-free path below is available in **v0.21.0**. It uses explicit lexical
+retrieval and client-native `mcp-config` output. The commands pin that release
+tag; a newer [release](https://github.com/phasespace-labs/palinode/releases/latest)
+or [Homebrew install](HOMEBREW.md) can be used after checking its documented
+retrieval requirements.
+
+For v0.21, you need Python 3.11+ and Git. These are POSIX-shell instructions,
+tested on macOS; use the release's platform-specific installation guidance on
+other platforms. Lexical mode does not need Ollama, an embedding endpoint, or a
+chat model. Hybrid mode needs an embedding endpoint for indexing and search;
+chat remains optional and is only used for features such as consolidation.
+Setting `PALINODE_RETRIEVAL_MODE=lexical` is an explicit mode choice, not a
+silent fallback when hybrid's endpoint is unavailable. See
+[PRIVACY.md](PRIVACY.md) before choosing a remote endpoint.
+
+## 1. Install the v0.21.0 release checkout
+
+Keep the code checkout separate from your memory store. Use the same checkout
+path in terminal two.
+
+**Before your first capture:** Palinode stores readable Markdown and Git history. `private`/`restricted` control discovery by scope; a caller with API access can still read a hidden memory by its known path and use full-store maintenance tools. These labels provide no encryption or per-user/per-agent authentication. Protect the store, backups and API credentials; use separate instances or filesystem permissions for stronger separation. See the [privacy contract](PRIVACY.md).
 
 ```bash
-cd /path/to/palinode
-
-# Create venv and install
-python3 -m venv venv
-source venv/bin/activate
+git clone https://github.com/phasespace-labs/palinode.git "$HOME/palinode-src"
+cd "$HOME/palinode-src"
+git checkout v0.21.0
+python3 -m venv .venv
+. .venv/bin/activate
 pip install -e .
 
-# Initialize the database
-python3 -c "from palinode.core.store import init_db; init_db()"
-
-# Pull BGE-M3 if not already on your Ollama host
-ollama pull bge-m3
+export PALINODE_HOME="$(pwd)"
+export PALINODE_BIN="$PALINODE_HOME/.venv/bin"
+export PALINODE_DIR="$HOME/.palinode"
+mkdir -p "$PALINODE_DIR"
+git -C "$PALINODE_DIR" init
+git -C "$PALINODE_DIR" config user.name "Your Name"
+git -C "$PALINODE_DIR" config user.email "you@example.invalid"
 ```
 
-## Running
+`PALINODE_DIR` contains your memories, index, logs, and Git history. Keep it
+private; do not put it inside the checkout or publish it. A remote Git push is
+optional and is your responsibility to configure.
 
-### Option A: Systemd services (recommended)
+## 2. Start Palinode in terminal one
+
+`palinode start` keeps the API and watcher in the foreground. Leave this
+terminal open. The explicit retrieval mode is an environment setting, so it
+must be present on the service process and in each client terminal.
 
 ```bash
-# Required environment variables
-export PALINODE_HOME=/path/to/palinode             # code root + venv/
-export PALINODE_DATA_DIR=/path/to/palinode-data    # memory markdown files
-export OLLAMA_URL=http://localhost:11434
-export EMBEDDING_MODEL=bge-m3
-
-# Install + enable the three user units (palinode-api, palinode-mcp, palinode-watcher)
-bash deploy/systemd/install.sh --enable
-
-# Check status
-systemctl --user status palinode-api palinode-mcp palinode-watcher
+# Keep the PALINODE_HOME and PALINODE_BIN values established in step 1.
+export PALINODE_DIR="$HOME/.palinode"
+export PALINODE_RETRIEVAL_MODE=lexical
+"$PALINODE_BIN/palinode" start
 ```
 
-See [`deploy/systemd/README.md`](../deploy/systemd/README.md) for full variable reference, troubleshooting, and uninstall.
+## 3. Before enabling automatic capture: inspect and control it
 
-### Option B: Manual
+Open terminal two while the API continues running in terminal one. Set its
+environment before using controls; a new shell does not inherit terminal
+one's variables. Inspect the result before `palinode init --hook` or asking
+a client to save automatically.
 
 ```bash
-# Terminal 1: API server
-source venv/bin/activate
-uvicorn palinode.api.server:app --host 127.0.0.1 --port 6340
-
-# Terminal 2: File watcher
-source venv/bin/activate
-python3 -m palinode.indexer.watcher
+# Use the same absolute checkout path chosen in step 1.
+export PALINODE_HOME="$HOME/palinode-src"
+export PALINODE_BIN="$PALINODE_HOME/.venv/bin"
+export PALINODE_DIR="$HOME/.palinode"
+export PALINODE_RETRIEVAL_MODE=lexical
+"$PALINODE_BIN/palinode" controls status --format json
 ```
 
-### Open the local inspector
+It reports the effective store and policy-resolved project, configured
+destinations and Git remotes (with URL credentials and query values redacted),
+and files it can observe in this project. A generated hook/config file is not
+proof that a client process is running; Palinode cannot inspect client-managed
+model traffic. Local storage is also not a no-network promise when an embedding
+provider, consolidation provider, Git remote, or client provider is configured.
 
-Once the API is running, open <http://127.0.0.1:6340/ui/> to browse memory
-health, files, search results, Git changes, compaction history, quality queues,
-and per-memory provenance. The inspector is read-only and loopback-only; see
-the [Local provenance UI guide](UI.md) for its views, access boundary, and
-troubleshooting.
-
-## Usage
-
-### Create a memory file
-
-Write a markdown file anywhere in the palinode directory:
+For a usable **recall-only** session on this Palinode instance, pause future
+API capture while leaving recall active. This is useful when an agent should
+search existing context but must not write new memories:
 
 ```bash
-cat > people/alice.md << 'EOF'
----
-id: person-alice
-category: person
-name: Alice
-core: true
-entities: [project/my-app]
-last_updated: 2026-03-22T20:00:00Z
----
-# Alice
-
-Designer and product lead for My App. Controls the design system.
-EOF
+"$PALINODE_BIN/palinode" controls pause --capture --no-recall
+"$PALINODE_BIN/palinode" controls status
+# Review http://127.0.0.1:6340/ui/ and `palinode history <memory-file>`.
+"$PALINODE_BIN/palinode" search "SQLite local prototype"
+"$PALINODE_BIN/palinode" save --type Decision \
+  "Fictional refused capture while controls are paused."
+"$PALINODE_BIN/palinode" controls resume --capture --no-recall
 ```
 
-The watcher auto-indexes it within ~10 seconds.
+The text status after the pause begins with `Capture: paused` and `Recall:
+active`; the attempted save is refused by the server before it stores the
+fictional content, while search remains available. On a newly created empty
+store, that search can return no results; it demonstrates recall availability,
+not that an earlier decision was found. `resume --capture
+--no-recall` restores capture without changing the recall setting. This is an
+instance-wide API control: it affects every future API-routed capture request
+for this Palinode store, not only one agent or chat.
 
-### Save via API
+Pause applies only to future capture and recall requests routed through this
+API. It does not stop background indexing, enrichment, or consolidation;
+direct-file legacy clients; in-flight requests; context already delivered to a
+client; or client-native memory and model traffic. To omit a project or source
+path from **automatic** capture and recall, use bounded exclusions:
 
 ```bash
-curl -X POST http://localhost:6340/save \
-  -H "Content-Type: application/json" \
-  -d '{
-    "content": "Alice wants 5 modules instead of 3",
-    "type": "Decision",
-    "slug": "app-five-modules",
-    "entities": ["person/alice", "project/my-app"]
-  }'
+"$PALINODE_BIN/palinode" controls exclude-project private-prototype
+"$PALINODE_BIN/palinode" controls exclude-path "$PWD/.env"
 ```
 
-### Search
+Exclusions do not block an explicit save, explicit recall, or other explicit
+user/API input, and they are not a secret-scanner guarantee. Do not submit
+secrets as explicit content. Transcript capture remains an opt-in harness
+feature; MCP installation alone does not enable it, and the command cannot
+certify a client process is running. See [HARNESSES.md](HARNESSES.md) for source/range and
+automatic-versus-explicit behavior, and [PRIVACY.md](PRIVACY.md) for visibility
+and access limits.
+
+## 4. Verify and save a decision in terminal two
+
+Continue in terminal two with the environment from step 3.
 
 ```bash
-# Via API
-curl -X POST http://localhost:6340/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "how many acts", "limit": 5}'
-
-# Via CLI
-python3 -m palinode.cli search "how many acts"
+"$PALINODE_BIN/palinode" doctor
+"$PALINODE_BIN/palinode" status --format json
+"$PALINODE_BIN/palinode" save --type Decision \
+  --project harbor-notes --slug harbor-notes-storage \
+  "Use SQLite for the local prototype because it runs as a single-user desktop app."
+"$PALINODE_BIN/palinode" search "SQLite local prototype"
 ```
 
-### Check status
+Expected results: `save` reports `retrieval_mode: lexical`, `indexed: true`,
+and `git_committed: true`; the search returns `decisions/harbor-notes-storage`.
+If it does not, run `doctor` first. Do not infer a semantic-match quality claim
+from lexical mode: it is exact-term retrieval for a supported minimal path.
+
+## 5. Connect a client, then prove a fresh session
+
+Generate the native fragment for the client instead of copying a command path.
+For example, v0.21.0 emits a TOML fragment for Codex:
 
 ```bash
-curl http://localhost:6340/status
-# or
-python3 -m palinode.cli stats
+"$PALINODE_BIN/palinode" mcp-config --editor codex --stdio --project harbor-notes
 ```
 
-### Verify with `palinode doctor`
+The explicit project is emitted as `PALINODE_PROJECT` for this stdio server
+process, so later searches and fresh sessions keep `harbor-notes` even from a
+linked worktree. A `palinode_session_init` project argument scopes that call;
+it does not change the scope of later calls. For a different project, generate
+a separate client entry. This option is stdio-only; HTTP clients share the
+remote server process.
 
-After install, run a quick health check:
+Merge the result into the destination named in its instructions, then restart
+the client. Use [MCP install recipes](MCP-INSTALL-RECIPES.md) for the selected
+client and [MCP configuration homes](MCP-CONFIG-HOMES.md) to diagnose a config;
+the command never edits client configuration itself.
+
+Start a genuinely new chat/session and ask the connected client to call
+`palinode_session_init` for `harbor-notes`. For a deterministic CLI check of
+the same session-start digest, run:
 
 ```bash
-palinode doctor
+"$PALINODE_BIN/palinode" prime --project harbor-notes
 ```
 
-It runs 18 read-only checks across path integrity, service health, config drift, index sanity, disk/backup, and a forward-looking CLAUDE.md scan. Every check has a remediation string; pass `--verbose` to also see remediation for passing checks. Use `--fix` (with per-action confirmation) to apply the small whitelist of safe automated fixes — doctor never moves user data. Full guide: [`docs/DOCTOR.md`](DOCTOR.md).
+It should report `project/harbor-notes` resolved explicitly and list the recent
+storage decision. MCP-only clients require this explicit tool call. Automatic
+session-start injection is only available when the selected client has its
+documented integration/hooks; it is not implied merely by installing MCP. See
+[HARNESSES.md](HARNESSES.md) for the supported harness tiers, hooks, and
+per-client behavior.
 
-### Rebuild index from scratch
+## 6. Inspect, then correct the decision
+
+Before changing anything, inspect the exact markdown and provenance:
 
 ```bash
-# Delete and recreate
-rm .palinode.db
-python3 -c "from palinode.core.store import init_db; init_db()"
-curl -X POST http://localhost:6340/reindex
+"$PALINODE_BIN/palinode" read decisions/harbor-notes-storage.md --meta
 ```
 
-## File Format
+The local inspector is read-only and loopback-only. It lets you browse the
+saved decision and its history; it is not an authorization boundary. Visit
+<http://127.0.0.1:6340/ui/> in a browser (`open` on macOS, `xdg-open` on many
+Linux desktops, or paste the URL on Windows). See [UI.md](UI.md) for its
+visibility and deployment limits.
 
-All memory files use YAML frontmatter:
-
-```yaml
----
-id: unique-id
-category: person | project | decision | insight | research
-core: true | false       # true = loaded at every session start
-status: active | archived | superseded
-entities: [person/name, project/slug]
-last_updated: 2026-03-22T20:00:00Z
----
-
-# Title
-
-Content here.
-```
-
-## Architecture
-
-```
-/path/to/palinode/
-├── .palinode.db              ← SQLite-vec (auto-generated, in .gitignore)
-├── people/*.md             ← who you know
-├── projects/*.md           ← what you're building
-├── decisions/*.md          ← choices made
-├── insights/*.md           ← lessons learned
-├── research/*.md           ← reference material
-├── daily/*.md              ← session logs
-├── specs/prompts/*.md      ← system prompts (read by the memory manager)
-├── PROGRAM.md              ← memory manager behavioral spec
-└── PRD.md                  ← what Palinode is
-```
-
-### Where the prompts come from
-
-`specs/prompts/*.md` are the prompts consolidation actually reads, and they are
-yours to edit — that is the point of keeping them in the store as files rather
-than in the code. `palinode init` writes them there from the copies that ship
-inside the package, and never overwrites one that already exists.
-
-Two consequences worth knowing:
-
-- A store that has no `specs/prompts/` still consolidates: the runner falls back
-  to the packaged copy and logs one line saying so. Run `palinode init` to get
-  editable copies.
-- A release that changes a prompt does not change *your* copy. `palinode doctor`
-  reports the gap (`prompts_current`) and `palinode prompt sync` closes it,
-  replacing only the files you have not edited.
-- They are config, not memory. Nothing under `specs/` is listed by `/list` or
-  injected at session start, browsable in the UI, reviewed, primed, propagated
-  to, or indexed for search — edit them with an editor or `palinode prompt`.
-
-## Ports & Services
-
-| Service | Port | Process |
-|---|---|---|
-| Palinode API | 6340 | uvicorn (FastAPI) |
-| Palinode Watcher | — | python watchdog daemon |
-| Ollama (embeddings) | 11434 | ollama serve |
-
-## Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `PALINODE_DIR` | `/path/to/palinode` | Root directory for memory files |
-| `OLLAMA_URL` | `http://localhost:11434` | Ollama endpoint for embeddings |
-| `EMBEDDING_MODEL` | `bge-m3` | Ollama model name |
-
-## Verify your setup with palinode doctor
-
-After install and service start, run:
+First save a neighboring decision that must remain unchanged, then save the
+separate requirement that supports the hosted-service decision. Record the
+shared-service decision under a **new** slug with a typed supersession link,
+a typed support link to that requirement, and a historical quote from the
+initial SQLite decision. Finally archive the initial decision with the
+replacement reference and a reason. This preserves the original markdown and
+Git history while removing it from default recall.
 
 ```bash
-palinode doctor
+"$PALINODE_BIN/palinode" save --type Decision \
+  --project harbor-notes --slug harbor-notes-timestamps \
+  "Store event timestamps in UTC."
+"$PALINODE_BIN/palinode" save --type Decision \
+  --project harbor-notes --slug harbor-notes-concurrent-write-requirement \
+  "The shared hosted service requires transactional coordination for concurrent writers."
+"$PALINODE_BIN/palinode" save --type Decision \
+  --project harbor-notes --slug harbor-notes-storage-shared \
+  --cite "decisions/harbor-notes-storage.md::Use SQLite for the local prototype because it runs as a single-user desktop app." \
+  --cite "decisions/harbor-notes-concurrent-write-requirement.md::The shared hosted service requires transactional coordination for concurrent writers." \
+  --backed-by decisions/harbor-notes-concurrent-write-requirement \
+  --metadata-json '{"supersedes":"decisions/harbor-notes-storage.md"}' \
+  "Use PostgreSQL for the shared hosted service because concurrent writers need transactional coordination."
+"$PALINODE_BIN/palinode" archive decisions/harbor-notes-storage.md \
+  --superseded-by decisions/harbor-notes-storage-shared.md \
+  --reason "The shared hosted service needs concurrent-write coordination."
 ```
 
-This checks 18+ conditions — DB path validity, watcher connectivity, config consistency, index health — and prints a pass/warn/fail report. If something is misconfigured, run `palinode doctor --fix` to apply safe automated repairs. See [docs/DOCTOR.md](DOCTOR.md) for the full check catalog.
+Start a fresh session again and ask it to search for the shared hosted-service
+decision, then inspect its source and the unaffected UTC neighbor:
 
-## Obsidian integration
+```bash
+"$PALINODE_BIN/palinode" prime --project harbor-notes
+"$PALINODE_BIN/palinode" search "shared hosted service"
+"$PALINODE_BIN/palinode" read decisions/harbor-notes-storage-shared.md --meta
+"$PALINODE_BIN/palinode" read decisions/harbor-notes-timestamps.md --meta
+```
 
-Palinode stores everything as plain markdown with YAML frontmatter, so your Palinode directory is already a valid Obsidian vault. Run `palinode init --obsidian --dir /path/to/vault` for an opinionated scaffold (graph defaults, daily-notes wiring, a starter `_index.md` MOC), then open the directory in Obsidian. You get the graph view, backlinks, and Bases on top of Palinode's hybrid search and consolidation — same files, two surfaces.
+The search finds the new shared-service decision; its metadata includes the
+supersession, a typed support link to the concurrent-writers requirement, and
+the preserved SQLite history reference. The initial SQLite decision is
+archived, not replaced in place, and the UTC neighbor remains a separate
+unchanged file.
 
-See [OBSIDIAN.md](OBSIDIAN.md) for the comprehensive guide: quickstart, the wiki-maintenance contract, the embedding tools the LLM calls (`palinode_dedup_suggest`, `palinode_orphan_repair`), and migration paths.
-## Connecting your IDE via MCP
+The SQLite quote is historical lineage: it proves that the quoted text was
+found in that saved record when cited. It does not support the PostgreSQL
+rationale, and quote integrity does not establish that a quoted claim is true.
+The separately saved concurrent-writers requirement is the recorded support
+for the new rationale; assess that requirement's source and claim status on
+its own merits.
 
-Once the API is running, connect it to your AI coding assistant:
+## 7. A conflict stays unresolved without evidence
 
-| Client | Recipe |
-|--------|--------|
-| Claude Code | [INSTALL-CLAUDE-CODE.md](INSTALL-CLAUDE-CODE.md) |
-| Claude Desktop | [MCP-SETUP.md](MCP-SETUP.md#claude-desktop) |
-| Cursor | [MCP-INSTALL-RECIPES.md](MCP-INSTALL-RECIPES.md#1-cursor) |
-| Windsurf | [MCP-INSTALL-RECIPES.md](MCP-INSTALL-RECIPES.md#2-windsurf) |
-| Continue (VS Code) | [MCP-INSTALL-RECIPES.md](MCP-INSTALL-RECIPES.md#3-continue-vs-code) |
-| Cline (VS Code) | [MCP-INSTALL-RECIPES.md](MCP-INSTALL-RECIPES.md#4-cline-vs-code) |
-| Zed | [MCP-INSTALL-RECIPES.md](MCP-INSTALL-RECIPES.md#5-zed) |
+Palinode records disagreement; it does not choose a winner for you. This
+optional demonstration creates two disputed region choices and asks for their
+current state:
 
-After connecting, verify with `palinode mcp-config --diagnose`.
+```bash
+"$PALINODE_BIN/palinode" save --type Decision --project harbor-notes \
+  --slug harbor-notes-region-north --contradicts decisions/harbor-notes-region-south \
+  "Deploy the shared service in the north region."
+"$PALINODE_BIN/palinode" save --type Decision --project harbor-notes \
+  --slug harbor-notes-region-south --contradicts decisions/harbor-notes-region-north \
+  "Deploy the shared service in the south region."
+"$PALINODE_BIN/palinode" resolve "harbor-notes deployment region"
+```
+
+The result lists both contested sides and says there is no winner. Do not use a
+later save to silently resolve a conflict; add explicit evidence or a replacement
+record when a decision is actually made.
+
+## Next steps
+
+- [Homebrew](HOMEBREW.md) for the current released installation and upgrades.
+- [Operations](OPERATIONS.md) for service management, recovery, and model-mode behavior.
+- [MCP install recipes](MCP-INSTALL-RECIPES.md) for client-specific configuration.
+- [Privacy policy](PRIVACY.md) for local storage, optional remote services, and Git remotes.
+- `palinode init --obsidian --dir /path/to/vault` to scaffold an Obsidian vault;
+  it is optional and operates on the chosen vault, not on the code checkout.

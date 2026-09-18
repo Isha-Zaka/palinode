@@ -217,6 +217,11 @@ class World:
         self._git("config", "user.email", "bench@example.invalid")
         self._git("config", "user.name", "current-state bench")
         self._git("config", "commit.gpgsign", "false")
+        # Replays copy this disposable repository, including .git/objects.
+        # Keep Git from scheduling background maintenance that can remove its
+        # transient lock while shutil.copytree is enumerating that directory.
+        self._git("config", "maintenance.auto", "false")
+        self._git("config", "gc.auto", "0")
         self.commit("corpus: initial state")
 
     def commit(self, message: str) -> None:

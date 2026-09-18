@@ -8,7 +8,6 @@
  * Host-side install / opt-in flags: see plugin/INSTALL.md
  */
 
-import * as fs from "fs";
 import * as path from "path";
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
@@ -56,7 +55,7 @@ const DEFAULTS = {
   palinodeApiUrl: "http://localhost:6340",
   palinodeDir: path.join(process.env.HOME || "", "palinode"),
   promptsDir: "specs/prompts",
-  autoCapture: true,
+  autoCapture: false,
   autoRecall: true,
   midTurnMode: "none" as "none" | "summary" | "full",
   recallProfile: "coding" as RecallProfileName,
@@ -215,7 +214,7 @@ export const PALINODE_CONFIG_SCHEMA = Type.Object(
       Type.String({ description: "Path to extraction prompts, relative to palinodeDir" }),
     ),
     autoCapture: Type.Optional(
-      Type.Boolean({ description: "Append session summaries to daily/ at agent end" }),
+      Type.Boolean({ description: "Opt in to bounded transcript capture through the API at agent end and reset" }),
     ),
     autoRecall: Type.Optional(
       Type.Boolean({ description: "Inject core memory + semantic recall before each agent turn" }),
@@ -256,7 +255,7 @@ const palinodeConfigSchema = {
         typeof cfg.promptsDir === "string"
           ? cfg.promptsDir
           : DEFAULTS.promptsDir,
-      autoCapture: cfg.autoCapture !== false,
+      autoCapture: cfg.autoCapture === true,
       autoRecall: cfg.autoRecall !== false,
       midTurnMode: (["none", "summary", "full"].includes(cfg.midTurnMode as string) ? cfg.midTurnMode : "none") as "none" | "summary" | "full",
       recallProfile: profileName,
@@ -332,14 +331,6 @@ export function composeInjectionFrame(injection: string, systemRoleAvailable = t
 // Helpers
 // ============================================================================
 
-function readFileIfExists(filePath: string): string | null {
-  try {
-    return fs.readFileSync(filePath, "utf-8");
-  } catch {
-    return null;
-  }
-}
-
 function resolveWithin(baseDir: string, ...segments: string[]): string | null {
   const root = path.resolve(baseDir);
   const candidate = path.resolve(root, ...segments);
@@ -350,26 +341,46 @@ function resolveWithin(baseDir: string, ...segments: string[]): string | null {
   return null;
 }
 
-/** Check if a file's YAML frontmatter contains core: true */
-function isCoreFile(content: string): boolean {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return false;
-  return /^core:\s*true/m.test(match[1]);
-}
-
 async function palinodeFetch(
   baseUrl: string,
   endpoint: string,
   options?: RequestInit,
 ): Promise<any> {
+  const headers = new Headers(options?.headers);
+  headers.set("Content-Type", "application/json");
+  // Same deployment credential as the shared Pi/Cline client.
+  const token = process.env.PALINODE_API_TOKEN?.trim();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
   const res = await fetch(`${baseUrl}${endpoint}`, {
     ...options,
-    headers: { "Content-Type": "application/json", ...options?.headers },
+    headers,
   });
   if (!res.ok) {
     throw new Error(`Palinode API ${endpoint}: ${res.status} ${res.statusText}`);
   }
   return res.json();
+}
+
+type AutomaticScope = { cwd?: string; project?: string };
+
+function automaticScope(event: any, context: any): AutomaticScope {
+  const cwd = context?.workspaceDir ?? event?.cwd;
+  return typeof cwd === "string" && path.isAbsolute(cwd) ? { cwd } : {};
+}
+
+async function automaticAllowed(
+  baseUrl: string, action: "capture" | "recall", scope: AutomaticScope,
+): Promise<boolean> {
+  if (!scope.cwd) return false;
+  try {
+    const result = await palinodeFetch(baseUrl, "/controls/check", {
+      method: "POST", signal: AbortSignal.timeout(3000),
+      body: JSON.stringify({ action, automatic: true, ...scope }),
+    });
+    return result?.allowed === true;
+  } catch {
+    return false;
+  }
 }
 
 /** Keep aligned with palinode/core/scoring.py; OpenClaw has not migrated to the shared core yet. */
@@ -426,7 +437,7 @@ const palinodePlugin = {
             Type.Number({ description: "Max results (default 5)" }),
           ),
           threshold: Type.Optional(
-            Type.Number({ description: "Similarity threshold (0.0–1.0). Higher = stricter." }),
+            Type.Number({ description: "Vector similarity floor (0.0–1.0); ignored in lexical mode." }),
           ),
           since_days: Type.Optional(
             Type.Number({ description: "Only return memories from the last N days." }),
@@ -491,7 +502,8 @@ const palinodePlugin = {
             if (params.include_telemetry !== undefined) body.include_telemetry = params.include_telemetry;
             if (params.tier !== undefined) body.tier = params.tier;
             if (params.resolve !== undefined && params.resolve !== "none") body.resolve = params.resolve;
-            const results = await palinodeFetch(
+            body.receipt = true;
+            const payload = await palinodeFetch(
               cfg.palinodeApiUrl,
               "/search",
               {
@@ -500,10 +512,16 @@ const palinodePlugin = {
               },
             );
 
+            const results = Array.isArray(payload) ? payload : (payload?.results ?? []);
+            const retrieval = payload?.receipt?.retrieval;
+            const diagnostic = retrieval
+              ? `Retrieval: ${retrieval.active_mode} · index: ${retrieval.index_state} · ${retrieval.outcome}\n`
+              : "";
+
             if (!results || results.length === 0) {
               return {
                 content: [
-                  { type: "text", text: "No relevant memories found in Palinode." },
+                  { type: "text", text: diagnostic + "No relevant memories found in Palinode." },
                 ],
               };
             }
@@ -519,7 +537,7 @@ const palinodePlugin = {
               content: [
                 {
                   type: "text",
-                  text: `Found ${results.length} memories:\n\n${text}`,
+                  text: `${diagnostic}Found ${results.length} memories:\n\n${text}`,
                 },
               ],
             };
@@ -955,8 +973,10 @@ const palinodePlugin = {
         api.logger.info("openclaw-palinode: compaction detected — will re-inject full core on next turn");
       });
 
-      api.on("before_prompt_build", async (event: any) => {
+      api.on("before_prompt_build", async (event: any, context: any) => {
         if (!event.prompt || event.prompt.length < 3) return;
+        const scope = automaticScope(event, context);
+        if (!await automaticAllowed(cfg.palinodeApiUrl, "recall", scope)) return;
 
         sessionTurnCount++;
         const isFirstTurn = sessionTurnCount === 1;
@@ -979,7 +999,7 @@ const palinodePlugin = {
         try {
           let coreContent = "";
 
-          // Phase 1: Load all files with core: true
+          // Phase 1: Discover core files through the server visibility policy.
           // Gated by `profile.sources.includes("core")` (#391/#394) — profiles
           // like "monitoring" and "investigation" skip core entirely.
           // Within core-enabled profiles, midTurnMode still controls full vs
@@ -987,7 +1007,6 @@ const palinodePlugin = {
           const CORE_FILE_MAX = profile.coreMaxCharsPerFile ?? 3000;
           const CORE_TOTAL_MAX = profile.coreBudget ?? 8000;
           const midTurnMode = cfg.midTurnMode || "none";
-          const dirsToScan = ["people", "projects", "decisions", "insights"];
           let coreBudgetRemaining = CORE_TOTAL_MAX;
 
           const coreEnabled = profile.sources.includes("core");
@@ -996,45 +1015,45 @@ const palinodePlugin = {
           if (!coreEnabled || (!fullCoreThisTurn && midTurnMode === "none")) {
             // No core injection — the model still has turn 1's context (or core is profile-disabled)
           } else {
-            for (const dir of dirsToScan) {
-              const fullDir = resolveWithin(cfg.palinodeDir, dir);
-              if (!fullDir) continue;
-              if (!fs.existsSync(fullDir)) continue;
-              const files = fs
-                .readdirSync(fullDir)
-                .filter((f: string) => f.endsWith(".md"));
+            try {
+              // /list has no caller scope; it withholds private/restricted and
+              // expired cores. Only paths selected there become automatic reads.
+              const signal = AbortSignal.timeout(5000);
+              const files = await palinodeFetch(cfg.palinodeApiUrl, "/list?core_only=true", { signal });
+              if (!Array.isArray(files)) throw new Error("Invalid core selection response");
               for (const file of files) {
-                const filePath = resolveWithin(fullDir, file);
-                if (!filePath) continue;
-                const content = readFileIfExists(filePath);
-                if (content && isCoreFile(content)) {
-                  const summaryMatch = content.match(/^summary:\s*["']?(.+?)["']?\s*$/m);
-                  const summary = summaryMatch ? summaryMatch[1].trim() : null;
-
-                  if (!fullCoreThisTurn && midTurnMode === "summary") {
-                    // Summary-only turns: inject one-liner (skip files without summary)
-                    if (summary) {
-                      coreContent += `\n--- ${dir}/${file} ---\n> ${summary}\n`;
-                    }
-                  } else {
-                    // Full turn: inject content within budget
-                    if (coreBudgetRemaining <= 0) continue; // Budget exhausted
-
-                    let injected = content;
-                    const maxForThis = Math.min(CORE_FILE_MAX, coreBudgetRemaining);
-                    if (content.length > maxForThis) {
-                      injected = content.slice(0, maxForThis) +
-                        (summary
-                          ? `\n...[truncated — summary: ${summary}]`
-                          : `\n...[truncated — full file at ${dir}/${file}]`);
-                    }
-                    const header = summary ? `> ${summary}\n\n` : "";
-                    const block = `\n--- ${dir}/${file} ---\n${header}${injected}\n`;
-                    coreContent += block;
-                    coreBudgetRemaining -= block.length;
+                if (coreBudgetRemaining <= 0) break;
+                if (typeof file?.file !== "string" || file.core !== true) continue;
+                const summary = typeof file.summary === "string" ? file.summary.trim() : "";
+                const source = `\n--- ${file.file} ---\n`;
+                let block: string;
+                if (!fullCoreThisTurn && midTurnMode === "summary") {
+                  if (!summary) continue;
+                  block = `${source}> ${summary}\n`;
+                } else {
+                  const result = await palinodeFetch(
+                    cfg.palinodeApiUrl,
+                    `/read?file_path=${encodeURIComponent(file.file)}`,
+                    { signal },
+                  );
+                  if (typeof result?.content !== "string") throw new Error("Invalid core read response");
+                  const content = result.content;
+                  const maxForThis = Math.max(0, Math.min(CORE_FILE_MAX, coreBudgetRemaining));
+                  let injected = content.slice(0, maxForThis);
+                  if (content.length > maxForThis) {
+                    injected += summary
+                      ? `\n...[truncated — summary: ${summary}]`
+                      : `\n...[truncated — full file at ${file.file}]`;
                   }
+                  const header = summary ? `> ${summary}\n\n` : "";
+                  block = `${source}${header}${injected}\n`;
                 }
+                block = block.slice(0, coreBudgetRemaining);
+                coreContent += block;
+                coreBudgetRemaining -= block.length;
               }
+            } catch {
+              api.logger.warn("openclaw-palinode: core recall unavailable or incomplete; continuing with available recall");
             }
           }
 
@@ -1116,21 +1135,27 @@ const palinodePlugin = {
               if (triggers && triggers.length > 0) {
                   const nMax = profile.triggersLimit ?? 10;
                   const triggerCap = profile.triggersMaxCharsEach ?? 2000;
-                  triggerContent = triggers.slice(0, nMax).map((t: any) => {
-                      const triggerPath = resolveWithin(cfg.palinodeDir, t.memory_file);
-                      if (!triggerPath) {
-                          return `\n[TRIGGER SKIPPED: ${t.description}] -> Unsafe path: ${t.memory_file}`;
-                      }
-                      const content = readFileIfExists(triggerPath);
-                      if (content) {
-                          return `\n\n--- Triggered: ${t.description} (${t.memory_file}) ---\n${content.slice(0, triggerCap)}`;
-                      } else {
-                          return `\n[TRIGGER FIRED: ${t.description}] -> File: ${t.memory_file} (file not found)`;
-                      }
-                  }).join("\n\n");
+                  // Older trigger APIs do not enforce visibility. Select before
+                  // including even its description or path in automatic context.
+                  const signal = AbortSignal.timeout(5000);
+                  const files = await palinodeFetch(cfg.palinodeApiUrl, "/list", { signal });
+                  if (!Array.isArray(files)) throw new Error("Invalid trigger selection response");
+                  const visiblePaths = new Set(files.map((file: any) => file.file));
+                  const selected = triggers.filter((t: any) =>
+                    typeof t.memory_file === "string" && visiblePaths.has(t.memory_file),
+                  ).slice(0, nMax);
+                  for (const t of selected) {
+                    const result = await palinodeFetch(
+                      cfg.palinodeApiUrl,
+                      `/read?file_path=${encodeURIComponent(t.memory_file)}`,
+                      { signal },
+                    );
+                    if (typeof result?.content !== "string") throw new Error("Invalid trigger read response");
+                    triggerContent += `\n\n--- Triggered: ${t.description} (${t.memory_file}) ---\n${result.content.slice(0, triggerCap)}`;
+                  }
               }
             } catch {
-              // degrade gracefully
+              api.logger.warn("openclaw-palinode: trigger recall unavailable or incomplete; continuing with available recall");
             }
           }
 
@@ -1171,6 +1196,7 @@ const palinodePlugin = {
             pendingEsReceipt = null;
           }
 
+          if (!await automaticAllowed(cfg.palinodeApiUrl, "recall", scope)) return;
           return { systemContext: injection };
         } catch (err) {
           api.logger.warn(`openclaw-palinode: recall failed: ${String(err)}`);
@@ -1178,174 +1204,43 @@ const palinodePlugin = {
       });
     }
 
-    // ========================================================================
-    // Auto-Capture: extract memories after agent ends
-    // ========================================================================
+    // Capture uses the API policy and git provenance boundary.
+    const captureSession = async (event: any, context: any, trigger: string) => {
+      if (!cfg.autoCapture || !event.messages?.length) return;
+      const scope = automaticScope(event, context);
+      try {
+        if (!await automaticAllowed(cfg.palinodeApiUrl, "capture", scope)) return;
+        const messages: string[] = [];
+        for (const message of event.messages.slice(-20)) {
+          if (message?.role !== "user" && message?.role !== "assistant") continue;
+          const content = typeof message.content === "string" ? message.content
+            : Array.isArray(message.content) ? message.content
+              .filter((part: any) => typeof part?.text === "string")
+              .map((part: any) => part.text).join("\n") : "";
+          const text = content.replace(/<palinode-memory>[\s\S]*?<\/palinode-memory>\s*/g, "").trim();
+          if (text) messages.push(`${message.role}: ${text.slice(0, 500)}`);
+        }
+        if (!messages.length) return;
+        await palinodeFetch(cfg.palinodeApiUrl, "/session-end", {
+          method: "POST", signal: AbortSignal.timeout(10000),
+          body: JSON.stringify({
+            summary: `Auto-captured (openclaw ${trigger}).\n${messages.join("\n\n").slice(0, 2000)}`,
+            source: "openclaw-plugin", automatic: true, ...scope,
+            decisions: [], blockers: [],
+          }),
+        });
+        api.logger.info("openclaw-palinode: bounded session capture accepted by API");
+      } catch {
+        api.logger.warn("openclaw-palinode: automatic capture unavailable");
+      }
+    };
 
     if (cfg.autoCapture) {
-      api.on("agent_end", async (event: any) => {
-        if (!event.success || !event.messages || event.messages.length === 0) {
-          return;
-        }
-
-        try {
-          // Read PROGRAM.md for behavior instructions
-          const programContent = readFileIfExists(
-            resolveWithin(cfg.palinodeDir, "PROGRAM.md") ?? "",
-          );
-
-          // Read extraction prompt
-          const extractionPrompt = readFileIfExists(
-            resolveWithin(promptsDir, "extraction.md") ?? "",
-          );
-
-          if (!extractionPrompt) {
-            api.logger.warn(
-              "openclaw-palinode: extraction prompt not found, skipping auto-capture",
-            );
-            return;
-          }
-
-          // Build the messages for extraction
-          const recentMessages = event.messages.slice(-10);
-          const formattedMessages: string[] = [];
-
-          for (const msg of recentMessages) {
-            if (!msg || typeof msg !== "object") continue;
-            const role = (msg as any).role;
-            if (role !== "user" && role !== "assistant") continue;
-
-            let textContent = "";
-            const content = (msg as any).content;
-            if (typeof content === "string") {
-              textContent = content;
-            } else if (Array.isArray(content)) {
-              for (const block of content) {
-                if (block?.text && typeof block.text === "string") {
-                  textContent += (textContent ? "\n" : "") + block.text;
-                }
-              }
-            }
-
-            if (!textContent) continue;
-            // Strip injected palinode context to avoid feedback loop
-            textContent = textContent
-              .replace(/<palinode-memory>[\s\S]*?<\/palinode-memory>\s*/g, "")
-              .trim();
-            if (!textContent) continue;
-
-            formattedMessages.push(`${role}: ${textContent}`);
-          }
-
-          if (formattedMessages.length === 0) return;
-
-          const conversationText = formattedMessages.join("\n\n");
-
-          // We can't call an LLM directly from the plugin (no api.llm).
-          // Instead, save the session summary to daily/ for the memory manager
-          // to process later, OR use the Palinode API /save for simple captures.
-          //
-          // For MVP: save a session summary to daily/
-          const today = new Date().toISOString().split("T")[0];
-          const dailyPath = resolveWithin(cfg.palinodeDir, "daily", `${today}.md`);
-          if (!dailyPath) {
-            api.logger.warn("openclaw-palinode: unsafe daily path during auto-capture");
-            return;
-          }
-          const dirPath = path.dirname(dailyPath);
-          if (!fs.existsSync(dirPath)) {
-            fs.mkdirSync(dirPath, { recursive: true });
-          }
-
-          // Append to today's daily note
-          const sessionSummary = `\n\n## Session ${new Date().toISOString()}\n\n${conversationText.slice(0, 2000)}\n`;
-
-          fs.appendFileSync(dailyPath, sessionSummary);
-
-          api.logger.info(
-            `openclaw-palinode: appended session to daily/${today}.md (${formattedMessages.length} messages)`,
-          );
-
-          // Tier 1: Session-end status append
-          // For long sessions: extract unique TOPICS discussed, not just one line.
-          // For short sessions: capture intent → result.
-          try {
-            const userMessages = formattedMessages
-              .filter((m: string) => m.startsWith("user:"))
-              .map((m: string) => m.replace(/^user:\s*/, "").replace(/\n.*/s, "").trim())
-              .filter((l: string) => l.length > 15);
-
-            const assistantMessages = formattedMessages
-              .filter((m: string) => m.startsWith("A:"))
-              .map((m: string) => m.replace(/^A:\s*/, "").replace(/\n.*/s, "").trim())
-              .filter((l: string) => l.length > 20);
-
-            let summary = "";
-            const isLongSession = formattedMessages.length > 20;
-
-            if (isLongSession) {
-              // Long session: sample user messages across the session to capture topics
-              // Take first, middle, and last user messages for breadth
-              const sample: string[] = [];
-              if (userMessages.length > 0) sample.push(userMessages[0]);
-              if (userMessages.length > 4) sample.push(userMessages[Math.floor(userMessages.length / 2)]);
-              if (userMessages.length > 2) sample.push(userMessages[userMessages.length - 1]);
-              // Deduplicate and truncate
-              const unique = [...new Set(sample)].map((s: string) => s.slice(0, 60));
-              summary = `[${formattedMessages.length} msgs] ${unique.join("; ")}`;
-            } else {
-              // Short session: intent → result
-              const intent = userMessages[0] || "";
-              const result = assistantMessages[assistantMessages.length - 1] || "";
-              if (intent && result) {
-                summary = `${intent.slice(0, 100)} → ${result.slice(0, 100)}`;
-              } else {
-                summary = (result || intent).slice(0, 200);
-              }
-            }
-
-            if (summary.length > 15) {
-
-              // Use entity detection API to find which project was discussed
-              try {
-                const detectRes = await fetch(`${cfg.palinodeApiUrl}/entities`, {
-                  signal: AbortSignal.timeout(3000),
-                });
-                if (detectRes.ok) {
-                  const entities: any[] = await detectRes.json();
-                  // Find project entities that have status files
-                  const projectEntities = entities
-                    .filter((e: any) => e.entity_ref?.startsWith("project/"))
-                    .map((e: any) => e.entity_ref.replace("project/", ""));
-
-                  const statusDir = path.join(cfg.palinodeDir, "projects");
-                  if (fs.existsSync(statusDir)) {
-                    for (const proj of projectEntities) {
-                      const sfPath = path.join(statusDir, `${proj}-status.md`);
-                      if (fs.existsSync(sfPath)) {
-                        // Check if this session mentioned this project
-                        const projLower = proj.toLowerCase().replace(/-/g, " ");
-                        const mentioned = conversationText.toLowerCase().includes(projLower);
-                        if (mentioned) {
-                          fs.appendFileSync(sfPath, `\n- [${today}] ${summary}\n`);
-                          api.logger.info(`openclaw-palinode: status append → ${proj}-status.md`);
-                        }
-                      }
-                    }
-                  }
-                }
-              } catch {
-                // API not reachable — skip status append silently
-              }
-            }
-          } catch (statusErr) {
-            api.logger.warn(
-              `openclaw-palinode: status append failed: ${String(statusErr)}`,
-            );
-          }
-        } catch (err) {
-          api.logger.warn(`openclaw-palinode: capture failed: ${String(err)}`);
-        }
+      api.on("agent_end", async (event: any, context: any) => {
+        if (event.success) await captureSession(event, context, "agent_end");
+      });
+      api.on("before_reset", async (event: any, context: any) => {
+        await captureSession(event, context, "before_reset");
       });
     }
 
@@ -1409,52 +1304,6 @@ const palinodePlugin = {
       },
       { commands: ["palinode"] },
     );
-
-    // ========================================================================
-    // /new command hook — flush session summary before context resets
-    // ========================================================================
-
-    api.on("before_reset", async (event: any) => {
-      try {
-        const messages = event.messages || [];
-        if (messages.length === 0) return;
-
-        const formattedMessages: string[] = [];
-        for (const msg of messages.slice(-20)) {
-          if (!msg || typeof msg !== "object") continue;
-          const role = (msg as any).role;
-          if (role !== "user" && role !== "assistant") continue;
-          let textContent = "";
-          const content = (msg as any).content;
-          if (typeof content === "string") {
-            textContent = content;
-          } else if (Array.isArray(content)) {
-            for (const block of content) {
-              if (block?.text) textContent += (textContent ? "\n" : "") + block.text;
-            }
-          }
-          textContent = textContent.replace(/<palinode-memory>[\s\S]*?<\/palinode-memory>\s*/g, "").trim();
-          if (!textContent) continue;
-          formattedMessages.push(`${role}: ${textContent.slice(0, 500)}`);
-        }
-
-        if (formattedMessages.length === 0) return;
-
-        const today = new Date().toISOString().split("T")[0];
-        const dailyPath = resolveWithin(cfg.palinodeDir, "daily", `${today}.md`);
-        if (!dailyPath) {
-          api.logger.warn("openclaw-palinode: unsafe daily path during /new flush");
-          return;
-        }
-        const sessionSummary = `\n\n## /new flush — ${new Date().toISOString()}\n\n${formattedMessages.join("\n\n").slice(0, 3000)}\n`;
-
-        const existing = readFileIfExists(dailyPath) || `# Daily Notes — ${today}\n`;
-        fs.writeFileSync(dailyPath, existing + sessionSummary, "utf-8");
-        api.logger.info(`openclaw-palinode: /new hook — flushed ${formattedMessages.length} messages to ${dailyPath}`);
-      } catch (err) {
-        api.logger.warn(`openclaw-palinode: /new hook failed: ${String(err)}`);
-      }
-    });
 
     // ========================================================================
     // Service

@@ -303,7 +303,7 @@
     ]
   },
   "palinode_search": {
-    "description": "Search Palinode memory for relevant context about people, projects, decisions, insights, or research. Returns the most relevant memory file excerpts ranked by semantic similarity.",
+    "description": "Search Palinode memory for relevant context about people, projects, decisions, insights, or research. Returns the most relevant memory file excerpts ranked by configured hybrid or lexical retrieval.",
     "params": {
       "category": {
         "enum": [
@@ -377,7 +377,7 @@
     "required": []
   },
   "palinode_status": {
-    "description": "Check Palinode health: API reachability, index stats, last watcher run.",
+    "description": "Check Palinode health plus the effective read-only capture/recall pause state, policy provenance, and resolved project scope.",
     "params": {},
     "required": []
   },

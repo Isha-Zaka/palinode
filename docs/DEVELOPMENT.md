@@ -29,6 +29,41 @@ so pytest always prefers the local source tree over whatever is installed in
 `site-packages`.  This is the canonical fix for the editable-install gotcha
 described below.
 
+## Interpreting CI failures
+
+Documentation-only contributions receive unit, lint, security, and shipping
+checks too. The private development gate runs Ubuntu with Python 3.11 and 3.12
+and macOS with Python 3.12; its required Ubuntu names remain `unit-tests (3.11)`
+and `unit-tests (3.12)`. The macOS lane uses Homebrew Python so SQLite can load
+the sqlite-vec extension. The post-merge sweep covers the same three lanes.
+
+Open the first failed step and assertion. A Python installation or SQLite
+extension-loading failure is a runner/setup problem. A watcher coalescing
+assertion tests controlled timer ordering; a real-observer timeout tests actual
+filesystem delivery and index convergence. Both deserve investigation. Repeated
+stderr messages alone do not prove repeated indexing: compare pytest's captured
+log records and the embedding/pass assertions, since duplicate logging handlers
+can print a single record many times.
+
+For a focused local check, run:
+
+```bash
+python -m pytest tests/test_watcher_debounce_coalesce.py tests/test_watcher_thread_shutdown.py tests/test_watcher_on_moved.py -q
+```
+
+If an unrelated check fails on a docs contribution, maintainers should record
+the failing lane, assertion, and run link and investigate the test or runtime
+defect. Contributors need not change their documentation to satisfy an unrelated
+watcher failure. Fork workflow approval may require a maintainer; repeated
+reruns, platform skips, or bypassing CI are not the repair.
+
+The watcher defers a zero-byte event read for one additional debounce window,
+then reopens the path even if no further event arrives. A persistently empty
+file still reconciles, because markdown on disk is authoritative. This bounded
+retry reduces transient truncate/write exposure; it cannot guarantee a coherent
+snapshot of an arbitrarily slow non-atomic writer. Explicit reindex reads the
+current file immediately.
+
 ## Working in worktrees
 
 Palinode's agent-based development workflow uses `git worktree` to give each

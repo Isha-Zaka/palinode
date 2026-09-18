@@ -51,7 +51,7 @@ def test_wrap_command_is_deterministic():
     invariant no longer holds — /wrap deliberately calls two tools in order. """
     body = WRAP_COMMAND_BODY
     assert "palinode_session_end" in body
-    assert "palinode_push" in body, "wrap command must include palinode_push step (#353)"
+    assert "palinode_push" in body, "wrap command must include palinode_push step"
     assert "summary" in body
     assert "decisions" in body
     assert "blockers" in body
@@ -60,7 +60,7 @@ def test_wrap_command_is_deterministic():
     assert "safe to /clear now" in body
     # Push must precede session-end
     assert body.find("palinode_push") < body.find("palinode_session_end"), (
-        "palinode_push must appear before palinode_session_end (#353)"
+        "palinode_push must appear before palinode_session_end"
     )
     # Must NOT dispatch to palinode_save (a pointer to the tool for
     # mid-session checkpoints is fine; the /save //ps commands are removed)
@@ -93,7 +93,7 @@ def test_wrap_light_has_step0_git_preflight():
 def test_wrap_light_step0_scaffolds_into_command(tmp_path: Path):
     """The Step 0 pre-flight reaches the scaffolded .claude/commands/wrap.md."""
     runner = CliRunner()
-    result = runner.invoke(main, ["init", "--dir", str(tmp_path)])
+    result = runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])
     assert result.exit_code == 0, result.output
     wrap = (tmp_path / ".claude" / "commands" / "wrap.md").read_text()
     assert "Step 0" in wrap
@@ -250,6 +250,7 @@ def _run_hook(tmp_path, transcript_text, *, env=None, reason="clear",
         '#!/bin/bash\n'
         'echo "$@" >> "$STUB_DIR/curl-called"\n'
         '[ "${CURL_FAIL:-0}" = "1" ] && exit 22\n'
+        'case "$*" in *"/controls/check"*) [ "${CONTROL_DENY:-0}" = "1" ] && echo "{\\"allowed\\":false}" || echo "{\\"allowed\\":true,\\"project\\":\\"fixture-project\\"}" ;; esac\n'
         'exit 0\n'
     )
     (stub_dir / "curl").chmod(0o755)
@@ -295,7 +296,9 @@ def test_hook_skips_when_wrap_already_ran(tmp_path):
     )
     proc, _fallback, curl_called = _run_hook(tmp_path, transcript)
     assert proc.returncode == 0, proc.stderr
-    assert not curl_called.exists(), "curl POST fired despite /wrap having run"
+    calls = curl_called.read_text()
+    assert "/controls/check" in calls
+    assert "/session-end" not in calls, "floor POST fired despite /wrap having run"
 
 
 def test_hook_force_overrides_wrap_dedup(tmp_path):
@@ -316,19 +319,36 @@ def test_hook_dryrun_writes_nothing(tmp_path):
         tmp_path, _NONTRIVIAL, env={"PALINODE_HOOK_DRYRUN": "1"})
     assert proc.returncode == 0, proc.stderr
     assert "DRYRUN" in proc.stdout
-    assert not curl_called.exists(), "dry-run must not POST"
+    calls = curl_called.read_text()
+    assert "/controls/check" in calls, "dry-run still validates policy scope"
+    assert "/session-end" not in calls, "dry-run must not capture"
 
 
-def test_hook_fallback_log_on_api_failure(tmp_path):
-    """When the POST fails, the capture is appended to the fallback log so it
-    isn't lost."""
+def test_hook_failure_never_writes_a_transcript_fallback(tmp_path):
+    """A failed automatic post cannot leave a replayable transcript summary.
+
+    The API may have rejected a pause/exclusion after the hook preflight, so a
+    local fallback would silently defeat the user control.
+    """
     proc, fallback, curl_called = _run_hook(
         tmp_path, _NONTRIVIAL, env={"CURL_FAIL": "1"})
     assert proc.returncode == 0, proc.stderr
     assert curl_called.exists(), "curl should have been attempted"
-    assert fallback.exists(), "failed POST must route to the fallback log"
-    line = json.loads(fallback.read_text().strip())
-    assert "summary" in line and "project" in line
+    assert not fallback.exists(), "automatic failure must not leave a fallback"
+
+
+def test_hook_denial_precedes_transcript_read_and_never_falls_back(tmp_path):
+    """The policy request names only the path; fixture content never leaves it."""
+    secret = "sk-ant-HARMLESS-HARBOR-NOTES-NEGATIVE-FIXTURE"
+    transcript = _NONTRIVIAL.replace("first ask", secret)
+    proc, fallback, curl_called = _run_hook(
+        tmp_path, transcript, env={"CONTROL_DENY": "1"})
+    assert proc.returncode == 0, proc.stderr
+    calls = curl_called.read_text()
+    assert "/controls/check" in calls
+    assert "/session-end" not in calls
+    assert secret not in calls
+    assert not fallback.exists()
 
 
 def test_hook_happy_path_posts_once_no_fallback(tmp_path):
@@ -339,6 +359,15 @@ def test_hook_happy_path_posts_once_no_fallback(tmp_path):
     assert curl_called.exists()
     assert "/session-end" in curl_called.read_text()
     assert not fallback.exists()
+
+
+def test_hook_post_carries_transcript_source_path(tmp_path):
+    """The final API check needs the same path scope as hook preflight."""
+    proc, _fallback, curl_called = _run_hook(tmp_path, _NONTRIVIAL)
+    assert proc.returncode == 0, proc.stderr
+    calls = curl_called.read_text()
+    assert '"source_path"' in calls
+    assert str(tmp_path / "t.jsonl") in calls
 
 
 def test_hook_bearer_token_sent_when_configured(tmp_path):
@@ -360,9 +389,17 @@ def test_hook_no_auth_header_by_default(tmp_path):
 # ---- Scaffolding flow ---------------------------------------------------
 
 
+def test_init_requires_explicit_hook_opt_in_for_new_transcript_capture(tmp_path: Path):
+    result = CliRunner().invoke(main, ["init", "--dir", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / ".claude" / "hooks" / "palinode-session-end.sh").exists()
+    assert "not installed" in result.output
+    assert "--hook" in result.output
+
+
 def test_init_creates_all_files(tmp_path: Path):
     runner = CliRunner()
-    result = runner.invoke(main, ["init", "--dir", str(tmp_path)])
+    result = runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])
     assert result.exit_code == 0, result.output
 
     assert (tmp_path / ".claude" / "CLAUDE.md").exists()
@@ -383,7 +420,7 @@ def test_init_settings_include_worktree_allow_rules(tmp_path: Path):
     from palinode.cli.init import WORKTREE_ALLOW_RULES
 
     runner = CliRunner()
-    result = runner.invoke(main, ["init", "--dir", str(tmp_path)])
+    result = runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])
     assert result.exit_code == 0, result.output
 
     settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
@@ -405,8 +442,8 @@ def test_init_merge_adds_allow_rules_without_duplicating(tmp_path: Path):
     }))
 
     runner = CliRunner()
-    runner.invoke(main, ["init", "--dir", str(tmp_path)])
-    runner.invoke(main, ["init", "--dir", str(tmp_path)])  # twice — must stay idempotent
+    runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])
+    runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])  # twice — must stay idempotent
 
     settings = json.loads(settings_path.read_text())
     allow = settings["permissions"]["allow"]
@@ -499,13 +536,13 @@ def test_build_plan_matches_executed_write_set(tmp_path: Path):
 
 def test_init_is_idempotent(tmp_path: Path):
     runner = CliRunner()
-    first = runner.invoke(main, ["init", "--dir", str(tmp_path)])
+    first = runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])
     assert first.exit_code == 0
 
     wrap_content = (tmp_path / ".claude" / "commands" / "wrap.md").read_text()
     settings_content = (tmp_path / ".claude" / "settings.json").read_text()
 
-    second = runner.invoke(main, ["init", "--dir", str(tmp_path)])
+    second = runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])
     assert second.exit_code == 0
     assert "skipped" in second.output
 
@@ -538,7 +575,7 @@ def test_init_merges_into_existing_settings_json(tmp_path: Path):
     }, indent=2))
 
     runner = CliRunner()
-    result = runner.invoke(main, ["init", "--dir", str(tmp_path), "--no-claudemd", "--no-mcp", "--no-slash"])
+    result = runner.invoke(main, ["init", "--dir", str(tmp_path), "--no-claudemd", "--no-mcp", "--no-slash", "--hook"])
     assert result.exit_code == 0
 
     merged = json.loads(settings.read_text())
@@ -554,8 +591,8 @@ def test_init_registers_both_hooks_idempotently(tmp_path: Path):
     """A double init registers SessionStart + SessionEnd exactly once each
     (the ship palinode-session-start.sh hook for claude code work: the session-start hook rides the same settings merge as session-end)."""
     runner = CliRunner()
-    runner.invoke(main, ["init", "--dir", str(tmp_path)])
-    runner.invoke(main, ["init", "--dir", str(tmp_path)])
+    runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])
+    runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])
 
     settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())
     for event, script in (
@@ -584,7 +621,7 @@ def test_init_upgrades_sessionend_only_settings(tmp_path: Path):
     }, indent=2))
 
     runner = CliRunner()
-    result = runner.invoke(main, ["init", "--dir", str(tmp_path)])
+    result = runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])
     assert result.exit_code == 0, result.output
 
     settings = json.loads(settings_path.read_text())
@@ -681,7 +718,7 @@ def test_memory_block_core_is_harness_neutral():
         "sample-project",
     ):
         assert required in core, f"core lost required section: {required!r}"
-    for claude_only in ("/wrap", "/clear", "/save", "/ps", "hook", "SessionEnd"):
+    for claude_only in ("/wrap", "/clear", "/save", "/ps", "SessionEnd"):
         assert claude_only not in core, f"Claude-ism leaked into core: {claude_only!r}"
     assert core.count("## Memory (Palinode)") == 1
 
@@ -810,6 +847,32 @@ def test_init_installs_session_skill_by_default(tmp_path: Path):
     assert result.exit_code == 0, result.output
     installed = tmp_path / ".claude" / "skills" / "palinode-session" / "SKILL.md"
     assert installed.read_text() == PALINODE_SESSION_SKILL
+
+
+def test_generated_session_skill_uses_conditional_capture_semantics_without_hooks(tmp_path: Path):
+    """The default skill must not turn a recall-only session into a timed write."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["init", "--dir", str(tmp_path), "--no-hook"])
+    assert result.exit_code == 0, result.output
+    skill = (tmp_path / ".claude" / "skills" / "palinode-session" / "SKILL.md").read_text()
+    for expected in (
+        "new durable progress has accumulated",
+        "recall-only/no-new-information session",
+        "explicit request not to save",
+        "opt-in client hooks and background auto-summary enrichment",
+        "`/wrap`, preserve that explicit requested session-end write",
+        "`palinode init --no-hook` leaves automatic hooks off",
+    ):
+        assert expected in skill
+    assert "Before the user exits, capture the session:" not in skill
+    assert "If actively working and 30+ minutes since last palinode_save" not in skill
+    assert "automatic Claude hooks: not installed" in result.output
+    assert "instruction-driven session capture: palinode-session skill selected" in result.output
+
+    help_result = runner.invoke(main, ["init", "--help"])
+    assert help_result.exit_code == 0, help_result.output
+    assert "conditional explicit" in help_result.output
+    assert "not automatic hook capture" in help_result.output
 
 
 def test_init_session_skill_into_detected_harness_paths(tmp_path: Path):

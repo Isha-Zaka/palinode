@@ -73,6 +73,16 @@ def test_only_the_digest_variant_tells_the_agent_to_call_session_init():
     assert "palinode_search" in pmcp._SERVER_INSTRUCTIONS_NO_DIGEST
 
 
+def test_instructions_distinguish_explicit_capture_from_hooks_and_recap_only_sessions():
+    """The handshake must not turn every connection into an unconditional write."""
+    for text in (pmcp._SERVER_INSTRUCTIONS, pmcp._SERVER_INSTRUCTIONS_NO_DIGEST):
+        assert "content-bearing writes" in text
+        assert "opt-in client hooks" in text
+        assert "background auto-summary enrichment" in text
+        assert "recall-only/no-new-information session" in text
+        assert "explicit request not to save" in text
+
+
 @pytest.mark.parametrize(
     "client_name,digest_promised",
     [

@@ -82,7 +82,7 @@ class TestCollectDailyNotesYamlParseWarning:
 
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning_records, (
-            "_collect_daily_notes must emit WARNING when YAML parse fails (#387)"
+            "_collect_daily_notes must emit WARNING when YAML parse fails"
         )
         combined = " ".join(r.getMessage() for r in warning_records)
         assert bad_file.name in combined or "yaml" in combined.lower() or "parse" in combined.lower(), (
@@ -106,7 +106,7 @@ class TestCollectDailyNotesYamlParseWarning:
             notes, skipped = _collect_daily_notes(lookback_days=30)
 
         assert skipped == 1, (
-            f"Exactly 1 file had bad YAML — skip count should be 1, got {skipped} (#387)"
+            f"Exactly 1 file had bad YAML — skip count should be 1, got {skipped}"
         )
 
     def test_two_corrupt_files_count_two(self, memory_dir, caplog):
@@ -119,7 +119,7 @@ class TestCollectDailyNotesYamlParseWarning:
             _notes, skipped = _collect_daily_notes(lookback_days=30)
 
         assert skipped == 2, (
-            f"Two bad files → skip count must be 2, got {skipped} (#387)"
+            f"Two bad files → skip count must be 2, got {skipped}"
         )
 
     def test_body_text_still_collected_after_parse_failure(self, memory_dir, caplog):
@@ -139,7 +139,7 @@ class TestCollectDailyNotesYamlParseWarning:
 
         assert len(notes) == 1, (
             "Note with bad YAML frontmatter must still produce a notes entry "
-            "(body text collected) (#387)"
+            "(body text collected)"
         )
         assert "project/palinode" in notes[0]["mentions"] or "useful content" in notes[0]["content"], (
             "Body text must be present in the collected note even with bad frontmatter"
@@ -193,7 +193,7 @@ class TestGetDecisionsYamlParseWarning:
 
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert warning_records, (
-            "_get_decisions_for_project must emit WARNING on YAML parse failure (#387)"
+            "_get_decisions_for_project must emit WARNING on YAML parse failure"
         )
         combined = " ".join(r.getMessage() for r in warning_records)
         assert "decision-bad.md" in combined or "parse" in combined.lower(), (

@@ -250,7 +250,7 @@ def test_install_sh_documents_watcher_unit_name() -> None:
     )
     output = result.stdout + result.stderr
     assert "WATCHER_UNIT_NAME" in output, (
-        "install.sh --help should document the WATCHER_UNIT_NAME override (#252)"
+        "install.sh --help should document the WATCHER_UNIT_NAME override"
     )
 
 
@@ -287,7 +287,7 @@ def test_install_sh_documents_system_flag() -> None:
         text=True,
     )
     output = result.stdout + result.stderr
-    assert "--system" in output, "install.sh --help should document the --system flag (#252)"
+    assert "--system" in output, "install.sh --help should document the --system flag"
 
 
 def test_install_sh_system_scope_targets_etc() -> None:

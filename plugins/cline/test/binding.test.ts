@@ -15,6 +15,7 @@ type Calls = Array<{ url: string; body?: unknown; headers?: Record<string, strin
 function stubFetch(routes: Record<string, unknown>, calls: Calls = []): typeof fetch {
   return (async (url: unknown, init?: { body?: unknown; headers?: Record<string, string> }) => {
     const u = String(url);
+    if (u.includes("/controls/check") && !("/controls/check" in routes)) return Response.json({ allowed: true });
     calls.push({ url: u, body: init?.body ? JSON.parse(String(init.body)) : undefined, headers: init?.headers });
     const hit = Object.entries(routes).find(([path]) => u.includes(path));
     if (!hit) return new Response("not found", { status: 404 });
@@ -53,7 +54,7 @@ function request(messages: ClineMessage[], snapshot: Record<string, unknown> = {
 }
 
 function make(routes: Record<string, unknown>, calls: Calls = [], extra: Record<string, unknown> = {}) {
-  return createPalinodePlugin({ env: {}, fetchFn: stubFetch(routes, calls), ...extra });
+  return createPalinodePlugin({ env: { PALINODE_CAPTURE_ENABLED: "1" }, fetchFn: stubFetch(routes, calls), ...extra });
 }
 
 describe("shape", () => {
@@ -193,7 +194,7 @@ describe("beforeModel — fail-open", () => {
     await expect(p.hooks.beforeModel(request([user(PROMPT)]))).resolves.toBeUndefined();
   });
 
-  it("gives up inside the hook deadline when the API hangs, and does not retry that prompt", async () => {
+  it("gives up inside the hook deadline and rechecks policy on the next request", async () => {
     let hangs = 0;
     const hanging = (async () => {
       hangs += 1;
@@ -207,7 +208,7 @@ describe("beforeModel — fail-open", () => {
     expect(Date.now() - started).toBeLessThan(1000);
     const before = hangs;
     await expect(p.hooks.beforeModel(request([u1, assistant("x")], { iteration: 2 }))).resolves.toBeUndefined();
-    expect(hangs).toBe(before);
+    expect(hangs).toBe(before + 1);
   });
 
   it("returns undefined on a malformed request rather than throwing", async () => {
@@ -288,7 +289,7 @@ describe("afterRun — capture floor", () => {
       source: "cline-plugin",
       harness: "cline",
       trigger: "run_end",
-      project: "myproj",
+      automatic: true,
       session_id: "sess-9",
       cwd: "/tmp/work/myproj",
     });
@@ -320,5 +321,40 @@ describe("afterRun — capture floor", () => {
       }) as typeof fetch,
     });
     await expect(down.hooks.afterRun(run(convo(5)))).resolves.toBeUndefined();
+  });
+});
+
+
+describe("persistent policy controls", () => {
+  it("withholds cached context while paused and recalls anew after resume", async () => {
+    const decision = { allowed: true };
+    const calls: Calls = [];
+    const p = make({ ...HIT, "/controls/check": decision }, calls);
+    const prompt = user(PROMPT);
+    expect(await p.hooks.beforeModel(request([prompt]))).toBeDefined();
+    const searches = calls.filter(c => c.url.includes("/search")).length;
+    decision.allowed = false;
+    expect(await p.hooks.beforeModel(request([prompt, assistant("continue")]))).toBeUndefined();
+    expect(calls.filter(c => c.url.includes("/search"))).toHaveLength(searches);
+    decision.allowed = true;
+    expect(await p.hooks.beforeModel(request([prompt]))).toBeDefined();
+    expect(calls.filter(c => c.url.includes("/search"))).toHaveLength(searches + 1);
+  });
+
+  it("does not process or transmit excluded transcript content", async () => {
+    const calls: Calls = [];
+    const p = make({ "/controls/check": { allowed: false } }, calls);
+    const messages = [{ role: "user", get content(): never { throw new Error("excluded content read"); } }];
+    await p.hooks.afterRun({ snapshot: { messages } } as any);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain("/controls/check");
+    expect(calls[0].body).toMatchObject({ action: "capture", automatic: true });
+  });
+
+  it("does not capture without explicit opt-in", async () => {
+    const calls: Calls = [];
+    const p = make({ "/controls/check": { allowed: true } }, calls, { env: {} });
+    await p.hooks.afterRun({ snapshot: { messages: [] } } as any);
+    expect(calls).toHaveLength(0);
   });
 });

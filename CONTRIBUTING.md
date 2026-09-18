@@ -11,11 +11,14 @@ every remembered fact is a line in a git-versioned markdown file that you can re
 epistemic status, typed links to the evidence that backs or contradicts it, and a
 verifiable quote-level citation to its source.
 
-That phrase — *reference implementation* — is doing real work. Palinode is not trying
-to out-scale hosted memory services, and it is not competing for the largest install
-base. It is trying to be the clearest, most correct, most inspectable expression of a
-particular idea about how agent memory should work. **Contributions that make it
-clearer or more correct are worth more here than contributions that make it bigger.**
+The immediate goal is useful project memory for developers returning to the same
+repositories across sessions, agents and worktrees. We aim to grow adoption by
+making it useful to retain decision reasons, preserve corrections, and inspect what
+an agent received. The reference-implementation ambition supports those outcomes.
+
+**Contributions that improve a demonstrated developer workflow, correctness or
+inspectability take priority.** The [roadmap](ROADMAP.md) sequences successful first
+use, correction and recall quality, and project handoffs before broader expansion.
 
 ## Ways to contribute
 

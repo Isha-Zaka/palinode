@@ -39,6 +39,7 @@ from palinode.cli.depends import depends
 from palinode.cli.mcp_smoke import mcp_smoke
 from palinode.cli.worktree import worktree_reconcile
 from palinode.cli.repair_status import repair_status
+from palinode.cli.controls import controls
 
 def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> None:
     if not value or ctx.resilient_parsing:
@@ -126,6 +127,7 @@ main.add_command(mcp_config, name="mcp-config")
 # Maintenance
 main.add_command(worktree_reconcile, name="worktree-reconcile")
 main.add_command(repair_status, name="repair-status")
+main.add_command(controls)
 
 # Embedding tools (Obsidian wiki maintenance helpers)
 main.add_command(dedup_suggest)

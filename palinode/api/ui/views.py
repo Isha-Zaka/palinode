@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from palinode.core.skip_dirs import is_skipped_path
+from palinode.core.scoring import describe_match
 
 # Passed to collect_memory_files(skip_dirs=...): the same non-browsable dirs
 # ``list_api`` skips, on top of the never-memory dirs every surface skips
@@ -133,11 +134,18 @@ def scan_memory_files() -> list[dict[str, Any]]:
     ``category``, ``core`` (bool), ``last_updated``, ``days_old``, ``freshness``.
     """
     from palinode.api.routers.memory import collect_memory_files
+    from palinode.core.config import config
 
     now = datetime.now(timezone.utc)
     rows: list[dict[str, Any]] = []
     for r in collect_memory_files(skip_dirs=_LIST_SKIP_DIRS, include_history=False):
         rel = r["file"]
+        parts = Path(rel).parts
+        if any(
+            Path(config.memory_dir, *parts[:depth]).is_symlink()
+            for depth in range(1, len(parts) + 1)
+        ):
+            continue
         last_updated = r.get("last_updated") or ""
         days_old = _days_since(last_updated, now)
         rows.append(
@@ -153,7 +161,7 @@ def scan_memory_files() -> list[dict[str, Any]]:
                 "freshness": _freshness(days_old),
             }
         )
-    rows.sort(key=lambda r: str(r.get("last_updated") or ""), reverse=True)
+    rows.sort(key=lambda r: (str(r.get("last_updated") or ""), r["path"]), reverse=True)
     return rows
 
 
@@ -192,7 +200,7 @@ def build_memory_list(
 
 def run_search(
     query: str,
-    search_callable: Callable[[str], Iterable[dict[str, Any]]],
+    search_callable: Callable[[str], Iterable[dict[str, Any]] | dict[str, Any]],
     rel_path: Callable[[str], str],
 ) -> dict[str, Any]:
     """Shape search results for the UI.
@@ -208,13 +216,15 @@ def run_search(
     if not q:
         return {"query": "", "results": [], "count": 0, "error": None}
     try:
-        raw = list(search_callable(q))
+        payload = search_callable(q)
+        retrieval = (payload.get("receipt") or {}).get("retrieval") if isinstance(payload, dict) else None
+        raw = payload.get("results", []) if isinstance(payload, dict) else list(payload)
     except Exception as exc:  # noqa: BLE001 — surface as a soft banner, not a 500
         return {
             "query": q,
             "results": [],
             "count": 0,
-            "error": f"search unavailable ({type(exc).__name__}) — is the embedder reachable?",
+            "error": f"search unavailable ({type(exc).__name__}) — check retrieval diagnostics",
         }
     results = []
     for r in raw:
@@ -230,6 +240,7 @@ def run_search(
                 "type": meta.get("type"),
                 "snippet": r.get("snippet") or "",
                 "score": round(float(r.get("score", 0.0)), 3),
+                "match_label": describe_match(r),
                 # Search's `freshness` is index/source agreement (stored hash
                 # vs the file) — a different question from the memory list's
                 # age-based fresh/aging/stale, so it is carried under its own
@@ -240,7 +251,7 @@ def run_search(
                 "currency_reason": r.get("currency_reason"),
             }
         )
-    return {"query": q, "results": results, "count": len(results), "error": None}
+    return {"query": q, "results": results, "count": len(results), "error": None, "retrieval": retrieval}
 
 
 def _memory_files_only(files: list[str]) -> list[str]:
@@ -341,6 +352,9 @@ def build_compaction_view(
 # return key to a display label + the row-rendering shape.
 def build_quality_view(lint: dict[str, Any]) -> dict[str, Any]:
     """Shape ``run_lint_pass`` output into linkable attention queues.
+
+    Discovery callers must supply ``discovery_lint`` output: path-shape
+    filtering here cannot undo hidden files' influence on a full-store graph.
 
     Buckets: stale, orphaned, missing-description, contradictions, and (new)
     missing-extraction-metadata — facts with no captured extraction provenance

@@ -2,19 +2,19 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.phasespace-labs/palinode",
   "title": "Palinode",
-  "description": "Git-versioned markdown memory for AI agents: save, search, compact, lint, and audit.",
+  "description": "Inspectable, correctable project memory in git-versioned Markdown for AI agents.",
   "websiteUrl": "https://github.com/phasespace-labs/palinode",
   "repository": {
     "url": "https://github.com/phasespace-labs/palinode",
     "source": "github"
   },
-  "version": "0.20.1",
+  "version": "0.21.0",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "palinode",
-      "version": "0.20.1",
+      "version": "0.21.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"
@@ -65,7 +65,7 @@
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "palinode",
-      "version": "0.20.1",
+      "version": "0.21.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "streamable-http",
@@ -127,8 +127,8 @@
   "_meta": {
     "io.modelcontextprotocol.registry/publisher-provided": {
       "tool": "mcp-publisher",
-      "release": "v0.20.1",
-      "release_notes_url": "https://github.com/phasespace-labs/palinode/releases/tag/v0.20.1"
+      "release": "v0.21.0",
+      "release_notes_url": "https://github.com/phasespace-labs/palinode/releases/tag/v0.21.0"
     }
   }
 }

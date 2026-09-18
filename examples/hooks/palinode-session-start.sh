@@ -54,6 +54,20 @@ SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 SOURCE=$(echo "$INPUT" | jq -r '.source // "startup"')
 
+# Future automatic recall is controlled before priming or reading the core
+# list. If controls are unavailable, fail closed: an unavailable pause control
+# must not turn into an unannounced injection.
+CONTROL_PAYLOAD=$(jq -n --arg cwd "$CWD" \
+  '{action: "recall", cwd: $cwd, automatic: true}')
+CONTROL=$(curl -sS -f \
+  -X POST "${PALINODE_API}/controls/check" \
+  ${AUTH[@]+"${AUTH[@]}"} \
+  -H "Content-Type: application/json" \
+  -d "$CONTROL_PAYLOAD" \
+  --connect-timeout 2 \
+  --max-time "${HOOK_TIMEOUT}" 2>/dev/null) || exit 0
+[ "$(echo "$CONTROL" | jq -r 'if .allowed == true then "yes" else "no" end' 2>/dev/null)" = "yes" ] || exit 0
+
 # Word-boundary match on a space-padded allowlist so substrings don't
 # false-positive (same pattern as palinode-session-end.sh).
 case " $ALLOWED_SOURCES " in
@@ -117,6 +131,18 @@ ${DIGEST}"
 
 # Bound total size so a pathological store can't flood the context window.
 CONTEXT="${CONTEXT:0:${MAX_CHARS}}"
+
+# Recheck at the output boundary: a pause can be applied while the hook was
+# priming or reading the core list. Do not inject context authorized only by
+# the earlier preflight.
+FINAL_CONTROL=$(curl -sS -f \
+  -X POST "${PALINODE_API}/controls/check" \
+  ${AUTH[@]+"${AUTH[@]}"} \
+  -H "Content-Type: application/json" \
+  -d "$CONTROL_PAYLOAD" \
+  --connect-timeout 2 \
+  --max-time "${HOOK_TIMEOUT}" 2>/dev/null) || exit 0
+[ "$(echo "$FINAL_CONTROL" | jq -r 'if .allowed == true then "yes" else "no" end' 2>/dev/null)" = "yes" ] || exit 0
 
 jq -n --arg ctx "$CONTEXT" \
   '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'

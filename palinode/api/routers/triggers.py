@@ -6,7 +6,9 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from palinode.api._util import _safe_500
-from palinode.core import embedder, expiry, store
+from palinode.api.path_safety import _open_memory_file_text, _resolve_memory_path
+from palinode.core import embedder, expiry, parser, store
+from palinode.core.visibility import is_visible
 
 router = APIRouter()
 
@@ -26,6 +28,24 @@ class TriggerRequest(BaseModel):
 class CheckTriggersRequest(BaseModel):
     query: str
     cooldown_bypass: bool | None = False
+
+
+def _trigger_target_visible(memory_file: str) -> bool:
+    """Require a safe, readable target with live no-chain discovery permission."""
+    candidates = [memory_file]
+    if not memory_file.endswith(".md"):
+        candidates.append(f"{memory_file}.md")
+    for candidate in candidates:
+        try:
+            _, resolved = _resolve_memory_path(candidate)
+            content = _open_memory_file_text(resolved)
+            metadata, _ = parser.parse_frontmatter(content)
+        except FileNotFoundError:
+            continue
+        except (HTTPException, OSError, ValueError):
+            return False
+        return is_visible(None, resolved, metadata=metadata)
+    return False
 
 
 @router.post("/triggers")
@@ -86,7 +106,9 @@ def check_triggers_api(req: CheckTriggersRequest) -> list[dict[str, Any]]:
             query_embedding=emb,
             cooldown_bypass=req.cooldown_bypass or False
         )
-        return results
+        # Matching/cooldown is store-wide; only deliver visible target metadata
+        # to automatic recall. Registry inspection remains a maintenance view.
+        return [row for row in results if _trigger_target_visible(row["memory_file"])]
     except embedder.EmbeddingInputError:
         raise  # typed 422 via the app-level handler in server.py
     except embedder.EmbeddingUnavailable:

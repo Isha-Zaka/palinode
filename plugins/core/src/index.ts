@@ -65,6 +65,8 @@ export interface PalinodeConfig {
   coreMaxChars: number;
   /** Minimum user messages before session capture fires. */
   minMessages: number;
+  /** Explicit opt-in to transcript capture. */
+  captureOn: boolean;
 }
 
 /**
@@ -154,6 +156,7 @@ export function configFromEnv(
     coreMaxFiles: num(env, "PALINODE_HOOK_INJECT_MAX_FILES", profile.coreMaxFiles),
     coreMaxChars: num(env, "PALINODE_HOOK_INJECT_MAX_CHARS", 4000),
     minMessages: num(env, "PALINODE_HOOK_MIN_MESSAGES", 3),
+    captureOn: env.PALINODE_CAPTURE_ENABLED === "1",
   };
   const defined = Object.fromEntries(
     Object.entries(overrides).filter(([, v]) => v !== undefined),
@@ -189,6 +192,18 @@ export async function apiJson(
   } catch {
     return null;
   }
+}
+
+/** Metadata-only preflight; a missing or old controls service denies automation. */
+export async function automaticAllowed(
+  cfg: PalinodeConfig, action: "capture" | "recall", cwd: string,
+  fetchFn: FetchFn = fetch,
+): Promise<boolean> {
+  const result = await apiJson(cfg, fetchFn, "/controls/check", {
+    body: { action, cwd, automatic: true }, timeoutMs: Math.min(cfg.timeoutMs, 250),
+  });
+  return Boolean(result && typeof result === "object" &&
+    (result as { allowed?: unknown }).allowed === true);
 }
 
 interface SearchHit {
@@ -624,6 +639,7 @@ export function buildSessionCapture(
   cfg: PalinodeConfig,
   origin: CaptureOrigin,
 ): SessionCapturePayload | null {
+  if (!cfg.captureOn) return null;
   const users = userEntries(entries);
   if (users.length < cfg.minMessages) return null;
 
@@ -651,7 +667,9 @@ export async function postSessionCapture(
   cfg: PalinodeConfig,
   fetchFn: FetchFn = fetch,
 ): Promise<boolean> {
-  const res = await apiJson(cfg, fetchFn, "/session-end", { body: payload });
+  if (!cfg.captureOn || !payload.cwd || !await automaticAllowed(cfg, "capture", payload.cwd, fetchFn)) return false;
+  const res = await apiJson(cfg, fetchFn, "/session-end", { body: { ...payload, automatic: true,
+    project: undefined } });
   return res !== null;
 }
 

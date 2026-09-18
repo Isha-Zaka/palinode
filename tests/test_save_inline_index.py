@@ -363,7 +363,7 @@ class TestFrontmatterLastUpdatedOnInitialSave:
             res = client.post(
                 "/save",
                 json={
-                    "content": "Frontmatter last_updated sentinel for #177.",
+                    "content": "Frontmatter last_updated sentinel.",
                     "type": "Insight",
                     "slug": "frontmatter-last-updated-177",
                 },
@@ -375,7 +375,7 @@ class TestFrontmatterLastUpdatedOnInitialSave:
         meta = post.metadata
 
         assert "created_at" in meta, "frontmatter missing created_at"
-        assert "last_updated" in meta, "frontmatter missing last_updated (#177)"
+        assert "last_updated" in meta, "frontmatter missing last_updated"
         # On first write both timestamps should be identical (same UTC instant).
         assert str(meta["created_at"]) == str(meta["last_updated"]), (
             f"created_at ({meta['created_at']!r}) != last_updated ({meta['last_updated']!r})"

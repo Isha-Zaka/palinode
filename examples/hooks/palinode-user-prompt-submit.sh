@@ -164,6 +164,22 @@ trim_to_boundary() {
 }
 
 INPUT=$(cat)
+CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+
+# Check controls before extracting the prompt. The hook input necessarily
+# carries the prompt envelope, but no prompt body is parsed, logged, or sent to
+# a recall endpoint until automatic recall is explicitly allowed.
+CONTROL_PAYLOAD=$(jq -n --arg cwd "$CWD" \
+  '{action: "recall", cwd: $cwd, automatic: true}')
+CONTROL=$(curl -sS -f \
+  -X POST "${PALINODE_API}/controls/check" \
+  ${AUTH[@]+"${AUTH[@]}"} \
+  -H "Content-Type: application/json" \
+  -d "$CONTROL_PAYLOAD" \
+  --connect-timeout 1 \
+  --max-time "${HOOK_TIMEOUT}" 2>/dev/null) || exit 0
+[ "$(echo "$CONTROL" | jq -r 'if .allowed == true then "yes" else "no" end' 2>/dev/null)" = "yes" ] || exit 0
+
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty')
 
 # Trivial-prompt gate: "yes", "ok", "continue" carry no recall signal, and
@@ -335,6 +351,17 @@ CONTEXT=$(trim_to_boundary "$CONTEXT" "$MAX_CHARS") || CONTEXT=""
 
 # Nothing survived the trim honestly — say nothing rather than a fragment.
 [ -n "$CONTEXT" ] || exit 0
+
+# Recheck at the output boundary: controls may have changed while recall was
+# resolving. A denied or unavailable control service must suppress injection.
+FINAL_CONTROL=$(curl -sS -f \
+  -X POST "${PALINODE_API}/controls/check" \
+  ${AUTH[@]+"${AUTH[@]}"} \
+  -H "Content-Type: application/json" \
+  -d "$CONTROL_PAYLOAD" \
+  --connect-timeout 1 \
+  --max-time "${HOOK_TIMEOUT}" 2>/dev/null) || exit 0
+[ "$(echo "$FINAL_CONTROL" | jq -r 'if .allowed == true then "yes" else "no" end' 2>/dev/null)" = "yes" ] || exit 0
 
 jq -n --arg ctx "$CONTEXT" \
   '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $ctx}}'

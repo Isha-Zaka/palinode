@@ -88,7 +88,7 @@ def test_unset_budget_renders_exactly_the_unbudgeted_digest(three_outcomes, monk
     text = format_context_digest(digest)
 
     assert text == "\n".join([
-        "## Session context: project/demo",
+        "## Session context: project/demo (explicit; known)",
         "### Core memories",
         "- [insights/unsure.md] Cache maybe cold on deploy — Seen once, never "
         "reproduced [epistemic: open_question]",
@@ -110,7 +110,7 @@ def test_unset_budget_leaves_no_budget_keys_in_the_json(three_outcomes, monkeypa
     _budget(monkeypatch, chars=0, tokens=0)
     digest = build_context_digest(project="demo")
     assert set(digest) == {
-        "project", "core_memories", "recent_decisions",
+        "project", "project_resolved_by", "project_known", "core_memories", "recent_decisions",
         "open_action_items", "recent_snapshots", "_palinode_hint",
     }
 
@@ -149,7 +149,8 @@ def test_a_tight_cap_holds_the_rendered_payload(three_outcomes, monkeypatch):
     assert len(text) <= 420
 
 
-@pytest.mark.parametrize("cap", [380, 420, 480, 540, 600, 700, 900])
+# The smallest cap includes the resolution label plus the conflict stub.
+@pytest.mark.parametrize("cap", [400, 420, 480, 540, 600, 700, 900])
 def test_a_contested_row_is_never_rendered_as_one_settled_side(
     three_outcomes, monkeypatch, cap
 ):
@@ -222,7 +223,7 @@ def test_a_budget_that_fits_nothing_says_so_instead_of_claiming_an_empty_store(
     three_outcomes, monkeypatch
 ):
     text = _rendered_under(monkeypatch, 320)
-    assert text.splitlines()[0] == "## Session context: project/demo"
+    assert text.splitlines()[0] == "## Session context: project/demo (explicit; known)"
     assert "(no memories in scope yet)" not in text
     assert "⚠ 4 memories withheld for budget" in text
     assert "palinode_search" in text  # the memory contract survives

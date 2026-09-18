@@ -19,6 +19,7 @@ from __future__ import annotations
 import importlib
 import os
 import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -248,18 +249,7 @@ def test_history_sibling_not_counted_and_not_flagged(client):
 
 
 def test_private_and_restricted_memories_hidden_from_ui(client):
-    """The UI's memory count, list, and file-sourced Quality bucket must apply
-    the same visibility gate as GET /list — private/restricted memories
-    withheld with no chain, exactly like /list.
-
-    ``description``/``entities`` are populated on the private/restricted rows
-    so lint's own (deliberately ungated — it's a maintenance scan, per
-    ``core.visibility``'s module docstring) stale/orphaned/missing-description
-    buckets don't independently flag them; that isolates the assertion to the
-    file-sourced enumeration this fix actually changes (the memory list, the
-    sidebar/dashboard count, and the "No extraction metadata" queue, which is
-    built directly from that same enumeration).
-    """
+    """Discovery excludes hidden memories even when they trigger lint."""
     _write_file(
         "decisions/open.md",
         "---\ncategory: decisions\ntype: Decision\ndescription: open\n"
@@ -267,13 +257,13 @@ def test_private_and_restricted_memories_hidden_from_ui(client):
     )
     _write_file(
         "decisions/secret.md",
-        "---\ncategory: decisions\ntype: Decision\ndescription: gated\n"
-        "entities:\n  - person/nobody\nvisibility: private\n---\nbody",
+        "---\ncategory: decisions\ntype: Decision\n"
+        "visibility: private\ncore: true\n---\nbody",
     )
     _write_file(
         "decisions/gated.md",
-        "---\ncategory: decisions\ntype: Decision\ndescription: gated\n"
-        "entities:\n  - person/nobody\nvisibility: restricted\n"
+        "---\ncategory: decisions\ntype: Decision\n"
+        "visibility: restricted\ncore: true\n"
         "access:\n  - member/alice\n---\nbody",
     )
 
@@ -298,13 +288,196 @@ def test_private_and_restricted_memories_hidden_from_ui(client):
     # Quality's "No extraction metadata" queue is built straight from the same
     # file enumeration as the list above — must not surface them either.
     qual = client.get("/ui/quality").text
-    no_extraction_section = qual.split("No extraction metadata")[-1]
-    assert "decisions/secret.md" not in no_extraction_section
-    assert "decisions/gated.md" not in no_extraction_section
+    assert "decisions/secret.md" not in qual
+    assert "decisions/gated.md" not in qual
 
     # Cross-check against the real GET /list contract: same set, same gate.
     list_files = {d["file"] for d in client.get("/list").json()}
     assert list_files == {"decisions/open.md"}
+
+
+def _index_fixture(rel: str, content: str) -> None:
+    from palinode.indexer.index_file import index_file
+
+    _write_file(rel, content)
+    with patch("palinode.core.embedder.embed", return_value=_FAKE_VECTOR):
+        result = index_file(str(Path(config.memory_dir) / rel))
+    assert result["error"] is None, result
+
+
+def _commit_fixtures(paths: list[str]) -> None:
+    subprocess.run(["git", "-C", config.memory_dir, "add", "--", *paths], check=True)
+    subprocess.run(
+        ["git", "-C", config.memory_dir, "commit", "-qm", "test: fixture memories"],
+        check=True,
+    )
+
+
+def test_hidden_data_cannot_change_discovery_output(client):
+    """Real files, index and git: hidden additions cannot change discovery HTML."""
+    from palinode.api.ui.discovery import discovery_lint
+    from palinode.api.ui.views import scan_memory_files
+    from palinode.core import store
+    from palinode.core.lint import run_lint_pass
+
+    visible = []
+    for i in range(14):
+        rel = f"decisions/visible-{i:02d}.md"
+        _index_fixture(
+            rel,
+            "---\ncategory: decisions\ntype: Decision\ncore: true\n"
+            "last_updated: '2020-01-01'\n---\n# Visible\n\nVisible fixture body.\n",
+        )
+        visible.append(rel)
+    _write_file(
+        "decisions/dependent.md",
+        "---\ncategory: decisions\nbacked_by: [concealed/source]\n"
+        "stale_backing:\n  - ref: concealed/source\n    op: RETRACT\n"
+        "---\nDependent with an undiscoverable source.\n",
+    )
+    visible.append("decisions/dependent.md")
+    _commit_fixtures(visible)
+
+    routes = ["/ui", "/ui/quality", "/ui/memory", "/ui/memory?core=true", "/list"]
+    before = {url: client.get(url).text for url in routes}
+    lint_before = discovery_lint(scan_memory_files())
+    assert "decisions/visible-00.md" in lint_before["orphaned_files"]
+    assert "concealed/source" not in before["/ui/quality"]
+    assert client.get("/ui").context["total_chunks"] == 14
+    assert len(client.get("/ui").context["recent"]) == 12
+    assert client.get("/ui").context["git_commits_7d"] == 1
+
+    hidden = []
+    for i in range(45):
+        rel = f"concealed/secret-{i:02d}.md"
+        # Leave the index's frontmatter visible; the subsequent disk-only edit
+        # must control every UI result and count without waiting for the watcher.
+        text = (
+            "---\ncategory: concealed\ntype: HiddenType\ncore: true\n"
+            "last_updated: '2020-01-01'\n---\n# Hidden\n\nHidden fixture body.\n"
+        )
+        _index_fixture(rel, text)
+        visibility = "private" if i % 2 else "restricted"
+        _write_file(rel, text.replace("category:", f"visibility: {visibility}\ncategory:", 1))
+        hidden.append(rel)
+    for rel, fields in [
+        ("concealed/reference.md", "entities: [decisions/visible-00]\n"),
+        ("decisions/visible-00-status.md", "category: decisions\n"),
+        ("concealed/duplicate.md", "category: hidden-category\n"),
+        ("concealed/duplicate-status.md", "category: hidden-category\n"),
+        ("concealed/source.md", "status: retracted\nfalsified_by: [concealed/evidence]\n"),
+    ]:
+        _write_file(rel, f"---\nvisibility: private\n{fields}---\nHidden relationship.\n")
+        hidden.append(rel)
+    _commit_fixtures(hidden)
+
+    assert store.get_stats()["total_chunks"] > 14
+    assert discovery_lint(scan_memory_files()) == lint_before
+    for url, html in before.items():
+        response = client.get(url)
+        assert response.status_code == 200
+        assert response.text == html, url
+        assert "concealed" not in response.text
+        assert "HiddenType" not in response.text
+        assert "hidden-category" not in response.text
+
+    maintenance = run_lint_pass()
+    assert "concealed/secret-00.md" in maintenance["missing_descriptions"]
+    assert "decisions/visible-00.md" not in maintenance["orphaned_files"]
+    assert maintenance["contradictions"]
+    assert maintenance["core_count"] == 59
+    # Exact-path reads deliberately retain the deployment-level contract.
+    for url in [
+        "/read?file_path=concealed/secret-00.md",
+        "/ui/memory/concealed/secret-00",
+    ]:
+        response = client.get(url)
+        assert response.status_code == 200
+        assert "Hidden fixture body" in response.text
+
+
+def test_discovery_rechecks_visibility_and_live_metadata(client):
+    rel = "decisions/change.md"
+    _index_fixture(rel, "---\ntype: FormerType\ncore: true\n---\nBody.\n")
+    assert client.get("/ui").context["total_chunks"] == 1
+    _write_file(rel, "---\ntype: CurrentType\nvisibility: private\n---\nBody.\n")
+    for url in ("/ui", "/ui/quality", "/ui/memory"):
+        response = client.get(url)
+        assert rel not in response.text
+        assert response.context["total_chunks"] == 0
+        assert response.context["core_count"] == 0
+        assert response.context["nav_quality_count"] == 0
+    _write_file(rel, "---\ntype: CurrentType\n---\nBody.\n")
+    response = client.get("/ui")
+    assert response.context["total_chunks"] == 1
+    assert "CurrentType" in response.text
+    assert "FormerType" not in response.text
+    (Path(config.memory_dir) / rel).unlink()
+    assert client.get("/ui").context["total_chunks"] == 0
+
+
+def test_selected_lint_empty_and_support_boundary(client):
+    from palinode.core.lint import run_lint_pass
+
+    _write_file("decisions/open.md", "---\nbacked_by: [archive/source]\n---\nBody.")
+    _write_file("archive/source.md", "---\nstatus: archived\n---\nRetired.")
+    assert run_lint_pass()["stale_backing"]
+    selected = run_lint_pass(file_paths={"decisions/open.md"})
+    assert "archived" not in str(selected["stale_backing"])
+    empty = run_lint_pass(file_paths=set())
+    assert empty["total_files"] == 0
+    assert all(value == [] or value == 0 for value in empty.values())
+    assert run_lint_pass(file_paths={"../escape.md", "/etc/passwd"}) == empty
+
+    root = Path(config.memory_dir)
+    (root / "alias.md").symlink_to(root / "decisions/open.md")
+    (root / "alias-dir").symlink_to(root / "decisions", target_is_directory=True)
+    assert run_lint_pass(file_paths={"alias.md", "alias-dir/open.md"}) == empty
+    for url in ("/ui", "/ui/quality", "/ui/memory"):
+        assert "alias" not in client.get(url).text
+
+
+def test_visible_relationship_findings_remain_discoverable(client):
+    from palinode.api.ui.discovery import discovery_lint
+    from palinode.api.ui.views import scan_memory_files
+
+    _write_file("decisions/source.md", "---\nstatus: retracted\n---\nRetired.")
+    _write_file(
+        "decisions/open.md",
+        "---\ncategory: decisions\nbacked_by: [decisions/source]\n---\nBody.",
+    )
+    _write_file("decisions/open-status.md", "---\ncategory: decisions\n---\nBody.")
+    lint = discovery_lint(scan_memory_files())
+    assert lint["contradictions"] == [{
+        "entity": "decisions/open",
+        "issue": "Multiple 'active' files detected for the same entity.",
+    }]
+    assert lint["stale_backing"][0]["file"] == "decisions/open.md"
+    response = client.get("/ui/quality")
+    assert "backed by decisions/source" in response.text
+    assert response.context["contradictions"] == 1
+
+
+def test_ui_discovery_requires_deployment_bearer_and_loopback(client, monkeypatch):
+    from fastapi import FastAPI
+    from palinode.api.ui.router import mount_static, router
+    from palinode.core.auth import BearerAuthMiddleware
+
+    app = FastAPI()
+    app.include_router(router)
+    mount_static(app)
+    app.add_middleware(BearerAuthMiddleware, token="test-inspector-token")
+    with TestClient(app) as authenticated:
+        for url in ("/ui", "/ui/quality", "/ui/memory"):
+            assert authenticated.get(url).status_code == 401
+            assert authenticated.get(url, headers={"Authorization": "Bearer wrong"}).status_code == 401
+            headers = {"Authorization": "Bearer test-inspector-token"}
+            assert authenticated.get(url, headers=headers).status_code == 200
+            monkeypatch.setenv("PALINODE_API_HOST", "0.0.0.0")
+            monkeypatch.setenv("PALINODE_API_BIND_INTENT", "public")
+            monkeypatch.setenv("PALINODE_API_ALLOW_UNAUTH", "1")
+            assert authenticated.get(url, headers=headers).status_code == 403
+            monkeypatch.delenv("PALINODE_API_HOST")
 
 
 def test_nav_links_wired_on_dashboard(client):

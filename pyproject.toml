@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "palinode"
-version = "0.20.1"
-description = "The memory substrate for AI agents and developer tools. Git-versioned, file-native, MCP-first."
+version = "0.21.0"
+description = "Inspectable, correctable project memory in git-versioned Markdown for AI agents."
 authors = [
   {name = "Paul Kyle", email = "paul@phasespace.co"}
 ]

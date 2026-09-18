@@ -619,6 +619,23 @@ def test_no_unregistered_capabilities(surface: Surface) -> None:
     )
 
 
+def test_capture_controls_are_deliberately_api_only_hook_management_contract() -> None:
+    """Controls are operator APIs; hooks preflight them without new MCP tools."""
+    controls = {"GET /controls", "POST /controls", "POST /controls/check"}
+    assert controls <= INVENTORY_INFRA["api"]
+    assert _api_param_names("POST", "/controls") == {
+        "capture_paused", "recall_paused", "excluded_projects", "excluded_paths",
+    }
+    assert _api_param_names("POST", "/controls/check") == {
+        "action", "cwd", "project", "source_path", "automatic",
+    }
+    assert {
+        "controls status", "controls pause", "controls resume",
+        "controls exclude-project", "controls exclude-path",
+    } <= INVENTORY_INFRA["cli"]
+    assert not any("control" in capability for capability in _live_mcp_capabilities())
+
+
 @pytest.mark.parametrize("surface", ["mcp", "api", "cli"])
 def test_inventory_accounting_is_not_stale(surface: Surface) -> None:
     """Infra/backlog entries must reference capabilities that are still live.

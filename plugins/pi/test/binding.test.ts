@@ -23,11 +23,13 @@ function fakePi() {
 const emptyCtx = { sessionManager: undefined };
 
 beforeEach(() => {
+  vi.stubEnv("PALINODE_CAPTURE_ENABLED", "1");
   // Default stub: every Palinode endpoint quietly empty.
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: unknown) => {
       const u = String(url);
+      if (u.includes("/controls/check")) return Response.json({ allowed: true });
       if (u.includes("/search")) return new Response(JSON.stringify({ results: [] }));
       return new Response("[]");
     }),
@@ -36,6 +38,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("registration", () => {
@@ -56,6 +59,7 @@ describe("before_agent_start", () => {
       "fetch",
       vi.fn(async (url: unknown) => {
         const u = String(url);
+      if (u.includes("/controls/check")) return Response.json({ allowed: true });
         if (u.includes("/search"))
           return new Response(
             JSON.stringify({
@@ -113,6 +117,7 @@ describe("session_start", () => {
       "fetch",
       vi.fn(async (url: unknown) => {
         const u = String(url);
+      if (u.includes("/controls/check")) return Response.json({ allowed: true });
         if (u.includes("/list"))
           return new Response(
             JSON.stringify([{ file: "projects/p.md", name: "P", summary: "s" }]),
@@ -148,6 +153,7 @@ describe("session_shutdown", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: unknown, init?: { body?: unknown }) => {
+        if (String(url).includes("/controls/check")) return Response.json({ allowed: true });
         posts.push(String(url) + " " + String(init?.body ?? ""));
         return new Response("{}");
       }),
@@ -173,5 +179,31 @@ describe("session_shutdown", () => {
     expect(
       fetchSpy.mock.calls.filter((c) => String(c[0]).includes("/session-end")),
     ).toHaveLength(0);
+  });
+});
+
+
+describe("capture policy", () => {
+  it("does not read session entries without capture opt-in", async () => {
+    vi.stubEnv("PALINODE_CAPTURE_ENABLED", "0");
+    const { pi, handlers } = fakePi();
+    palinode(pi);
+    const getEntries = vi.fn(() => { throw new Error("must not read transcript"); });
+    await handlers.get("session_shutdown")!({}, { sessionManager: { getEntries } });
+    expect(getEntries).not.toHaveBeenCalled();
+  });
+
+  it("does not read excluded session entries or inject denied recall", async () => {
+    const fetchSpy = vi.fn(async () => Response.json({ allowed: false }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const { pi, handlers, sent } = fakePi();
+    palinode(pi);
+    const getEntries = vi.fn(() => { throw new Error("excluded transcript read"); });
+    await handlers.get("session_shutdown")!({}, { sessionManager: { getEntries } });
+    await handlers.get("session_start")!({}, emptyCtx);
+    expect(await handlers.get("before_agent_start")!({ prompt: "FAKE_SECRET_excluded" }, emptyCtx)).toBeUndefined();
+    expect(getEntries).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(0);
+    expect(JSON.stringify(fetchSpy.mock.calls)).not.toContain("FAKE_SECRET_excluded");
   });
 });

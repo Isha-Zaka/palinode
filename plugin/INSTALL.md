@@ -48,7 +48,7 @@ Both flags are required for full functionality. `allowConversationAccess` alone 
 When the plugin initializes successfully with hooks enabled, you should see a line like:
 
 ```
-openclaw-palinode: registered (api: http://localhost:6340, dir: ~/palinode, autoRecall: true, autoCapture: true)
+openclaw-palinode: registered (api: http://localhost:6340, dir: ~/palinode, autoRecall: true, autoCapture: false)
 ```
 
 If that line appears but you see no subsequent `openclaw-palinode: turn 1 — profile=...` line on the first agent turn, the `before_prompt_build` hook is not firing — check that `allowPromptInjection` is set to `true` in the host config.
@@ -76,8 +76,23 @@ These live under `plugins.entries.openclaw-palinode` alongside the `hooks` block
 | `palinodeApiUrl` | `http://localhost:6340` | Palinode API server URL |
 | `palinodeDir` | `~/palinode` | Path to your Palinode memory directory |
 | `autoRecall` | `true` | Inject core memory + semantic recall before each agent turn |
-| `autoCapture` | `true` | Append session summaries to `daily/` at agent end |
+| `autoCapture` | `false` | Opt in to bounded transcript capture through the API at agent end and reset |
 | `midTurnMode` | `none` | Core-memory injection on turns after the first: `none` (skip), `summary` (one line per core file), `full` (whole files) |
 | `recallProfile` | `coding` | Named recall preset: `coding`, `monitoring`, `investigation`, `writing`, `conversation`, `minimal`, `off` |
 | `recallProfileConfig` | — | Per-field overrides on top of the named preset |
 | `promptsDir` | `specs/prompts` | Path to extraction prompts, relative to `palinodeDir` |
+
+### Capture and pause controls
+
+Transcript capture is off until `autoCapture: true` is explicitly configured.
+Both agent-end and reset capture check the server policy before inspecting the
+last 20 messages, then send at most 2,000 characters through `/session-end`
+for normal store writes and Git provenance. There is no local transcript fallback.
+The hook must provide an absolute workspace directory; unknown scope, unavailable
+controls, or denied policy skips automatic capture and recall.
+
+`palinode controls pause` stops future supported API capture and recall.
+`palinode controls resume` restores them; the plugin still requires its capture
+opt-in. Recall is checked again before returning new context. Already delivered
+client context and a request already executing cannot be recalled by this control.
+The plugin requires the matching controls-capable API version.

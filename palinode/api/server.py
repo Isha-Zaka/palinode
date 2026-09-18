@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -298,6 +299,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Palinode API", lifespan=lifespan)
 
 
+@app.exception_handler(RequestValidationError)
+async def _controls_validation_error(request: Request, exc: RequestValidationError):
+    """Keep invalid controls payloads from reflecting sensitive caller input."""
+    if request.url.path in {"/controls", "/controls/check"}:
+        return JSONResponse(status_code=422, content={"detail": "Invalid controls request"})
+    # Preserve FastAPI's established validation shape for every other route.
+    from fastapi.exception_handlers import request_validation_exception_handler
+
+    return await request_validation_exception_handler(request, exc)
+
+
 @app.exception_handler(EmbeddingUnavailable)
 async def _embedding_unavailable_handler(
     request: Request, exc: EmbeddingUnavailable
@@ -570,6 +582,53 @@ class _BodyTooLargeError(Exception):
 
 app.add_middleware(_BodySizeLimitMiddleware, max_bytes=_MAX_REQUEST_BYTES)
 
+
+class _CapturePauseMiddleware:
+    """Stop paused API capture/recall routes before their request body is read.
+
+    Path and project exclusions remain handler/preflight concerns because they
+    need scoped inputs, but a store-wide pause must also stop explicit MCP/API
+    calls and every alternate read route.  This is intentionally a short,
+    closed list: it is audited beside the router registration rather than a
+    speculative settings platform.
+    """
+
+    _CAPTURE_PATHS = {"/save", "/session-end", "/ingest", "/ingest-url"}
+    _RECALL_PATHS = {
+        "/search", "/search-associative", "/dedup-suggest", "/orphan-repair",
+        "/cluster-neighbors", "/topic-coverage", "/read", "/list", "/resolve",
+        "/context/prime", "/check-triggers", "/entities",
+    }
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        action = "capture" if path in self._CAPTURE_PATHS else (
+            "recall" if path in self._RECALL_PATHS or path.startswith("/entities/") else None
+        )
+        if action is not None:
+            from palinode.core.capture_policy import evaluate_capture_policy
+            decision = evaluate_capture_policy(action, automatic=False)
+            if not decision.allowed:
+                body = json.dumps({"detail": decision.reason}).encode("utf-8")
+                await send({
+                    "type": "http.response.start", "status": 403,
+                    "headers": [(b"content-type", b"application/json")],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+# Added last so a pause is evaluated before body buffering, parsing, logging,
+# embedding, retrieval, or a write-side effect.
+app.add_middleware(_CapturePauseMiddleware)
+
 # Startup log for a non-loopback bind. The hard refusal (non-loopback + no
 # token, no PALINODE_API_ALLOW_UNAUTH=1) already fired in
 # _validate_auth_config above, so reaching here token-less means the
@@ -619,6 +678,7 @@ from palinode.api.enrichment import (  # noqa: E402,F401
 
 # ── Register sub-routers (routes moved from this module) ─────────────────────
 from palinode.api.routers.consolidation import router as _consolidation_router  # noqa: E402
+from palinode.api.routers.controls import router as _controls_router  # noqa: E402
 from palinode.api.routers.context import router as _context_router  # noqa: E402
 from palinode.api.routers.git_history import router as _git_history_router  # noqa: E402
 from palinode.api.routers.health import router as _health_router  # noqa: E402
@@ -630,6 +690,7 @@ from palinode.api.routers.session import router as _session_router  # noqa: E402
 from palinode.api.routers.triggers import router as _triggers_router  # noqa: E402
 app.include_router(_triggers_router)
 app.include_router(_consolidation_router)
+app.include_router(_controls_router)
 app.include_router(_git_history_router)
 app.include_router(_memory_router)
 app.include_router(_search_router)
@@ -670,6 +731,10 @@ from palinode.api.routers.consolidation import (  # noqa: E402,F401
     archive_expired_api, archive_api, split_layers_api, bootstrap_fact_ids_api,
     RestoreRequest, UnretractRequest, ForgetWithdrawRequest,
     restore_api, unretract_api, forget_withdraw_api,
+)
+from palinode.api.routers.controls import (  # noqa: E402,F401
+    ControlsCheckRequest, ControlsUpdateRequest, controls_check_api,
+    controls_status_api, controls_update_api,
 )
 from palinode.api.routers.git_history import (  # noqa: E402,F401
     history_api, diff_api, blame_api, rollback_api,

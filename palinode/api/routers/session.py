@@ -26,7 +26,8 @@ from palinode.core.parity import PROMPT_TASKS
 from palinode.core.relative_dates import normalize_lines, normalize_text
 from palinode.prompts import store_prompts_dir
 
-from palinode.api._util import _project_from_cwd, _utc_now
+from palinode.api._util import _utc_now
+from palinode.core.context_prime import resolve_context
 from palinode.api.path_safety import _memory_base_dir
 from palinode.api.memory_write import _resolve_source
 from palinode.api.search_helpers import _check_session_end_dedup
@@ -208,11 +209,38 @@ class SessionEndRequest(BaseModel):
     # do it. Two separate investigations left junk entries behind for exactly
     # this reason.
     dry_run: bool = False
+    # Automatic hook captures are controlled by the persistent policy.  An
+    # omitted field keeps the longstanding explicit API/MCP call contract.
+    automatic: bool = False
+    # Transcript/final-event source considered by automatic capture policy.
+    # It is not persisted as session content.
+    source_path: str | None = None
+
+
+_LEGACY_AUTOMATIC_SOURCES = frozenset({
+    "claude-code-hook", "pi-extension", "cline-plugin", "openclaw-plugin",
+})
 
 
 @router.post("/session-end")
 def session_end_api(req: SessionEndRequest, request: Request = None) -> dict[str, Any]:
     """Capture session outcomes to daily notes and project status files."""
+    from palinode.core.capture_policy import evaluate_capture_policy
+
+    source = _resolve_source(req.source, request)
+    automatic = req.automatic or req.trigger in {
+        "session-end-hook", "clear-fallback-hook", "sigterm", "exit",
+    } or source.strip().lower() in _LEGACY_AUTOMATIC_SOURCES
+    decision = evaluate_capture_policy(
+        "capture",
+        automatic=automatic,
+        cwd=req.cwd,
+        project=req.project,
+        source_path=req.source_path,
+    )
+    if not decision.allowed:
+        # Do not log or echo summary/decision body on this deny path.
+        raise HTTPException(status_code=403, detail=decision.reason)
     # Fail loud BEFORE any write: an envelope stored as memory is silent
     # corruption in a system whose whole claim is audit-grade recall. Safe to
     # 400 even though session-end is the last call of a session — the SessionEnd
@@ -247,10 +275,11 @@ def session_end_api(req: SessionEndRequest, request: Request = None) -> dict[str
             )
 
     # ADR-010: same precedence as save_api — explicit > header > env > default.
-    source = _resolve_source(req.source, request)
-
     # Auto-derive project from cwd if caller didn't pass one.
-    project = req.project or _project_from_cwd(req.cwd)
+    resolution = resolve_context(cwd=req.cwd, project=req.project)
+    project = resolution.project.removeprefix("project/") if resolution.project else None
+    if project and (".." in project or not re.fullmatch(r"[A-Za-z0-9._-]+", project)):
+        raise HTTPException(status_code=400, detail="Project must be a slug or project/<slug> ref")
 
     # Build session entry
     parts = [f"## Session End — {now_iso}\n"]

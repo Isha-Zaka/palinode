@@ -1,7 +1,7 @@
 import json as _json
 
 import click
-from palinode.cli._api import api_client
+from palinode.cli._api import HTTPStatusError, api_client
 from palinode.cli._format import console, print_result, get_default_format, OutputFormat
 from palinode.core.parity import MEMORY_TYPES
 
@@ -338,7 +338,10 @@ def save(
             # plainly instead of leaving the user thinking the save half-failed:
             # the memory is safe and keyword-searchable now; the watcher re-embeds
             # for semantic recall once the embedder is back.
-            if "embedded" in result and not result.get("embedded"):
+            if result.get("retrieval_mode") == "lexical":
+                state = "ready" if result.get("indexed") else "not indexed"
+                console.print(f"[dim]  lexical retrieval: {state}[/dim]")
+            elif "embedded" in result and not result.get("embedded"):
                 console.print(
                     "[yellow]  embedding deferred[/yellow] — saved and keyword-searchable now; "
                     "semantic recall follows once the embedder is reachable "
@@ -354,6 +357,28 @@ def save(
                     f"applied={applied}, llm={ms}ms"
                 )
 
+    except HTTPStatusError as e:
+        try:
+            detail = e.response.json()
+        except ValueError:
+            detail = None
+        if (
+            e.response.status_code == 403
+            and isinstance(detail, dict)
+            and detail.get("detail") == "capture_paused"
+        ):
+            console.print(
+                "[red]Error saving memory: capture_paused — capture is paused.[/red]"
+            )
+            console.print(
+                "Check `palinode controls status`. To enable capture, run:\n"
+                "`palinode controls resume --capture --no-recall`."
+            )
+        else:
+            console.print(
+                f"[red]Error saving memory: API returned {e.response.status_code}.[/red]"
+            )
+        raise click.Abort() from e
     except Exception as e:
         console.print(f"[red]Error saving memory: {str(e)}[/red]")
         raise click.Abort()

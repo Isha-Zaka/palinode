@@ -364,3 +364,12 @@ def test_cli_prime_renders_digest():
     assert result.exit_code == 0, result.output
     assert "Session context: project/p" in result.output
     assert "insights/x.md" in result.output
+
+
+def test_session_hint_honors_conditional_capture():
+    from palinode.core.context_prime import PALINODE_HINT
+
+    assert "requested wrap-ups or new durable information" in PALINODE_HINT
+    assert "Skip recall-only writes" in PALINODE_HINT
+    assert "honor no-save requests" in PALINODE_HINT
+    assert "before the session ends" not in PALINODE_HINT

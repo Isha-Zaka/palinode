@@ -88,3 +88,18 @@ it by relative path: `import { ... } from "../../core/src/index.js"`.
 npm install
 npm test        # vitest — pure functions over an injected fetch
 ```
+
+### Capture controls
+
+Transcript capture is off by default. Set `PALINODE_CAPTURE_ENABLED=1` (or
+`captureOn: true` in a binding that accepts config overrides) to opt in.
+Automatic capture and recall require a successful metadata-only policy check
+against the matching controls-capable API. A paused, excluded, unavailable, or
+malformed policy produces no new capture or injection. Cline also checks before
+replaying cached recall into a later request. Already delivered client context
+and queued Pi messages cannot be withdrawn by this control.
+
+Use `palinode controls status`, `palinode controls pause`, and
+`palinode controls resume` to inspect and change the store policy. Capture
+remains bounded to the configured message floor and the first/latest user
+prompt excerpts; explicit tools remain subject to the API's store-level pause.

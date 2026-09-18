@@ -19,7 +19,7 @@ assert SESSION_END_TIMEOUT_SECONDS == _SESSION_END_TIMEOUT_SENTINEL or os.enviro
 ), (
     f"SESSION_END_TIMEOUT_SECONDS ({SESSION_END_TIMEOUT_SECONDS}) differs from sentinel "
     f"({_SESSION_END_TIMEOUT_SENTINEL}) without PALINODE_SESSION_END_TIMEOUT override — "
-    "update cli/_api.py or defaults.py to stay in sync"
+    "update cli/_api.py or defaults.py to keep their timeout defaults in sync"
 )
 
 # Re-exported for CLI commands that need to catch API errors without
@@ -220,6 +220,40 @@ class PalinodeAPI:
 
     def get_status(self) -> dict[str, Any]:
         response = self.client.get("/status")
+        response.raise_for_status()
+        return response.json()
+
+    def get_controls(self) -> dict[str, Any]:
+        """Return the server-owned capture and recall control state."""
+        response = self.client.get("/controls")
+        response.raise_for_status()
+        return response.json()
+
+    def set_controls(self, **changes: Any) -> dict[str, Any]:
+        """Update server-owned controls without maintaining a CLI-side copy."""
+        payload = {key: value for key, value in changes.items() if value is not None}
+        response = self.client.post("/controls", json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    def check_controls(
+        self,
+        action: str,
+        *,
+        cwd: str | None = None,
+        project: str | None = None,
+        source_path: str | None = None,
+        automatic: bool = True,
+    ) -> dict[str, Any]:
+        """Preflight a control decision without sending capture content."""
+        payload: dict[str, Any] = {"action": action, "automatic": automatic}
+        if cwd is not None:
+            payload["cwd"] = cwd
+        if project is not None:
+            payload["project"] = project
+        if source_path is not None:
+            payload["source_path"] = source_path
+        response = self.client.post("/controls/check", json=payload)
         response.raise_for_status()
         return response.json()
 

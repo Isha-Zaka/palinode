@@ -4,8 +4,8 @@ Mounted on the existing app under ``/ui`` — no new service, no build step.
 Server-rendered HTML via Jinja2; CSS shipped in-package. The router is a pure
 client of existing capabilities:
 
-  - ``store.get_stats`` + ``lint.run_lint_pass``  → dashboard health summary
-  - ``store.list_recent``                          → dashboard recent list
+  - visible files + selected lint / chunk counts → dashboard health summary
+  - visible indexed files                         → dashboard recent list
   - ``list_api`` (file scan) + ``search_api``      → memory list + search (P1)
   - ``git_tools.recent_commits`` + ``diff``        → diffs / compaction (P1)
   - ``_resolve_memory_path`` + ``parser``          → fact body + frontmatter
@@ -38,12 +38,12 @@ from palinode.core.parser import parse_markdown, split_frontmatter
 from palinode.api.path_safety import _resolve_memory_path
 from palinode.api.ui.provenance import build_provenance
 from palinode.api.ui.render import render_markdown
+from palinode.api.ui.discovery import discovery_lint, indexed_discovery, visible_commit_count
 from palinode.api.ui.views import (
     build_compaction_view,
     build_diffs_view,
     build_memory_list,
     build_quality_view,
-    is_browsable_memory,
     run_search,
     scan_memory_files,
 )
@@ -103,12 +103,11 @@ def _loopback_guard() -> None:
     Reuses the API's bind-intent signal: the host comes from
     ``PALINODE_API_HOST`` (falling back to ``config.services.api.host``), the
     same resolution ``server.py`` uses for its startup bind gate. Unlike the
-    API (which serves a non-loopback bind with a token, or token-less under
-    ``PALINODE_API_ALLOW_UNAUTH=1``), the UI *hard-refuses* on a public bind —
-    it is an unauthenticated, read-everything audit surface and must never be
-    network-exposed in P0. Neither ``PALINODE_API_BIND_INTENT=public`` nor
-    ``PALINODE_API_ALLOW_UNAUTH=1`` lifts this refusal; the UI has no auth, so
-    there is no safe public path yet.
+    API, the UI hard-refuses a non-loopback bind even with a configured token.
+    The app's bearer middleware also protects UI requests when enabled; this
+    extra bind restriction is independent of deployment authentication.
+    Neither ``PALINODE_API_BIND_INTENT=public`` nor
+    ``PALINODE_API_ALLOW_UNAUTH=1`` lifts it.
     """
     host = os.environ.get("PALINODE_API_HOST", config.services.api.host)
     if not _host_is_loopback(host):
@@ -122,68 +121,30 @@ def _loopback_guard() -> None:
 
 
 # ── Shared template context ──────────────────────────────────────────────────
-def _browsable_lint_files(lint: dict[str, Any], key: str) -> int:
-    """Count a lint file-bucket restricted to browsable memories.
-
-    The lint pass counts ``-history.md`` siblings (and may include skip-dir
-    files); the UI's badges and Quality queues must not. Filtering through the
-    same ``is_browsable_memory`` predicate the memory list/count use keeps every
-    surface in agreement.
-    """
-    out = 0
-    for it in lint.get(key, []):
-        path = it.get("file") if isinstance(it, dict) else str(it)
-        if path and is_browsable_memory(path):
-            out += 1
-    return out
-
-
 def _page_context() -> dict[str, Any]:
-    """Build the context every page needs: shell + health counts.
-
-    ``total_memories`` is the count of *browsable* memory files on disk — the
-    same ``scan_memory_files`` / ``is_browsable_memory`` definition the memory
-    list uses — so the sidebar badge, the dashboard MEMORIES card, and the list
-    can never disagree (the bug where the badge showed 3 vs the list's 2 because
-    lint counted a ``-history.md`` sibling). The lint-derived health counts are
-    likewise restricted to browsable memories. ``total_chunks`` stays the
-    indexed-DB metric; ``unindexed`` is True when files exist on disk but no
-    chunks are indexed yet (fresh store / watcher not running).
-    """
-    from palinode.core.lint import run_lint_pass
-
-    lint = run_lint_pass()
-    total_memories = len(scan_memory_files())
-
-    try:
-        total_chunks = store.get_stats().get("total_chunks", 0)
-    except Exception:
-        total_chunks = 0
-
-    # Health counts filtered to browsable memories so the header + sidebar badge
-    # match the Quality view (which applies the same filter).
-    stale_count = _browsable_lint_files(lint, "stale_files")
-    orphaned_count = _browsable_lint_files(lint, "orphaned_files")
-    missing_descriptions = _browsable_lint_files(lint, "missing_descriptions")
-    contradictions = len(lint.get("contradictions", []))  # entity-keyed, not file
-    stale_backing = _browsable_lint_files(lint, "stale_backing")
+    """Build one visible discovery snapshot for the shell and page contents."""
+    memories = scan_memory_files()
+    lint = discovery_lint(memories)
+    quality = build_quality_view(lint)
+    counts = {q["key"]: len(q["rows"]) for q in quality["queues"]}
+    total_chunks, recent = indexed_discovery(memories)
+    total_memories = len(memories)
 
     return {
+        "memory_rows": memories,
+        "quality": quality,
+        "recent": recent,
         "total_memories": total_memories,
         "total_chunks": total_chunks,
         "unindexed": total_memories > 0 and total_chunks == 0,
         "palinode_dir": config.memory_dir,
         "api_port": config.services.api.port,
-        "stale_count": stale_count,
-        "orphaned_count": orphaned_count,
-        "missing_descriptions": missing_descriptions,
-        "contradictions": contradictions,
-        "core_count": lint.get("core_count", 0),
-        # Sidebar "Quality" badge: total actionable lint findings (excludes the
-        # all-facts missing-extraction-metadata bucket so the badge reflects
-        # real problems, not the universal not-yet-captured placeholder).
-        "nav_quality_count": stale_count + orphaned_count
-        + missing_descriptions + contradictions + stale_backing,
+        "stale_count": counts["stale"],
+        "orphaned_count": counts["orphaned"],
+        "missing_descriptions": counts["missing_description"],
+        "contradictions": counts["contradictions"],
+        "core_count": sum(bool(r["core"]) for r in memories),
+        "nav_quality_count": quality["total"] - counts["no_extraction_meta"],
     }
 
 
@@ -224,25 +185,7 @@ def ui_dashboard(request: Request) -> HTMLResponse:
     _loopback_guard()
     ctx = _page_context()
 
-    git_stats = git_tools.commit_count(7)
-    ctx["git_commits_7d"] = git_stats.get("total_commits", 0)
-
-    recent: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    try:
-        # list_recent returns one row per chunk; dedup to one entry per file.
-        for row in store.list_recent(limit=40):
-            rel = _rel_path(row.get("file_path", ""))
-            if not rel or rel in seen:
-                continue
-            seen.add(rel)
-            meta = row.get("metadata") or {}
-            recent.append({"path": rel, "type": meta.get("type")})
-            if len(recent) >= 12:
-                break
-    except Exception:
-        recent = []
-    ctx["recent"] = recent
+    ctx["git_commits_7d"] = visible_commit_count(ctx["memory_rows"])
 
     ctx["active"] = "dashboard"
     return templates.TemplateResponse(request, "dashboard.html", ctx)
@@ -268,7 +211,7 @@ def ui_memory_list(
     ctx["active"] = "memory"
 
     rows = build_memory_list(
-        scan_memory_files(),
+        ctx["memory_rows"],
         type_filter=type or None,
         core_only=bool(core),
         freshness=freshness or None,
@@ -330,21 +273,8 @@ def ui_quality(request: Request) -> HTMLResponse:
     missing-description, contradictions, and missing-extraction-metadata —
     each linking to its fact."""
     _loopback_guard()
-    from palinode.core.lint import run_lint_pass
-
-    lint = run_lint_pass()
-    # Augment with the new missing-extraction-metadata bucket: every browsable
-    # memory fact, since extraction provenance (G2) is not captured yet. Scanned
-    # the same way the file-based counts are, so it stays coherent.
-    lint = dict(lint)
-    lint["no_extraction_meta"] = [
-        {"file": r["path"]}
-        for r in scan_memory_files()
-    ]
-
     ctx = _page_context()
     ctx["active"] = "quality"
-    ctx["quality"] = build_quality_view(lint)
     return templates.TemplateResponse(request, "quality.html", ctx)
 
 
@@ -402,7 +332,7 @@ def ui_memory(request: Request, file_path: str) -> HTMLResponse:
         metadata.get("title")
         or metadata.get("name")
         or _first_heading(body)
-        or slug
+        or _filename_title(rel)
     )
     kicker = " · ".join(
         p for p in [mem_type, "core memory" if metadata.get("core") else "memory"] if p
@@ -436,17 +366,48 @@ def ui_memory(request: Request, file_path: str) -> HTMLResponse:
 
 @router.get("/history/{file_path:path}", response_class=HTMLResponse, name="ui_history")
 def ui_history(request: Request, file_path: str) -> HTMLResponse:
-    """Minimal commit-history view (target of the Saved-commit link).
+    """Read-only Git timeline for one memory (target of the Saved link)."""
+    _loopback_guard()
 
-    Kept intentionally thin in P0 — it routes back to the fact view; the rich
-    diff/timeline view is Phase 1. Redirect-style: render the fact page so the
-    Saved link is not a dead end.
-    """
-    return ui_memory(request, file_path)
+    # Keep the detail route's convenience suffix and its traversal/symlink
+    # boundary before passing a user-supplied path to Git.
+    candidates = [file_path]
+    if not file_path.endswith(".md"):
+        candidates.append(f"{file_path}.md")
+    rel = ""
+    for candidate in candidates:
+        _, resolved_candidate = _resolve_memory_path(candidate)
+        if os.path.isfile(resolved_candidate):
+            rel = candidate
+            break
+    if not rel:
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+    history_unavailable = False
+    try:
+        history = git_tools.history(rel, 20, detail="summary") or []
+    except Exception:
+        # A Git failure is materially different from a file that was never
+        # committed. Keep the page read-only, but make that uncertainty clear.
+        history = []
+        history_unavailable = True
+
+    ctx = _page_context()
+    ctx.update(
+        {
+            "active": "memory",
+            "file_path": rel,
+            "filename": _filename_title(rel),
+            "history": history,
+            "history_unavailable": history_unavailable,
+            "history_limit": 20,
+        }
+    )
+    return templates.TemplateResponse(request, "history.html", ctx)
 
 
 # ── Capability adapters for the P1 views ────────────────────────────────────
-def _search_memory(query: str) -> list[dict[str, Any]]:
+def _search_memory(query: str) -> dict[str, Any]:
     """Run the existing search capability in-process and return result rows.
 
     Calls ``search_api`` (the same handler the JSON ``/search`` endpoint uses)
@@ -456,8 +417,8 @@ def _search_memory(query: str) -> list[dict[str, Any]]:
     """
     from palinode.api.routers.search import SearchRequest, search_api
 
-    req = SearchRequest(query=query, limit=25)
-    return list(search_api(req, request=None) or [])
+    req = SearchRequest(query=query, limit=25, receipt=True)
+    return search_api(req, request=None)
 
 
 def _history_files() -> list[str]:
@@ -506,8 +467,23 @@ def _strip_frontmatter(content: str) -> str:
 
 
 def _first_heading(body: str) -> str | None:
-    for line in body.splitlines():
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
         s = line.strip()
         if s.startswith("#"):
-            return s.lstrip("#").strip() or None
+            heading = s.lstrip("#").strip()
+            if not heading:
+                continue
+            # The save pipeline appends this generated footer. It is a useful
+            # navigational section, never the memory's user-authored title.
+            following = next((item.strip() for item in lines[index + 1:] if item.strip()), "")
+            if heading.casefold() == "see also" and following == "<!-- palinode-auto-footer -->":
+                continue
+            return heading
     return None
+
+
+def _filename_title(rel: str) -> str:
+    """Turn a heading-less filename into a readable, stable page title."""
+    stem = Path(rel).stem.replace("-", " ").replace("_", " ").strip()
+    return stem or rel

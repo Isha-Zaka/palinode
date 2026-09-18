@@ -341,9 +341,12 @@ is a marketing page.
 - **As-of and claim-validity questions are not answered at all**, and are not
   claimed to be. The family is recorded with a deferred disposition and scored by
   nothing. **Deferred**, along with the actionability axis and the queryable
-  injection ledger — all three were rescheduled to v0.22.0 on 2026-09-13, since
-  each adds a schema axis or table with its own migration decision and they are
-  better decided as one story.
+  injection ledger. All three are held together as one coordinated design and
+  migration decision, since each adds a schema axis or table, and implementation
+  is gated on demonstrated need rather than scheduled — the release milestones
+  are the current word on where that sits. This page deliberately names no
+  version for them: it has been rewritten twice in two days as the roadmap
+  moved, and a stale version number here is worse than no number.
 - **No statement is made about semantic paraphrase recall.** The seed stage ran
   on a lexical stand-in embedder.
 

@@ -1,6 +1,6 @@
 ---
 name: palinode-session
-description: "Automatically manage persistent memory during coding sessions via Palinode MCP. Fires when: starting a new task, completing a milestone, making a decision, finishing a session, or when 30+ minutes have passed since last save. Also fires on 'save to memory', 'remember this', 'what do we know about'. Do NOT fire on trivial file edits or routine commands."
+description: "Guide intentional persistent-memory capture during coding sessions via Palinode MCP. Recall at session start; save durable milestones, explicit wrap-ups, and user-requested memories. Do NOT write for recall-only/no-new-information sessions or after an explicit no-save request."
 ---
 
 # Palinode Session Memory
@@ -43,7 +43,10 @@ palinode_save(
 
 ## Every ~30 Minutes
 
-If actively working and 30+ minutes since last palinode_save, save a brief progress note:
+If actively working and new durable progress has accumulated, consider a brief
+progress note after roughly 30 minutes. Do not turn this into a timer-based
+write for a recall-only/no-new-information session, and honor an explicit
+request not to save:
 
 ```
 palinode_save(
@@ -54,7 +57,8 @@ palinode_save(
 
 ## On Session End
 
-Before the user exits, capture the session:
+At a user-requested wrap-up, or when the session produced new durable
+information, capture the session:
 
 ```
 palinode_session_end(
@@ -64,6 +68,15 @@ palinode_session_end(
   project="[project-slug]"
 )
 ```
+
+Do not create a recap for a recall-only or no-new-information session, and
+honor an explicit request not to save. `palinode_save` and
+`palinode_session_end` are intentional, content-bearing MCP writes; they are
+separate from opt-in client hooks and background auto-summary enrichment.
+`palinode init --no-hook` leaves automatic hooks off, but this skill can still
+guide an agent to make an intentional explicit tool call. When the user invokes
+`/wrap`, preserve that explicit requested session-end write unless the user
+separately says not to save.
 
 ## Tool Reference
 

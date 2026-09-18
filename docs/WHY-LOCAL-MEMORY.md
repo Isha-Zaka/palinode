@@ -1,47 +1,34 @@
-# Why Local Memory Matters
+# Why Local Project Memory Matters
 
-AI coding agents are getting powerful automation features — scheduled tasks, looping prompts, MCP integrations, custom skills, computer control. But they all share one limitation: **sessions are stateless by default.**
+Repeated repository work has a simple failure mode: a new session or a different
+coding agent lacks the reason a previous approach was accepted or rejected.
+Palinode gives that project context a local, inspectable home.
 
-Every `/clear`, every context compaction, every new session starts from zero. The agent forgets what it did, what it decided, and why.
+For example, a team can record why it chose SQLite, later record a change to
+PostgreSQL, and inspect both records before asking an agent to continue the work.
+The later decision does not erase the earlier rationale; it gives people something
+specific to review and correct.
 
-Cloud vendors will ship memory. It will live on their servers, be opaque, and be locked to their platform. That's convenient — and it's not enough.
+## Files, history, and local ownership
 
-## What Palinode does differently
+Palinode stores memory as Markdown with YAML frontmatter. Git records writes and
+later changes, while the search index is derived from the files. This makes the
+records readable with ordinary local tools and lets a project keep its own storage
+and backup choices.
 
-**Files are the source of truth. The LLM is a compiler.**
+Local ownership is not a security guarantee by itself. Visibility labels do not
+provide encryption or per-user authentication; protect the store, backups, and API
+credentials, or use separate instances and filesystem permissions where stronger
+separation is needed. See the [privacy contract](PRIVACY.md).
 
-| Property | Cloud memory | Palinode |
-|----------|-------------|---------|
-| Storage | Vendor servers | Your machine, your git repo |
-| Format | Opaque database | Markdown + YAML frontmatter |
-| Auditability | None | `git blame` on every fact |
-| Portability | Locked to one platform | Works across any MCP client |
-| Ownership | Vendor controls retention | You control everything |
-| Offline access | No | `cat` and `grep` always work |
-| Consolidation | Black box | Deterministic executor with reviewable ops |
+## How a session uses it
 
-## The case for transparency
+An agent can explicitly save a decision, search for it in a later session, and
+inspect its source and history. Configured integrations may automate selected
+capture or recall steps, but their behavior depends on the client and its setup.
+The [Quickstart](QUICKSTART.md) documents the supported first-use path and its
+controls; it is the source for what is automatic in a particular setup.
 
-When an agent remembers something, you should be able to:
-
-1. **Read it** — in a text editor, not a dashboard
-2. **Trace it** — `git blame` shows which session recorded each fact
-3. **Edit it** — fix mistakes with your editor, not a support ticket
-4. **Move it** — switch from Claude to Cursor to Codex without losing memory
-5. **Version it** — roll back bad consolidation with `git revert`
-6. **Own it** — no vendor lock-in, no data on someone else's server
-
-## Cross-session communication
-
-Palinode turns stateless sessions into a stateful workflow:
-
-- **Session A** saves a decision with rationale → Palinode memory
-- **Session B** searches for context → finds the decision, understands why
-- **Consolidation** merges overlapping memories → keeps signal high
-- **Git** tracks every change → full audit trail
-
-This works across Claude Code, Cursor, Zed, Codex, or any MCP-compatible client. Your memory moves with you.
-
-## When cloud memory is fine
-
-If you use one AI platform, don't need audit trails, and trust the vendor with your data — cloud memory works. Palinode is for people who want to own their agent's knowledge, version it, and take it with them.
+Consolidation proposes structured changes that Palinode validates and applies.
+Review the resulting Git changes before treating them as a correction, and use the
+record history to understand what changed.

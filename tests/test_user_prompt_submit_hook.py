@@ -85,6 +85,11 @@ def _run_hook(tmp_path: Path, *, prompt: str = _PROMPT, env: dict | None = None,
         'echo "$@" >> "$STUB_DIR/curl-called"\n'
         '[ "${CURL_FAIL:-0}" = "1" ] && exit 22\n'
         'case "$*" in\n'
+        '  *"/controls/check"*) control_count_file="$STUB_DIR/control-count"; '
+        'control_count=$(cat "$control_count_file" 2>/dev/null || echo 0); '
+        'control_count=$((control_count + 1)); echo "$control_count" > "$control_count_file"; '
+        'if [ "${CONTROL_DENY:-0}" = "1" ] || [ "${CONTROL_DENY_ON_CHECK:-0}" -eq "$control_count" ]; '
+        'then echo \'{"allowed":false}\'; else echo \'{"allowed":true}\'; fi ;;\n'
         '  *check-triggers*) cat "$STUB_DIR/resp-triggers.json" ;;\n'
         '  */resolve*) [ "${RESOLVE_FAIL:-0}" = "1" ] && exit 28; '
         'cat "$STUB_DIR/resp-resolve.json" ;;\n'
@@ -441,14 +446,41 @@ def test_short_prompt_skipped_before_any_network(tmp_path):
     proc, curl_called = _run_hook(tmp_path, prompt="ok")
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == ""
-    assert not curl_called.exists(), "curl fired for a trivial prompt"
+    calls = curl_called.read_text()
+    assert "/controls/check" in calls
+    assert "/resolve" not in calls and "/search" not in calls
+
+
+def test_recall_denial_does_not_send_prompt_to_recall_endpoints(tmp_path):
+    secret = "sk-ant-HARMLESS-HARBOR-NOTES-NEGATIVE-FIXTURE"
+    proc, curl_called = _run_hook(
+        tmp_path, prompt=secret, env={"CONTROL_DENY": "1"})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    calls = curl_called.read_text()
+    assert "/controls/check" in calls
+    assert secret not in calls
+    assert "/check-triggers" not in calls and "/resolve" not in calls and "/search" not in calls
+
+
+def test_late_recall_denial_suppresses_additional_context(tmp_path):
+    """A pause during resolution must prevent the final context injection."""
+    proc, curl_called = _run_hook(
+        tmp_path, search_response=_SEARCH_HITS, env={"CONTROL_DENY_ON_CHECK": "2"})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    calls = curl_called.read_text()
+    assert calls.count("/controls/check") == 2
+    assert "/resolve" in calls or "/search" in calls
 
 
 def test_dryrun_prints_plan_and_touches_nothing(tmp_path):
     proc, curl_called = _run_hook(tmp_path, env={"PALINODE_HOOK_DRYRUN": "1"})
     assert proc.returncode == 0, proc.stderr
     assert "DRYRUN" in proc.stdout
-    assert not curl_called.exists()
+    calls = curl_called.read_text()
+    assert "/controls/check" in calls
+    assert "/resolve" not in calls and "/search" not in calls
 
 
 # ---- Channel switches ---------------------------------------------------
@@ -513,7 +545,7 @@ def test_no_auth_header_by_default(tmp_path):
 
 def test_init_writes_and_registers_the_recall_hook(tmp_path):
     runner = CliRunner()
-    result = runner.invoke(main, ["init", "--dir", str(tmp_path)])
+    result = runner.invoke(main, ["init", "--dir", str(tmp_path), "--hook"])
     assert result.exit_code == 0, result.output
 
     script = tmp_path / ".claude" / "hooks" / "palinode-user-prompt-submit.sh"
@@ -564,7 +596,7 @@ def test_settings_timeout_matches_canonical_example():
 def test_init_rerun_registers_recall_hook_exactly_once(tmp_path):
     runner = CliRunner()
     for _ in range(2):
-        result = runner.invoke(main, ["init", "--dir", str(tmp_path), "--force"])
+        result = runner.invoke(main, ["init", "--dir", str(tmp_path), "--force", "--hook"])
         assert result.exit_code == 0, result.output
 
     settings = json.loads((tmp_path / ".claude" / "settings.json").read_text())

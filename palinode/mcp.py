@@ -53,6 +53,7 @@ from palinode.core.defaults import (
     SESSION_END_TIMEOUT_SECONDS as _SESSION_END_TIMEOUT,
     _SESSION_END_TIMEOUT_SENTINEL as _SENTINEL,
 )
+from palinode.core.disclosure import PAUSED_READ_AVAILABILITY, PAUSE_SCOPE
 from palinode.core.parity import (
     CATEGORIES,
     MEMORY_TYPES,
@@ -95,7 +96,12 @@ _INSTRUCTIONS_SEARCH_SENTENCE = (
 _INSTRUCTIONS_CLOSING = (
     "Call palinode_search before answering questions about prior decisions or "
     "project state. Save decisions and insights with palinode_save (include "
-    "the rationale). Call palinode_session_end before the session ends."
+    "the rationale). Explicit palinode_save and palinode_session_end calls are "
+    "content-bearing writes, separate from opt-in client hooks and background "
+    "auto-summary enrichment. At a user-requested wrap-up, or when new durable "
+    "information warrants it, call palinode_session_end. Do not create a recap "
+    "for a recall-only/no-new-information session, and honor an explicit request "
+    "not to save."
 )
 #: What a client that can actually collect on the digest is told.
 _SERVER_INSTRUCTIONS = (
@@ -163,7 +169,7 @@ async def _on_call_tool(ctx: Any, params: Any) -> types.CallToolResult:
 # ``tests/test_mcp_server_metadata.py`` pins the two together.
 SERVER_TITLE = "Palinode"
 SERVER_DESCRIPTION = (
-    "Git-versioned markdown memory for AI agents: save, search, compact, lint, and audit."
+    "Inspectable, correctable project memory in git-versioned Markdown for AI agents."
 )
 SERVER_WEBSITE_URL = "https://github.com/phasespace-labs/palinode"
 
@@ -333,37 +339,20 @@ _coerce_str_array = coerce_str_array
 
 
 def _resolve_context() -> list[str] | None:
-    """Resolve ambient project context from environment (ADR-008).
+    """List view of the common ADR-008 resolver for ambient search."""
+    from palinode.core.context_prime import ambient_cwd, resolve_context
 
-    Resolution order:
-    1. PALINODE_PROJECT env var (explicit entity ref, e.g. "project/palinode")
-    2. CWD basename → config.context.project_map lookup
-    3. CWD basename → auto-detect as project/{basename} (if auto_detect=True)
-    """
-    if not config.context.enabled:
+    return resolve_context(cwd=ambient_cwd()).context
+
+
+def _status_project() -> str | None:
+    """Resolve the MCP client's project exactly as session-init does."""
+    from palinode.core.context_prime import ambient_cwd, resolve_context
+
+    try:
+        return resolve_context(cwd=ambient_cwd()).project
+    except Exception:
         return None
-
-    # 1. Explicit env var
-    explicit = os.environ.get("PALINODE_PROJECT")
-    if explicit:
-        return [explicit] if "/" in explicit else [f"project/{explicit}"]
-
-    # 2/3. CWD-based resolution
-    cwd = os.environ.get("CWD") or os.getcwd()
-    basename = os.path.basename(cwd)
-    if not basename:
-        return None
-
-    # Check config map
-    if basename in config.context.project_map:
-        entity = config.context.project_map[basename]
-        return [entity] if "/" in entity else [f"project/{entity}"]
-
-    # Auto-detect
-    if config.context.auto_detect:
-        return [f"project/{basename}"]
-
-    return None
 
 
 # ── HTTP client helpers ──────────────────────────────────────────────────────
@@ -382,7 +371,7 @@ assert _SESSION_END_TIMEOUT == _SENTINEL or os.environ.get(
 ), (
     f"SESSION_END_TIMEOUT_SECONDS ({_SESSION_END_TIMEOUT}) differs from sentinel "
     f"({_SENTINEL}) without PALINODE_SESSION_END_TIMEOUT override — "
-    "update mcp.py or defaults.py to stay in sync"
+    "update mcp.py or defaults.py to keep their timeout defaults in sync"
 )
 
 def _client_headers() -> dict[str, str]:
@@ -752,6 +741,9 @@ def _format_receipt(receipt: dict[str, Any]) -> list[str]:
     bundle = receipt.get("bundle_id")
     evaluated = receipt.get("evaluated_at")
     head = f"Receipt: {bundle} · evaluated {evaluated}"
+    if receipt.get("retrieval"):
+        from palinode.core.scoring import describe_diagnostics
+        head += "\n" + describe_diagnostics(receipt["retrieval"])
     supplied = [s for s in receipt.get("supplied") or [] if isinstance(s, dict)]
     if not supplied:
         return ["", head]
@@ -1096,7 +1088,7 @@ def _all_tools() -> list[types.Tool]:
             description=(
                 "Search Palinode memory for relevant context about people, projects, "
                 "decisions, insights, or research. Returns the most relevant memory "
-                "file excerpts ranked by semantic similarity."
+                "file excerpts ranked by configured hybrid or lexical retrieval."
             ),
             inputSchema={
                 "type": "object",
@@ -1170,7 +1162,7 @@ def _all_tools() -> list[types.Tool]:
                     },
                     "threshold": {
                         "type": "number",
-                        "description": "Override similarity threshold (0.0-1.0); higher is stricter.",
+                        "description": "Vector similarity floor (0.0-1.0); ignored in lexical mode.",
                     },
                     "full": {
                         "type": "boolean",
@@ -1394,7 +1386,10 @@ def _all_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="palinode_status",
-            description="Check Palinode health: API reachability, index stats, last watcher run.",
+            description=(
+                "Check Palinode health plus the effective read-only capture/recall "
+                "pause state, policy provenance, and resolved project scope."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -2434,7 +2429,7 @@ async def _tool_save(arguments: dict[str, Any]) -> list[types.TextContent]:
     # Surface per-index health signals from if either index
     # write failed — these are warnings, not save failures.
     warnings: list[str] = []
-    if not data.get("indexed_vec", True):
+    if data.get("retrieval_mode") != "lexical" and not data.get("indexed_vec", True):
         warnings.append("vec index write failed (chunk absent from vector search)")
     if not data.get("indexed_fts", True):
         warnings.append("FTS5 sync failed (periodic rebuild will recover)")
@@ -2467,6 +2462,9 @@ async def _tool_save(arguments: dict[str, Any]) -> list[types.TextContent]:
         confirmation = f"Saved to {rel}"
         if outcome_text:
             confirmation += f" ({outcome_text})"
+    if data.get("retrieval_mode") == "lexical":
+        state = "ready" if data.get("indexed") else "not indexed"
+        confirmation += f" [lexical retrieval: {state}]"
     if warnings:
         confirmation += f" [warnings: {'; '.join(warnings)}]"
     return _text(confirmation)
@@ -2720,7 +2718,12 @@ async def _tool_status(arguments: dict[str, Any]) -> list[types.TextContent]:
     resp = await _get("/status")
     if resp.status_code != 200:
         return _text(f"API unreachable: {resp.text}")
-    s = resp.json()
+    try:
+        s = resp.json()
+    except (TypeError, ValueError):
+        return _text("API status is unavailable.")
+    if not isinstance(s, dict):
+        return _text("API status is unavailable.")
     lines = [
         "Palinode Status",
         f"  Version:        {s.get('version', '?')}",
@@ -2734,6 +2737,38 @@ async def _tool_status(arguments: dict[str, Any]) -> list[types.TextContent]:
         f"  Unpushed:       {s.get('unpushed_commits', '?')}",
         f"  API:            {_api_url('')}",
     ]
+    controls = await _get("/controls")
+    if controls.status_code != 200:
+        lines.extend([
+            "Capture controls: unavailable (policy could not be read).",
+            f"Pause scope: {PAUSE_SCOPE}.",
+            PAUSED_READ_AVAILABILITY,
+        ])
+        return _text("\n".join(lines))
+    try:
+        policy = controls.json()
+    except (TypeError, ValueError):
+        policy = None
+    if not isinstance(policy, dict) or type(policy.get("capture_paused")) is not bool \
+            or type(policy.get("recall_paused")) is not bool \
+            or type(policy.get("policy_version")) is not int \
+            or policy.get("provenance") not in {None, "api_controls"}:
+        lines.extend([
+            "Capture controls: unavailable (policy response was invalid).",
+            f"Pause scope: {PAUSE_SCOPE}.",
+            PAUSED_READ_AVAILABILITY,
+        ])
+        return _text("\n".join(lines))
+    provenance = policy["provenance"] or "default (no persisted policy)"
+    lines.extend([
+        "Capture controls (read-only)",
+        f"  Capture:        {'paused' if policy['capture_paused'] else 'active'}",
+        f"  Recall:         {'paused' if policy['recall_paused'] else 'active'}",
+        f"  Policy:         v{policy['policy_version']}; provenance: {provenance}",
+        f"  Project:        {_status_project() or 'unresolved'}",
+        f"Pause scope: {PAUSE_SCOPE}.",
+        PAUSED_READ_AVAILABILITY,
+    ])
     return _text("\n".join(lines))
 
 
@@ -2774,7 +2809,19 @@ async def _tool_session_init(arguments: dict[str, Any]) -> list[types.TextConten
     elif not body:
         # stdio servers run on the client's machine, so the server
         # process CWD is a usable default scope hint. Explicit args win.
-        body["cwd"] = os.getcwd()
+        from palinode.core.context_prime import ambient_cwd
+
+        body["cwd"] = ambient_cwd()
+    if "project" not in body:
+        # The MCP stdio process can have a client-specific PALINODE_PROJECT
+        # while the API process does not.  Forward that resolved environment
+        # scope across the process boundary, but leave cwd/git resolution in
+        # the API for clients without an explicit environment scope.
+        from palinode.core.context_prime import resolve_context
+
+        resolution = resolve_context(cwd=body.get("cwd"))
+        if resolution.basis == "environment" and resolution.project:
+            body["project"] = resolution.project
     resp = await _post("/context/prime", json=body)
     if resp.status_code != 200:
         return _text(f"Error: {resp.text}")

@@ -79,7 +79,7 @@ def test_session_end_timeout_constant_matches_sentinel():
     assert proc.returncode == 0, proc.stderr
     value, sentinel = proc.stdout.split()[-2:]
     assert value == sentinel, (
-        f"Constant ({value}) != sentinel ({sentinel}); update defaults.py #377"
+        f"Constant ({value}) != sentinel ({sentinel}); update defaults.py"
     )
 
 
@@ -156,10 +156,10 @@ def test_init_py_hook_mirrors_canonical_hook():
     source = init_py.read_text(encoding="utf-8")
     # Find the HOOK_SCRIPT string literal block
     assert "PALINODE_HOOK_TIMEOUT" in source, (
-        "init.py HOOK_SCRIPT must reference PALINODE_HOOK_TIMEOUT (#377)"
+        "init.py HOOK_SCRIPT must reference PALINODE_HOOK_TIMEOUT"
     )
     assert 'max-time "${HOOK_TIMEOUT}"' in source or "max-time ${HOOK_TIMEOUT}" in source, (
-        "init.py HOOK_SCRIPT curl --max-time must use ${HOOK_TIMEOUT} (#377)"
+        "init.py HOOK_SCRIPT curl --max-time must use ${HOOK_TIMEOUT}"
     )
 
 
@@ -176,7 +176,7 @@ def test_init_py_settings_timeout_matches_canonical():
     assert init_timeout == canonical_timeout, (
         f"init.py SETTINGS_HOOK_BLOCK timeout ({init_timeout}) != "
         f"examples/hooks/settings.json timeout ({canonical_timeout}) — "
-        "keep them in sync (#377)"
+        "keep them in sync"
     )
 
 

@@ -90,7 +90,7 @@ def test_deploy_templates_use_http_entry_point() -> None:
     nix = (REPO_ROOT / "nix/services/mcp-service.nix").read_text()
     assert "/palinode-mcp-http" in systemd
     assert 'PALINODE_MCP_HTTP_PORT=${MCP_PORT}' in systemd, (
-        "the shipped unit passes the port via env, not --port (#1064)"
+        "the shipped unit passes the port via env, not --port"
     )
     assert "/palinode-mcp-http" in nix
     assert "PALINODE_MCP_HTTP_PORT = toString cfg.port" in nix

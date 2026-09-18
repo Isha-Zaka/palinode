@@ -126,7 +126,7 @@ def test_no_unit_test_module_is_silently_uncollected(
     missing = sorted(on_disk - set(per_file))
     assert not missing, (
         "test module(s) on disk contributed zero collected items — a silent "
-        f"non-collection, which is exactly the #356 failure mode: {missing}\n"
+        f"non-collection, which is exactly the historical failure mode: {missing}\n"
         f"{output[-2000:]}"
     )
 

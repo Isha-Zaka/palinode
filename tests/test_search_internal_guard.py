@@ -240,7 +240,7 @@ class TestBareSearchCallGuard:
             "Bare store.search() calls detected in non-allowlisted modules:\n"
             + "\n".join(violations)
             + "\n\nFix: use store.search_internal() for internal / maintenance "
-            "callers (ADR-015 H1, #481), or add the module to _ALLOWLIST if it "
+            "callers (ADR-015 H1), or add the module to _ALLOWLIST if it "
             "is genuinely user-facing and already records recall intentionally."
         )
 

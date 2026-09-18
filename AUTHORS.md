@@ -34,6 +34,8 @@ Contributions welcome via pull request. Names appear here once a PR is merged.
 - [Mayank Suthar](https://github.com/Mayanksuthar07)
 - [Vardhman Gupta](https://github.com/Kaap10)
 - [Utkarsh Arya](https://github.com/Utkarsh3725)
+- [Isha Zaka](https://github.com/Isha-Zaka)
+- [kevin-lozada-santos](https://github.com/kevin-lozada-santos)
 
 ## Acknowledgements
 

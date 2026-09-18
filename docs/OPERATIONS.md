@@ -86,18 +86,30 @@ For each `.md` file in your memory directory:
 
 **Reindex is safe to run on a live system.** Searches continue to work during reindex. The only brief lock is during FTS5 rebuild (milliseconds).
 
-### What uses Ollama
+### What uses an embedding or chat model
 
-| Operation | Needs Ollama? | Model | When |
+The default `hybrid` retrieval mode embeds new content and queries. A
+v0.21-capable source checkout can use explicit `lexical` mode, which uses the
+derived FTS index instead: it needs neither Ollama nor another embedding
+endpoint for save/search, but it is exact-term retrieval. Set the same mode on
+the API, watcher, CLI, and MCP client processes. `lexical` is not a fallback
+for an unreachable hybrid endpoint; choose it only when the installed source
+supports it. See the [Quickstart](QUICKSTART.md) for source prerequisites.
+
+| Operation | Needs an embedding endpoint? | Model/service | When |
 |-----------|:---:|-------|------|
 | Reindex (unchanged files) | No | — | Hash matches, skipped |
-| Reindex (changed files) | Yes | BGE-M3 | Embeds new content |
-| Search | Yes | BGE-M3 | Embeds the query |
-| Save | Yes | BGE-M3 | Embeds on write |
-| Summary generation | Yes | Chat model | Only for `core: true` files missing summaries |
+| Reindex (changed files) | Hybrid: yes; lexical: no | Any configured embedding endpoint in hybrid | Lexical rebuilds FTS only |
+| Search | Hybrid: yes; lexical: no | Any configured embedding endpoint in hybrid | Lexical ranks keyword matches |
+| Save | Hybrid: yes; lexical: no | Any configured embedding endpoint in hybrid | Lexical writes FTS without vectors |
+| Summary generation | No | Optional chat model | Only for `core: true` files missing summaries |
+| Consolidation | No | Optional chat model | Operator-triggered compaction when configured |
 | List, read, diff, blame, rollback | No | — | File/git operations only |
 
-If Ollama is unreachable during reindex, embedding failures are logged and skipped. The file is not indexed until Ollama comes back and you reindex again.
+If the hybrid embedder is unreachable during reindex, embedding failures are
+logged and skipped. The file is not semantically indexed until it returns and
+you reindex again. In lexical mode, inspect FTS readiness with `palinode status`
+or `palinode doctor`; switching back to hybrid requires a reindex.
 
 ---
 
@@ -131,6 +143,18 @@ gate on, schedule the cron as often as hourly and let it decide:
 47 * * * * cd /path/to/palinode && PALINODE_DIR=~/palinode venv/bin/python -m palinode.consolidation.cron --days 3 >> logs/consolidation.log 2>&1
 ```
 
+Both `--days` values above match the shipped defaults. Keep them that way: the
+cron argument silently overrides `consolidation.lookback_days`, so a crontab
+edited without the config is the kind of divergence nobody notices until a run
+behaves unexpectedly. `palinode doctor` reports the effective lookback and warns
+when the two disagree.
+
+The weekly's three days is a *deep clean* over recent notes — the pass that may
+ARCHIVE and MERGE, which the nightly deliberately cannot. It is not a safety net
+for old stragglers: a note the nightly never consolidated is not revisited once
+it falls outside the weekly window either. Widening the window is the wrong lever
+for that, because both passes pay for context they re-read.
+
 A deferred pass exits 0 and logs one line naming both numerators and both
 denominators, so the cron log alone answers "why didn't it run last night":
 
@@ -151,6 +175,12 @@ satisfies the 24 h default no matter how long the previous pass took or how
 many seconds the tick drifted; the ceiling has no slack. A pass that raises,
 or that finishes `partial` (a project group failed), records nothing and is
 retried on the next tick; a `--dry-run` records nothing either.
+
+The same file keeps a short per-mode **outcome history** under `runs` — the
+last 30 real passes with their start, status, failed projects and lookback,
+including the partial and raised passes the clock ignores. Nothing in the gate
+reads it; `palinode doctor`'s `consolidation_last_run` does, to report the
+last outcome and count a failure streak (see [DOCTOR.md](DOCTOR.md)).
 
 Notes:
 
@@ -223,22 +253,20 @@ rm ~/.palinode/.palinode.db
 palinode reindex
 ```
 
-Your memories are untouched. The database is rebuilt from scratch. This takes a few minutes for large memory stores (one Ollama call per file section).
+Your memories are untouched. The database is rebuilt from scratch. A hybrid
+rebuild embeds each changed section; a lexical rebuild recreates only the FTS
+index and needs no embedding service.
 
-### Ollama is down
+### Embedding endpoint is down
 
-Everything except search and save continues to work:
+In hybrid mode, saves still persist their markdown but semantic indexing and
+semantic search are unavailable until the endpoint returns. In lexical mode,
+save and exact-term search continue without an embedding endpoint.
 
-| Works without Ollama | Needs Ollama |
+| Works without an embedding endpoint | Hybrid work that waits for it |
 |---------------------|-------------|
-| `palinode list` | `palinode search` |
-| `palinode read` | `palinode save` (embedding step) |
-| `palinode diff` | `palinode reindex` (embedding step) |
-| `palinode blame` | |
-| `palinode history` | |
-| `palinode rollback` | |
-| `palinode push` | |
-| `palinode lint` | |
+| `palinode list`, `read`, `diff`, `blame`, `history`, `rollback`, `push`, `lint` | `palinode search` semantic retrieval |
+| Lexical `palinode save`, `search`, and `reindex` | Hybrid save/reindex vector embedding |
 
 To check Ollama connectivity:
 ```bash

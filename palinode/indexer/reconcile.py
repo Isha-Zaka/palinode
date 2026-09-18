@@ -51,6 +51,7 @@ from typing import Any
 
 from palinode.core import embedder as _embedder
 from palinode.core import parser, store
+from palinode.core.config import config
 from palinode.core.embedder import EmbeddingInputError, EmbeddingUnavailable
 from palinode.core.hashing import stable_md5_hexdigest
 from palinode.core.ollama_client import get_ollama_client
@@ -235,7 +236,7 @@ def plan(state: DerivedState) -> Plan:
             # A missing vector means an FTS-only row that must converge once
             # the embedder is reachable — re-index it. Otherwise only the
             # stamp or the frontmatter can be stale.
-            if not _vec_present(db, sec.chunk_id):
+            if config.search.retrieval_mode != "lexical" and not _vec_present(db, sec.chunk_id):
                 p.to_index.append(
                     PlannedWrite(sec, REPROJECT if text_differs else REEMBED)
                 )
@@ -343,7 +344,8 @@ def apply(p: Plan, embedder: Any = _embedder) -> Diff:
         diff.committed = True
         return diff
 
-    deferred = _embeds_deferred(get_ollama_client())
+    lexical = config.search.retrieval_mode == "lexical"
+    deferred = lexical or _embeds_deferred(get_ollama_client())
     diff.deferred = deferred
     metadata_json = json.dumps(state.metadata, default=str)
     now = store.utc_now_z()
@@ -501,6 +503,9 @@ def apply(p: Plan, embedder: Any = _embedder) -> Diff:
         )
         return diff
 
+    if lexical:
+        diff.vec_ok = False
+        return diff
     if deferred and p.to_index:
         diff.vec_ok = False
         diff.error = (

@@ -105,7 +105,7 @@ def _stable(rows):
     ]
 
 
-def test_ordinary_response_grows_by_exactly_two_fields(client, mem):
+def test_ordinary_receipt_adds_retrieval_diagnostics(client, mem):
     """`resolve` off: same bytes, plus a bundle id and an evaluation time."""
     _write(mem, "decisions/db.md", "# DB\n\nWe use Postgres as the primary database.",
            type="Decision", date="2026-01-05")
@@ -119,8 +119,8 @@ def test_ordinary_response_grows_by_exactly_two_fields(client, mem):
     # The delivered rows are the same delivery, byte for byte.
     assert json.dumps(_stable(enveloped["results"]), sort_keys=True) == \
         json.dumps(_stable(plain), sort_keys=True)
-    # And the receipt is the two-field reference — nothing more.
-    assert set(enveloped["receipt"]) == {"bundle_id", "evaluated_at"}
+    # The compact reference carries additive retrieval/readiness diagnostics.
+    assert set(enveloped["receipt"]) == {"bundle_id", "evaluated_at", "retrieval"}
 
 
 def test_resolve_on_carries_the_public_view(client, mem):
@@ -132,7 +132,7 @@ def test_resolve_on_carries_the_public_view(client, mem):
                          resolve="linked")
     assert set(receipt) == {
         "bundle_id", "policy_version", "scope", "requested_time", "evaluated_at",
-        "next_transition", "supplied", "lineage", "coverage", "dispositions",
+        "next_transition", "supplied", "lineage", "coverage", "dispositions", "retrieval",
     }
     by_ref = {s["ref"]: s for s in receipt["supplied"]}
     assert by_ref["decisions/db"]["disposition"] == REPLACED
@@ -394,7 +394,7 @@ def test_every_surface_carries_the_same_bundle_id(client, mem, monkeypatch):
     assert again != bundle
 
 
-def test_mcp_rendering_without_resolve_is_one_extra_line(client, mem):
+def test_mcp_rendering_without_resolve_has_receipt_and_mode(client, mem):
     _write(mem, "decisions/db.md", "# DB\n\nWe use Postgres as the primary database.",
            type="Decision", date="2026-01-05")
     rows, receipt = _search(client, query="primary database Postgres", limit=1,
@@ -403,7 +403,8 @@ def test_mcp_rendering_without_resolve_is_one_extra_line(client, mem):
     with_receipt = _format_results(rows, receipt=receipt)
     assert with_receipt.startswith(plain)
     extra = with_receipt[len(plain):].strip().splitlines()
-    assert len(extra) == 1 and extra[0].startswith(f"Receipt: {receipt['bundle_id']}")
+    assert len(extra) == 2 and extra[0].startswith(f"Receipt: {receipt['bundle_id']}")
+    assert extra[1] == "Retrieval: hybrid · index: ready · matched"
 
 
 # ── persistence: the retrieval log carries the receipt ───────────────────────

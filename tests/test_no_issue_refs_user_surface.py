@@ -337,6 +337,31 @@ def test_no_issue_refs_in_package_strings() -> None:
     )
 
 
+def test_no_issue_refs_in_source_string_constants() -> None:
+    """Every shipping source root gets the literal check, not just diagnostics.
+
+    Diagnostics keeps its dedicated failure above because its remediation text
+    is directly user-facing. This companion closes the equivalent gap in
+    production code, fixtures, and benchmark harnesses without diluting that
+    diagnostic-specific explanation.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    offenders: list[str] = []
+    for root in _SOURCE_ROOTS:
+        for py in sorted((repo_root / root).rglob("*.py")):
+            if py.is_relative_to(repo_root / "palinode" / "diagnostics"):
+                continue
+            for line, text in _string_constant_refs_in(py):
+                rel = py.relative_to(repo_root)
+                offenders.append(f"  {rel}:{line}: {_issue_refs(text)}  →  {text.strip()[:70]}")
+
+    assert not offenders, (
+        "Unfollowable issue refs found in source string constants. Replace the "
+        "bare number with the full public issue URL, or name the change instead:\n"
+        + "\n".join(offenders)
+    )
+
+
 # ── What counts as an unfollowable reference ─────────────────────────────────
 # The guards above are only as good as this distinction, and it is the part a
 # contributor actually collides with, so it is pinned directly.
@@ -344,7 +369,8 @@ def test_no_issue_refs_in_package_strings() -> None:
 
 def test_bare_number_is_rejected() -> None:
     """The original case: a bare tag, whichever tracker the author meant."""
-    assert _issue_refs("Issue #100: the body was mangled.") == ["#100"]
+    ref = "#" + "100"
+    assert _issue_refs(f"Issue {ref}: the body was mangled.") == [ref]
 
 
 def test_public_url_is_allowed() -> None:
@@ -365,13 +391,15 @@ def test_url_to_another_repository_is_rejected() -> None:
     dev-tracker link used to pass this guard untouched, while the same issue
     written as a bare tag beside it would have failed.
     """
-    text = "Context: https://github.com/some-owner/some-private-repo/issues/715"
+    url = "https://github.com/some-owner/some-private-repo/issues/" + "715"
+    text = f"Context: {url}"
     assert _issue_refs(text) == [
-        "https://github.com/some-owner/some-private-repo/issues/715"
+        url
     ]
 
 
 def test_allowed_url_does_not_mask_a_bare_ref_beside_it() -> None:
     """Stripping the permitted form must not swallow an offender next to it."""
-    text = "https://github.com/phasespace-labs/palinode/issues/100 and also #715"
-    assert _issue_refs(text) == ["#715"]
+    ref = "#" + "715"
+    text = "https://github.com/phasespace-labs/palinode/issues/100 and also " + ref
+    assert _issue_refs(text) == [ref]

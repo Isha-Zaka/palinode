@@ -4,10 +4,9 @@
 # Fires on SessionEnd (including /clear, logout, exit). Reads the transcript
 # from stdin JSON, extracts a minimal summary, and POSTs to palinode-api.
 #
-# Fail-silent by design — never block Claude Code exit. If the API is
-# unreachable the capture is appended to a local replay log
-# (.claude/session-floor-fallback.jsonl) rather than lost, and the hook still
-# exits cleanly.
+# Fail-silent by design — never block Claude Code exit. Automatic capture is
+# gated by the persisted control service; a denial or unavailable service exits
+# before reading a transcript and never writes a content-bearing fallback.
 #
 # Install:
 #   1. Copy to .claude/hooks/palinode-session-end.sh (or ~/.claude/hooks/…)
@@ -41,7 +40,23 @@ fi
 INPUT=$(cat)
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 SOURCE_REASON=$(echo "$INPUT" | jq -r '.source // .reason // "other"')
+
+# This preflight intentionally precedes every transcript operation. A malformed
+# or unavailable response fails closed without emitting user content.
+CONTROL_PAYLOAD=$(jq -n \
+  --arg cwd "$CWD" --arg source_path "$TRANSCRIPT_PATH" \
+  '{action: "capture", cwd: $cwd, source_path: $source_path, automatic: true}')
+CONTROL=$(curl -sS -f \
+  -X POST "${PALINODE_API}/controls/check" \
+  ${AUTH[@]+"${AUTH[@]}"} \
+  -H "Content-Type: application/json" \
+  -d "$CONTROL_PAYLOAD" \
+  --connect-timeout 2 \
+  --max-time "${HOOK_TIMEOUT}" 2>/dev/null) || exit 0
+[ "$(echo "$CONTROL" | jq -r 'if .allowed == true then "yes" else "no" end' 2>/dev/null)" = "yes" ] || exit 0
+PROJECT=$(echo "$CONTROL" | jq -r '.project // empty' 2>/dev/null) || exit 0
 
 # Drop reasons we're not capturing. Word-boundary match on a space-padded
 # allowlist so substrings (e.g. "log" in "logout") don't false-positive.
@@ -61,7 +76,10 @@ fi
 # strictly richer than this deterministic floor, so writing the floor too just
 # duplicates. Skip. Override with PALINODE_HOOK_FORCE=1 to capture regardless.
 if [ "${PALINODE_HOOK_FORCE:-0}" != "1" ] \
-   && grep -q 'palinode_session_end' "$TRANSCRIPT_PATH" 2>/dev/null; then
+   && jq -e -s 'any(.[]; .type == "assistant"
+       and any(.message.content[]?; .type == "tool_use"
+           and .name == "palinode_session_end"))' \
+       "$TRANSCRIPT_PATH" >/dev/null 2>&1; then
   exit 0
 fi
 
@@ -83,8 +101,6 @@ MSG_COUNT=${MSG_COUNT:-0}
 if [ "$MSG_COUNT" -lt "$MIN_MESSAGES" ]; then
   exit 0
 fi
-
-PROJECT=$(basename "$CWD" 2>/dev/null || echo "unknown")
 
 # The first user turn is a *topic hint*, not content — and in Claude Code it is
 # routinely wrapped in harness markup (slash-command expansion, system
@@ -110,7 +126,13 @@ PAYLOAD=$(jq -n \
   --arg summary "$SUMMARY" \
   --arg project "$PROJECT" \
   --arg source "claude-code-hook" \
-  '{summary: $summary, project: $project, source: $source, decisions: [], blockers: []}')
+  --arg cwd "$CWD" \
+  --arg source_path "$TRANSCRIPT_PATH" \
+  --arg session_id "$SESSION_ID" \
+  '{summary: $summary, project: $project, source: $source, cwd: $cwd,
+    source_path: $source_path, session_id: $session_id,
+    trigger: "session-end-hook", automatic: true,
+    decisions: [], blockers: []}')
 
 # Dry-run: print what would be POSTed and write nothing. Lets you verify the
 # hook wiring (reasons, triviality gate, payload shape) without touching the
@@ -121,20 +143,15 @@ if [ "${PALINODE_HOOK_DRYRUN:-0}" = "1" ]; then
   exit 0
 fi
 
-# POST the capture. `-f` makes curl fail on HTTP >=400 too (not just connection
-# errors), so a 5xx also routes to the fallback below. On ANY failure, never
-# lose the capture — append the payload to a local fallback log a later session
-# can replay. Always exit 0: a floor-capture failure must not block session exit.
-if ! curl -sS -o /dev/null -f \
+# The API rechecks the persisted policy immediately before its write. Do not
+# persist a fallback on failure: a 403 may mean the user paused capture after
+# this preflight.
+curl -sS -o /dev/null -f \
     -X POST "${PALINODE_API}/session-end" \
     ${AUTH[@]+"${AUTH[@]}"} \
     -H "Content-Type: application/json" \
     -d "$PAYLOAD" \
     --connect-timeout 5 \
-    --max-time "${HOOK_TIMEOUT}"; then
-  FALLBACK="${CLAUDE_PROJECT_DIR:-$CWD}/.claude/session-floor-fallback.jsonl"
-  mkdir -p "$(dirname "$FALLBACK")" 2>/dev/null || true
-  printf '%s\n' "$PAYLOAD" >> "$FALLBACK" 2>/dev/null || true
-fi
+    --max-time "${HOOK_TIMEOUT}" 2>/dev/null || true
 
 exit 0

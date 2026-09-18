@@ -20,7 +20,7 @@
         "type": "string"
       },
       "autoCapture": {
-        "description": "Append session summaries to daily/ at agent end",
+        "description": "Opt in to bounded transcript capture through the API at agent end and reset",
         "type": "boolean"
       },
       "autoRecall": {

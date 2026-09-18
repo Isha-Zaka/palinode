@@ -24,6 +24,8 @@ client = TestClient(app)
 
 DIGEST_KEYS = {
     "project",
+    "project_resolved_by",
+    "project_known",
     "core_memories",
     "recent_decisions",
     "open_action_items",

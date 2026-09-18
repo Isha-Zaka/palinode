@@ -66,7 +66,7 @@ class TestUpsertChunksReturnContract:
         chunk = _make_chunk("test-ok-1", str(db_path.parent / "insights/test.md"))
         result = upsert_chunks([chunk], skip_unchanged=False)
 
-        assert isinstance(result, dict), "upsert_chunks must return a dict (#385)"
+        assert isinstance(result, dict), "upsert_chunks must return a dict"
         assert result["written"] == 1
         assert result["vec_ok"] is True
         assert result["fts_ok"] is True
@@ -108,13 +108,13 @@ class TestUpsertChunksVecFailure:
 
         # Return contract
         assert result["vec_ok"] is False, (
-            "vec_ok must be False when chunks_vec write fails (#385)"
+            "vec_ok must be False when chunks_vec write fails"
         )
 
         # Error must be logged — operator needs a signal
         error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert error_records, (
-            "write_chunk_row must log at ERROR when chunks_vec write fails (#385)"
+            "write_chunk_row must log at ERROR when chunks_vec write fails"
         )
         combined = " ".join(r.getMessage() for r in error_records)
         assert "chunks_vec" in combined or "vector index" in combined, (
@@ -157,7 +157,7 @@ class TestUpsertChunksFTSFailure:
             result = upsert_chunks([chunk], skip_unchanged=False)
 
         assert result["fts_ok"] is False, (
-            "fts_ok must be False when FTS5 sync fails (#385)"
+            "fts_ok must be False when FTS5 sync fails"
         )
         assert result["vec_ok"] is True, (
             "vec_ok must not be affected by an isolated FTS5 failure"
@@ -167,7 +167,7 @@ class TestUpsertChunksFTSFailure:
             r for r in caplog.records if r.levelno >= logging.WARNING
         ]
         assert warning_records, (
-            "write_chunk_row must log at WARNING when FTS5 sync fails (#385)"
+            "write_chunk_row must log at WARNING when FTS5 sync fails"
         )
         combined = " ".join(r.getMessage() for r in warning_records)
         assert "fts" in combined.lower() or "fts5" in combined.lower(), (

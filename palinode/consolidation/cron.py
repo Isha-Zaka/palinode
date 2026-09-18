@@ -4,7 +4,7 @@ Palinode Consolidation Cron Entry Point
 Three-tier memory freshness:
   Tier 1: Session append (hook/MCP, every session, free — captures intent + result)
   Tier 2: Nightly dedup (--nightly, UPDATE/SUPERSEDE only, 1-day lookback)
-  Tier 3: Weekly deep clean (full ops, 3-7 day lookback)
+  Tier 3: Weekly deep clean (full ops, 3-day lookback)
 
 Crontab examples (times in UTC, target 4am PT = 11:00 UTC during PDT):
     # Nightly — lightweight dedup of today's sessions

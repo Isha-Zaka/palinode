@@ -53,6 +53,16 @@ _STUB_CURL = """\
 echo "$@" >> "$STUB_DIR/curl-called"
 [ "${CURL_FAIL:-0}" = "1" ] && exit 22
 case "$@" in
+  *"/controls/check"*)
+    control_count_file="$STUB_DIR/control-count"
+    control_count=$(cat "$control_count_file" 2>/dev/null || echo 0)
+    control_count=$((control_count + 1))
+    echo "$control_count" > "$control_count_file"
+    if [ "${CONTROL_DENY:-0}" = "1" ] || [ "${CONTROL_DENY_ON_CHECK:-0}" -eq "$control_count" ]; then
+      echo '{"allowed":false}'
+    else
+      echo '{"allowed":true}'
+    fi ;;
   *"/list"*) cat "$STUB_DIR/list-response.json" ;;
 esac
 exit 0
@@ -132,11 +142,32 @@ def test_api_down_is_fail_silent(tmp_path):
     assert curl_called.exists(), "curl should have been attempted"
 
 
+def test_recall_denial_prevents_prime_and_core_list(tmp_path):
+    proc, curl_called = _run_hook(tmp_path, env={"CONTROL_DENY": "1"})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    calls = curl_called.read_text()
+    assert "/controls/check" in calls
+    assert "/context/prime" not in calls and "/list" not in calls
+
+
+def test_late_recall_denial_suppresses_additional_context(tmp_path):
+    """A pause arriving after priming wins at the output boundary."""
+    proc, curl_called = _run_hook(tmp_path, env={"CONTROL_DENY_ON_CHECK": "2"})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    calls = curl_called.read_text()
+    assert calls.count("/controls/check") == 2
+    assert "/context/prime" in calls and "/list" in calls
+
+
 def test_non_allowlisted_source_skips(tmp_path):
     proc, curl_called = _run_hook(tmp_path, source="resume")
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == ""
-    assert not curl_called.exists(), "resume is not in the default source allowlist"
+    calls = curl_called.read_text()
+    assert "/controls/check" in calls
+    assert "/context/prime" not in calls and "/list" not in calls
 
 
 def test_source_allowlist_env_override(tmp_path):
@@ -168,7 +199,9 @@ def test_dryrun_touches_nothing(tmp_path):
     proc, curl_called = _run_hook(tmp_path, env={"PALINODE_HOOK_DRYRUN": "1"})
     assert proc.returncode == 0, proc.stderr
     assert "DRYRUN" in proc.stdout
-    assert not curl_called.exists(), "dry-run must not call the API"
+    calls = curl_called.read_text()
+    assert "/controls/check" in calls
+    assert "/context/prime" not in calls and "/list" not in calls
 
 
 # ---- Bounds -------------------------------------------------------------

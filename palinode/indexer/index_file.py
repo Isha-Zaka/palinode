@@ -18,6 +18,7 @@ import logging
 import os
 from typing import Any
 
+from palinode.core.config import config
 from palinode.indexer import reconcile
 
 logger = logging.getLogger("palinode.indexer")
@@ -32,6 +33,8 @@ def index_file(filepath: str, *, content: str | None = None) -> dict[str, Any]:
 
     Returns:
         dict with keys:
+            * ``retrieval_mode`` (str): configured hybrid or lexical mode.
+            * ``indexed`` (bool): committed and ready for the configured mode.
             * ``embedded`` (bool): True iff the reconcile committed with vectors
               (or was a no-op); False on cold-defer or a fail-closed abort.
             * ``chunks_written`` (int): chunks newly written (new/changed body).
@@ -47,6 +50,8 @@ def index_file(filepath: str, *, content: str | None = None) -> dict[str, Any]:
             * ``error`` (str | None): one-line failure/deferral reason, if any.
     """
     result: dict[str, Any] = {
+        "retrieval_mode": config.search.retrieval_mode,
+        "indexed": False,
         "embedded": False,
         "indexed_vec": True,
         "indexed_fts": True,
@@ -77,8 +82,13 @@ def index_file(filepath: str, *, content: str | None = None) -> dict[str, Any]:
 
     diff = reconcile.reconcile(filepath, content)
     result.update(
-        embedded=diff.committed and not diff.deferred and diff.embed_failures == 0,
-        indexed_vec=diff.vec_ok,
+        indexed=diff.committed and diff.fts_ok and (
+            config.search.retrieval_mode == "lexical"
+            or (not diff.deferred and diff.embed_failures == 0 and diff.vec_ok)
+        ),
+        embedded=(config.search.retrieval_mode != "lexical"
+                  and diff.committed and not diff.deferred and diff.embed_failures == 0),
+        indexed_vec=diff.vec_ok and config.search.retrieval_mode != "lexical",
         indexed_fts=diff.fts_ok,
         chunks_written=diff.written,
         chunks_unchanged=diff.unchanged,

@@ -43,6 +43,7 @@ ok() { echo "  ok: $1"; pass=$((pass + 1)); }
 ng() { echo "  FAIL: $1"; fail=$((fail + 1)); }
 
 PROBE="$REPO_ROOT/palinode/_write_choke_point_probe.py"
+WATCHER_PROBE="$REPO_ROOT/tests/fixtures/write_choke_point/palinode/indexer/watcher.py"
 cleanup() { rm -f "$PROBE"; }
 trap cleanup EXIT
 
@@ -140,6 +141,16 @@ if bash "$CHECK" "palinode/core/audit.py" >/dev/null 2>&1; then
     ok "palinode/core/audit.py (allowlisted) passes"
 else
     ng "palinode/core/audit.py should be allowlisted but was flagged"
+fi
+if bash "$CHECK" "palinode/indexer/watcher_identity.py" >/dev/null 2>&1; then
+    ok "watcher_identity.py runtime identity write is allowlisted"
+else
+    ng "watcher_identity.py should be allowlisted but was flagged"
+fi
+if bash "$CHECK" "$WATCHER_PROBE" >/dev/null 2>&1; then
+    ng "watcher.py-named raw memory write was incorrectly allowlisted"
+else
+    ok "watcher.py-named raw memory write is rejected"
 fi
 
 # ── 9. GIT_ALLOWED is empty by design and must not crash bash 3.2 ───────────

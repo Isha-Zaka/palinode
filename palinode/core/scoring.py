@@ -39,3 +39,8 @@ def describe_match(result: Mapping[str, Any]) -> str:
     if raw is None:
         return f"keyword match, rank {fused:.2f}"
     return f"{_percent(raw)}% match"
+
+
+def describe_diagnostics(value: dict[str, Any]) -> str:
+    return (f"Retrieval: {value['active_mode']} · index: {value['index_state']}"
+            + (f" · {value['outcome']}" if value.get("outcome") else ""))

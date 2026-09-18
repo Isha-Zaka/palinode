@@ -799,7 +799,7 @@ def save_memory(
     # watcher detects the absent description field and backfills within ~30s.
     # A caller-supplied description (via metadata) is respected and not deferred.
     description_pending = False
-    if config.auto_summary.enabled and not frontmatter_dict.get("description"):
+    if config.search.retrieval_mode != "lexical" and config.auto_summary.enabled and not frontmatter_dict.get("description"):
         description_pending = True
         # Leave description absent in frontmatter; watcher detects the missing
         # field and triggers /generate-summaries, which fills it.
@@ -821,7 +821,7 @@ def save_memory(
     # callers can distinguish "summary still missing" from "this file is not
     # eligible." Mirror the description_pending pattern
     summary_pending = False
-    if config.auto_summary.enabled:
+    if config.search.retrieval_mode != "lexical" and config.auto_summary.enabled:
         is_core = bool(frontmatter_dict.get("core", False))
         has_summary = bool(frontmatter_dict.get("summary"))
         if (
@@ -896,13 +896,15 @@ def save_memory(
     # zero results. The watcher remains the indexer for filesystem-direct
     # writes; this path covers API-driven saves.
     indexed = False
+    embedded = False
     indexed_vec: bool = True
     indexed_fts: bool = True
     index_error: str | None = None
     try:
         from palinode.indexer.index_file import index_file
         outcome = index_file(file_path)
-        indexed = bool(outcome.get("embedded"))
+        embedded = bool(outcome.get("embedded"))
+        indexed = bool(outcome.get("indexed", embedded))
         # Surface per-index health so callers can detect silent vec0/FTS5
         # failures. Defaults to True so a missing key (old index_file
         # version) does not falsely signal failure.
@@ -934,7 +936,8 @@ def save_memory(
         "save_outcome": save_outcome,
         "disambiguated_from": disambiguated_from,
         "indexed": indexed,
-        "embedded": indexed,
+        "embedded": embedded,
+        "retrieval_mode": config.search.retrieval_mode,
         # Per-index health flags. vec/FTS failures are non-fatal
         # but silent — surface them so callers (MCP, CLI) can warn the user.
         "indexed_vec": indexed_vec,
@@ -961,7 +964,7 @@ def save_memory(
     # Tier 2a (ADR-004): schedule write-time contradiction check.
     # Always safe to call — returns None immediately if disabled in config.
     # Errors inside the scheduler are logged and swallowed; never propagate.
-    if config.consolidation.write_time.enabled:
+    if config.search.retrieval_mode != "lexical" and config.consolidation.write_time.enabled:
         try:
             from palinode.consolidation import write_time
             item = {

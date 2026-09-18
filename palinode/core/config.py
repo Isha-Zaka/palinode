@@ -291,6 +291,7 @@ class SearchConfig:
     max_limit: int = 1000
     exclude_status: list[str] = field(default_factory=lambda: ["archived"])
     hybrid_weight: float = 0.5
+    retrieval_mode: Literal["hybrid", "lexical"] = "hybrid"
     hybrid_enabled: bool = True
     dedup_score_gap: float = 0.2
     daily_penalty: float = 0.3  # Multiplier for daily/ files (0.3 = 30% of original score)
@@ -423,7 +424,11 @@ class ConsolidationConfig:
     """Interval LLM job configuration settings logic."""
     enabled: bool = True
     schedule: str = "0 3 * * 0"  # Sunday 3am UTC
-    lookback_days: int = 7
+    # Matches the crontab in docs/OPERATIONS.md and this module's own example.
+    # The weekly is a deep clean (ARCHIVE/MERGE) over recent notes, not a safety
+    # net for old ones: a note the nightly never consolidated is not revisited
+    # once it falls outside this window.
+    lookback_days: int = 3
     # LLM for consolidation tasks (OpenAI-compatible API)
     llm_url: str = "http://localhost:8000"
     llm_model: str = "/model"
@@ -631,8 +636,8 @@ class ContextConfig:
     """
     enabled: bool = True
     boost: float = 1.5              # Multiplier for context-matching results (1.0 = disabled)
-    auto_detect: bool = True        # Fall back to project/{basename(cwd)} if not in project_map
-    project_map: dict[str, str] = field(default_factory=dict)  # CWD basename → entity ref
+    auto_detect: bool = True        # Infer from git identity, else normalized cwd basename
+    project_map: dict[str, str] = field(default_factory=dict)  # Directory/repository name → entity ref
     embed_augment: bool = True      # Prepend project context to query before embedding
     #: Session-start core injection: /context/prime, palinode_session_init,
     #: palinode prime.
@@ -903,6 +908,11 @@ def load_config() -> Config:
     _AUDIT_LOG_DEFAULT = ".audit/mcp-calls.jsonl"
     if cfg.audit.log_path == _AUDIT_LOG_DEFAULT:
         cfg.audit.log_path = os.path.join(cfg.memory_dir, ".audit", "mcp-calls.jsonl")
+    if "PALINODE_RETRIEVAL_MODE" in os.environ:
+        mode = os.environ["PALINODE_RETRIEVAL_MODE"].strip().lower()
+        if mode not in {"hybrid", "lexical"}:
+            raise ValueError("PALINODE_RETRIEVAL_MODE must be hybrid or lexical")
+        cfg.search.retrieval_mode = mode
     if "OLLAMA_URL" in os.environ:
         cfg.embeddings.primary.url = os.environ["OLLAMA_URL"]
     if "EMBEDDING_MODEL" in os.environ:
@@ -990,7 +1000,7 @@ def load_config() -> Config:
     banner_label = "⚠ defaults (no config file found)" if loaded_path is None else loaded_path
     print(
         f"Palinode config: {banner_label} "
-        f"({num_files} files, {cfg.embeddings.primary.model} @ {cfg.embeddings.primary.url})",
+        f"({num_files} files, embedding model {cfg.embeddings.primary.model})",
         file=sys.stderr,
     )
 

@@ -43,6 +43,22 @@ The test question is whether there is anything to fix. `depends` is the worked e
 
 `test_surface_realizations_name_a_real_param_and_capability` checks both halves of every declaration: the param exists in `canonical_params`, and the capability is live on that surface. A declaration nothing verifies rots — the entry this replaced carried an issue number from a private tracker, which resolved in the public one to an unrelated closed issue, and the parity test reported that number for months.
 
+## Context resolution and startup gates
+
+`core.context_prime.resolve_context` owns project selection. Explicit project
+arguments bypass `context.enabled`; ambient environment, mappings and directory
+inference obey it. CLI/MCP search consume its list view; prime and session-end
+consume its project view. Save tags only the project/entities explicitly supplied.
+[Project resolution](HOW-MEMORY-WORKS.md#choosing-the-project) documents precedence,
+git/worktree identity, remote-path limits and known/unrecognized diagnostics.
+
+Startup delivery has an intentional gate difference: MCP `palinode_session_init`
+honors `auto_inject.enabled` and per-harness suppression to avoid duplicate startup
+injection. Direct `POST /context/prime` and `palinode prime` remain available for
+hooks and deliberate inspection. These gates do not disable search or capture.
+`tests/test_project_resolution.py` tests the behavioral contract in addition to
+the parameter-name checks in `tests/test_surface_parity.py`.
+
 ## Admin-exempt operations
 
 These operations are **not** required to appear on every surface. They are intentionally CLI-only or CLI+API only because they're operational, not memory-semantic.

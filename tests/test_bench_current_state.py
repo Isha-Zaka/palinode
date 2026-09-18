@@ -224,6 +224,31 @@ def test_a_consolidation_event_that_changes_nothing_is_loud(tmp_path, corpus):
                                   "new_text": "x", "rationale": "y"}]})
 
 
+def test_disposable_world_disables_git_maintenance_before_replay_copy(tmp_path, corpus):
+    """Copied benchmark repos retain history without background Git maintenance.
+
+    The macOS full-corpus failure copied ``.git/objects`` while automatic
+    maintenance removed ``maintenance.lock``.  These must be local repository
+    settings: benchmark isolation cannot depend on a developer's global Git
+    config, and replay still has to preserve every source commit.
+    """
+    episode = next(e for e in corpus.split("dev") if e.id == "explicit-replacement-pos")
+    replay_root = str(tmp_path / "replay")
+    with world_mod.deterministic_embedder():
+        world = world_mod.build(episode, str(tmp_path / "world"))
+        assert world._git("config", "--local", "--get", "maintenance.auto").stdout.strip() == "false"
+        assert world._git("config", "--local", "--get", "gc.auto").stdout.strip() == "0"
+
+        history = world._git("rev-list", "--all", "--reverse").stdout.splitlines()
+        replay = harness.replay_check(episode, world, replay_root)
+
+    copied = world_mod.World(replay_root)
+    assert copied._git("fsck", "--no-dangling").returncode == 0
+    assert copied._git("rev-list", "--all", "--reverse").stdout.splitlines() == history
+    assert replay["ok"], replay
+    assert replay["receipts_explain_revisions"], replay
+
+
 # ── the run ───────────────────────────────────────────────────────────────
 
 

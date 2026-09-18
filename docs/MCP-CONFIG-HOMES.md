@@ -11,6 +11,57 @@ each, and shows how to identify which file your running instance uses.
 
 ---
 
+## Generate a client-specific preview
+
+Run the `palinode` command belonging to the installation you want the editor to
+launch (for example `"$VENV/bin/palinode"`). The generator uses its installed
+script metadata, falling back to its interpreter's scripts directory. It never
+selects an unrelated executable from `PATH`. Missing or conflicting candidates
+fail with repair instructions; `--executable /absolute/path/to/palinode-mcp`
+selects an explicit executable (use its real path, without symlinks or `..`).
+Regenerate after moving or removing the installation.
+
+| Selection | Preview command | Destination and merge operation |
+|---|---|---|
+| Claude Code | `palinode mcp-config --stdio --editor claude-code` | Project-root `.mcp.json`: merge `palinode` into `mcpServers`; approve the project server |
+| Codex CLI | `palinode mcp-config --stdio --editor codex` | `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`): merge `[mcp_servers.palinode]`; update an existing table, never duplicate it. Trusted projects can use `.codex/config.toml` |
+| Continue | `palinode mcp-config --stdio --editor continue` | `~/.continue/config.yaml`: merge the named item into the `mcpServers` list; retain the existing config name/version/schema/models |
+| Claude Desktop | `palinode mcp-config --stdio --editor claude-desktop` | Platform-specific `claude_desktop_config.json` below: merge into `mcpServers` after quitting Desktop |
+| Generic | `palinode mcp-config --stdio` | JSON `mcpServers` fragment; consult the client's recipe |
+
+`--client` aliases `--editor`. Unknown selections fail clearly. Codex output is
+TOML and Continue output is YAML even when piped; `--json` is rejected for those
+clients to prevent pasting the wrong format. For remote MCP, use `--http --url
+https://your-server/mcp/` with the selected editor; the Desktop JSON selector
+supports stdio only (use Desktop's Connectors UI for remote HTTP).
+
+Generation is a preview: it never writes or merges editor settings. Merge only
+the named server; **do not redirect output onto an existing config file**.
+Interactive output explains the merge destination. Piped output is only the
+native fragment, suitable for a separate private preview file.
+
+Stdio preserves the effective API host/port and memory directory plus explicitly
+configured API token/token-file, project, tool-surface and visibility identity
+variables. It does not copy unrelated shell secrets or freeze the current working
+directory; the client supplies its project directory at launch. For a client-only
+checkout on a remote API host, pass an explicit project in the tool call when
+needed. Project resolution remains the API/MCP contract.
+
+Interactive previews and diagnostics redact credentials. Raw generation includes
+explicitly configured credentials required for a usable connection. Prefer a
+`PALINODE_API_TOKEN_FILE` reference for stdio; the generator preserves its absolute
+path without reading its contents. `--bearer` remains an explicit HTTP option and
+is serialized into the client's supported header field. Keep raw output private.
+
+Schemas checked against [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp),
+[official Codex MCP documentation](https://developers.openai.com/codex/mcp/),
+and [Continue configuration reference](https://docs.continue.dev/reference).
+Automated tests cover formats, merge preservation and process launch; these are
+separate from observing an authenticated editor conversation. Other editor recipes
+below are documentation guidance, not evidence of an observed client connection.
+
+---
+
 ## The problem
 
 On macOS with both Claude Desktop and Claude Code CLI installed, at least
@@ -38,10 +89,11 @@ from the client to indicate this.
 ~/.claude.json
 ```
 
-The CLI stores project entries under a key matching the project root path.
-The `mcpServers` block for a given project is nested inside that entry.
-Project-local config in `.mcp.json` at the project root takes precedence
-over global entries.
+User-scoped servers live in top-level `mcpServers`. Local-scoped entries live
+under `projects[absolute-project-path].mcpServers`. Project-scoped servers live
+in project-root `.mcp.json`; the generator targets this shareable shape. Prefer
+`claude mcp add-json --scope user` when deliberately installing a user-wide entry.
+Claude Code resolves conflicting names in local, project, then user scope order.
 
 ### Claude Desktop
 
@@ -75,7 +127,7 @@ to take effect.
 ~/Library/Application Support/Claude-3p/claude_desktop_config.json
 ```
 
-### Project-local config (Claude Code CLI / Cursor / Windsurf)
+### Project-local config (Claude Code CLI)
 
 ```
 .mcp.json   (in the project root)
@@ -271,11 +323,38 @@ palinode mcp-config --http --url http://<palinode-host>:6341/mcp/
 
 # stdio (local):
 palinode mcp-config --stdio
+
+# stdio pinned to one project, even when the client later opens a linked worktree:
+palinode mcp-config --stdio --project harbor-notes
 ```
 
 When piped, the command emits only the raw JSON block (so you can redirect it);
 when run interactively it adds guidance and a `claude mcp add` one-liner. It is
 read-only — it never writes to any config file.
+
+### Explicit stdio project scope
+
+Use `palinode mcp-config --stdio --project <slug>` when one generated local
+MCP entry must consistently use a named project. The generated entry sets
+`PALINODE_PROJECT` only for the `palinode-mcp` process started by that client;
+two client configs can therefore name different projects without sharing
+mutable session state. The resolver reports this as `environment` in
+`palinode_session_init` (and the `prime` JSON output's
+`project_resolved_by`), while a `project` argument on that tool still wins as
+an explicit per-call override.
+
+Omit `--project` to retain normal resolution from the client's CWD, including
+Git origin/common-directory detection for linked worktrees. The option accepts
+only a plain slug, not `project/<slug>` or a path, so generated configuration
+cannot turn into a path-like project reference.
+
+`--project` intentionally rejects `--http`. An HTTP client connects to an
+already-running, potentially shared `palinode-mcp-http` process; putting an
+environment value in its client config cannot scope that remote process per
+client. For remote HTTP, use the `project` argument on an applicable tool call
+to make an explicit request, or configure the remote server's own environment
+only when every client is meant to share that default. Do not claim that an
+HTTP config fragment provides per-client persistent scope.
 
 ---
 

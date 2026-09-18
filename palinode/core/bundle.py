@@ -590,6 +590,9 @@ def _query_seeds(query: str, limit: int) -> tuple[list[dict[str, Any]], set[str]
     from palinode.core import embedder
 
     reasons: set[str] = set()
+    if config.search.retrieval_mode == "lexical":
+        reasons.add(DEGRADED_KEYWORD_ONLY)
+        return store.search_hybrid(query, None, top_k=limit, record_access=False), reasons
     try:
         embedding = embedder.embed(query)
     except (embedder.EmbeddingUnavailable, embedder.EmbeddingInputError) as exc:

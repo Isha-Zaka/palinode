@@ -63,6 +63,10 @@ OPEN_ALLOWED=(
     "palinode/cli/init.py"
     # Diagnostics baseline log (index-size trend) — not memory content.
     "palinode/diagnostics/checks/index_size.py"
+    # Runtime watcher identity under memory_dir/.palinode/ — internal process
+    # state, excluded from indexing and Git; this is not a memory-file write.
+    # Keep this dedicated module narrow: watcher.py remains fully scanned.
+    "palinode/indexer/watcher_identity.py"
     # `doctor --fix` appends the Palinode integration block to the *user's*
     # CLAUDE.md, not palinode's own memory_dir.
     "palinode/diagnostics/fixes.py"

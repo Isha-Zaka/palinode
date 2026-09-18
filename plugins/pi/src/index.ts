@@ -25,6 +25,7 @@
 
 import { basename } from "node:path";
 import {
+  automaticAllowed,
   buildCoreDigest,
   buildRecallContext,
   buildSessionCapture,
@@ -70,9 +71,10 @@ export default function palinode(pi: PiLike): void {
   const cfg = configFromEnv();
 
   pi.on("session_start", async (_event, ctx) => {
+    if (!await automaticAllowed(cfg, "recall", process.cwd())) return;
     const sessionId = ctx.sessionManager?.getSessionId?.() ?? "";
     const digest = await buildCoreDigest(cfg, fetch, process.cwd(), sessionId);
-    if (digest) {
+    if (digest && await automaticAllowed(cfg, "recall", process.cwd())) {
       // nextTurn: queued for the next user prompt — does not interrupt,
       // does not trigger a turn. Session-start priming, Pi-shaped.
       pi.sendMessage(
@@ -83,8 +85,9 @@ export default function palinode(pi: PiLike): void {
   });
 
   pi.on("before_agent_start", async (event, _ctx) => {
+    if (!await automaticAllowed(cfg, "recall", process.cwd())) return;
     const context = await buildRecallContext(event.prompt ?? "", cfg);
-    if (!context) return undefined; // silence is the common case
+    if (!context || !await automaticAllowed(cfg, "recall", process.cwd())) return undefined; // silence is the common case
     return {
       message: {
         customType: "palinode-recall",
@@ -95,6 +98,7 @@ export default function palinode(pi: PiLike): void {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    if (!cfg.captureOn || !await automaticAllowed(cfg, "capture", process.cwd())) return;
     const entries = ctx.sessionManager?.getEntries?.() ?? [];
     const payload = buildSessionCapture(entries, cfg, {
       project: basename(process.cwd()),

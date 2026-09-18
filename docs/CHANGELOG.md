@@ -6,6 +6,75 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Removed
+
+### Security
+
+## [0.21.0] — 2026-09-18
+
+**Compatibility:** automatic transcript capture now requires an explicit opt-in.
+Fresh Claude Code setup uses `palinode init --hook`; plain `palinode init` no
+longer installs transcript-reading hooks. Existing installed Claude hooks remain
+enabled when init is rerun unless they are explicitly removed. OpenClaw users who
+want agent-end transcript capture must set `autoCapture: true`, and Pi, Cline or
+shared plugin-core bindings must set `PALINODE_CAPTURE_ENABLED=1` (or their
+equivalent `captureOn: true` override). Manual saves, explicit session-end calls
+and recall remain available without enabling transcript capture.
+
+**Contributors:** [Chirag Gupta](https://github.com/chiruu12) ([PR #213](https://github.com/phasespace-labs/palinode/pull/213), [PR #218](https://github.com/phasespace-labs/palinode/pull/218)); [Isha Zaka](https://github.com/Isha-Zaka) ([PR #209](https://github.com/phasespace-labs/palinode/pull/209)); [kevin-lozada-santos](https://github.com/kevin-lozada-santos) ([PR #217](https://github.com/phasespace-labs/palinode/pull/217)); [Vardhman Gupta](https://github.com/Kaap10) ([PR #215](https://github.com/phasespace-labs/palinode/pull/215)).
+
+### Added
+
+- Persistent capture and recall controls can pause future API-routed capture or
+  recall requests, including explicit MCP/API calls. Project and path exclusions
+  apply only to automatic capture and recall; they do not block explicit saves,
+  recall or other user/API input. CLI and API status report the effective
+  control state and redacted destinations; MCP status also reports the resolved
+  project, policy version and provenance. Pausing does not delete stored history,
+  cancel in-flight work, remove delivered context or create an access-control
+  boundary, and status/history reads remain available while paused.
+- Explicit lexical retrieval provides service-free first recall before an
+  embedding endpoint is configured. The mode uses indexed FTS5 content, preserves
+  visibility filtering and reports its retrieval mode instead of silently
+  presenting keyword results as semantic search.
+- The canonical first-use path now includes executable-resolved native MCP config
+  for Claude Code, Codex, Continue and Desktop, a visible inspector walkthrough,
+  Git history for individual memories, and tested Claude/Codex fresh-session
+  correction journeys. The included participant kit is a protocol; it does not
+  claim that unfamiliar-user observations have occurred.
+
+- `palinode doctor` reports whether the last consolidation pass worked, and how
+  many in a row have not. Every real pass (cron, `palinode consolidate`,
+  `POST /consolidate`) now appends its outcome — start, status, failed
+  projects, lookback, the exception if it raised — to the activity gate's
+  state file under `runs` (last 30 per mode; dry runs are not recorded). The
+  new `consolidation_last_run` check reads that history and reports, per mode,
+  the last run and the consecutive-failure count derived from it. The
+  thresholds follow the nightly's own lookback: a streak as long as the
+  lookback drops a day of notes from every window (the Sunday weekly's window
+  does not reach it), so that is the error, and one short of it is the warn —
+  on the shipped 1-day default a single failure is already an error; on a
+  `--days 3` host it is warn at two, error at three. A nightly that failed at the token cap
+  was previously visible only to someone reading `consolidation.log` by hand.
+  Green results still carry the facts (last status, time, `--days`, hours since
+  the last success per mode); no state file, an unreadable one, or one from
+  before outcomes were recorded reports info with the reason, never a failure.
+- `palinode doctor` reports the consolidation lookback that actually runs.
+  `consolidation_schedule_effective` reads the cron entries invoking
+  `palinode.consolidation.cron` (`/etc/cron.d`, `/etc/crontab`, `crontab -l`),
+  parses their `--days N` and schedule, and prints the effective value for the
+  nightly and weekly passes whether or not it matches
+  `consolidation.nightly.lookback_days` / `consolidation.lookback_days` — a
+  `--days` argument silently overrides the configured value, and one host ran a
+  3-day nightly against a declared 1 for months, which made a failed run get
+  diagnosed against a scope it never had. A mismatch warns and names both
+  numbers and the winner; no cron entry, an unreadable crontab, an unparseable
+  line, or a non-Linux host reports not-applicable with the reason rather than
+  failing. Reports only — it never edits cron or the config.
 - **Hosted OpenAI-compatible embedding endpoints support bearer authentication
   and configurable paths.** Set `PALINODE_EMBEDDING_API_KEY` (or
   `PALINODE_EMBEDDING_API_KEY_FILE`) for `Authorization: Bearer` on the
@@ -20,7 +89,96 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
 
 ### Changed
 
+- Automatic transcript capture is opt-in across supported hooks and plugins.
+  Fresh `palinode init` runs leave Claude hooks uninstalled unless `--hook` is
+  selected; OpenClaw defaults `autoCapture` to false; shared plugin bindings
+  require their capture flag. Existing Claude hook installations are preserved
+  on rerun, while generated guidance distinguishes deliberate saves from
+  transcript-derived fallback capture.
+- Generated stdio client configuration can pin a project with
+  `mcp-config --stdio --project <slug>`. That scope is carried through session
+  initialization and linked worktrees; HTTP clients continue to share their
+  server process and should send an explicit project when the server cannot see
+  the caller's checkout.
+
+- Separate first-use participant prompts from observer answers, align the task
+  order and timer boundaries, and cite a saved concurrent-writers requirement
+  as support for the correction example. The retired SQLite decision remains
+  history; an exact quote does not establish that a claim is true.
+
+- Position the planned v0.21 first-use work around inspectable, correctable
+  project memory; align concise product descriptions and durable release links.
+  This documentation change does not claim a public release, automatic behavior
+  in every client, or completion of the planned human first-use study.
+
+- **The weekly consolidation lookback default is now 3 days, matching the crontab every other source already documented.** `consolidation.lookback_days` defaulted to 7 while `docs/OPERATIONS.md`'s example crontab, `palinode.consolidation.cron`'s own docstring example, and the dogfood host all ran `--days 3`. Since a `--days N` cron argument silently overrides the configured value, the default was the one number nobody was running, and anyone reasoning about consolidation scope from the config was reading fiction. Aligned downward rather than upward on purpose: raising the documented installs to 7 would widen every weekly pass's LLM context on no evidence that 3 loses notes, days after a pass failed by exceeding its token cap. The weekly is a deep clean over recent notes, not a safety net for old ones — a note the nightly never consolidated is not revisited once it leaves the window either, and `docs/OPERATIONS.md` now says so where the crontab is copied from.
+
+- **User trust throughout the planned v0.21–v0.24 milestones.** Add explicit acceptance for capture/destination/pause controls, privacy boundaries, forgetting and recovery, resistance to poisoned memory, deliberate sharing and migration safeguards. First-use and follow-up studies assess comprehension and control alongside usefulness. This updates planning and issue acceptance; it does not ship those capabilities.
+- The roadmap now sequences developer first use, correction and recall quality,
+  project handoffs, and evidence-gated schema work. It links to the current release
+  instead of maintaining a separate version number, and the contribution guide
+  aligns adoption with useful, inspectable project memory. These are planning and
+  documentation changes; runtime capabilities and study targets remain unfulfilled
+  until their release acceptance is demonstrated.
+
+- The first-use study protocol (`docs/FIRST-USE-STUDY.md`) and participant
+  script (`docs/FIRST-USE-PARTICIPANT-CARDS.md`) are now self-run rather than
+  observed: participants run the fictional Harbor Notes journey alone and
+  report through a public issue form, timing is read back from the memory
+  store's Git log and retrieval audit log, and comprehension answers are
+  written and scored afterwards. The evidence class is stated in the
+  protocol as self-reported and unassisted by declaration; the study remains
+  NOT RUN with zero participants.
+
 ### Fixed
+
+- Automatic core and trigger recall, inspector discovery, lint findings and
+  aggregate counts now apply the live visibility contract before surfacing
+  records. Exact-path reads and privileged maintenance/audit surfaces retain
+  their documented broader access; visibility labels are discovery controls,
+  not per-user authorization or secure erasure.
+- Watcher debounce/coalescing tests use deterministic barriers instead of a
+  wall-clock race, and the public macOS lane now exercises the contributor path.
+- Text-mode doctor output appears as checks complete while JSON remains one
+  parseable document. Foreground watcher identity is store-scoped, so diagnostics
+  no longer confuse a watcher for another store with the candidate's watcher.
+
+- Recognize the foreground watcher's store-scoped runtime identity in `doctor`
+  and give filesystem-specific advice when its database discovery scan times
+  out. Restart an older watcher to establish the new identity record.
+- The inspector ignores generated footer headings when choosing memory titles
+  and opens actual read-only commit history from its saved-commit link.
+- A save denied by paused capture explains the control state and shows how to
+  resume capture alone; it does not change controls or retry automatically.
+
+- Project resolution now shares one implementation across ambient CLI/MCP
+  search, startup priming and session-end. Git origin/common-checkout identity
+  keeps linked worktrees and subdirectories on their repository's project;
+  configured mappings and explicit overrides retain precedence. Ambient
+  disablement now applies to prime and session-end too. Startup digests show
+  the resolution basis and whether visible current records recognize the
+  project, so an empty inferred scope is distinguishable from a known project.
+  Explicit `project/<slug>` session-end inputs also address the same status
+  file as bare slugs. Remote API callers should pass an explicit project when
+  their checkout is unavailable to the host.
+- `mcp-config --stdio` resolves the intended installation's executable so editors
+  can launch without an activated shell. Select Claude Code, Codex, Continue or
+  Desktop config with `--editor`; generation preserves connection settings,
+  remains read-only and explains where to merge the client-native fragment.
+  Missing or ambiguous executables fail actionably, and interactive previews
+  and diagnostics redact credentials.
+
+- `palinode worktree-reconcile` no longer uses `os.kill(pid, 0)` to test
+  whether a worktree's owning process is alive on Windows, where that call can
+  signal or terminate the process. It now uses a non-signalling `OpenProcess` /
+  `WaitForSingleObject` query with immediate error capture, and treats anything
+  it cannot determine as alive
+  ([#212](https://github.com/phasespace-labs/palinode/issues/212)).
+
+- User-facing package string constants are now checked for unfollowable bare
+  issue references, extending the earlier diagnostics-only guard while keeping
+  test fixtures out of scope ([public PR #218](https://github.com/phasespace-labs/palinode/pull/218),
+  thanks [@chiruu12](https://github.com/chiruu12)).
 
 - Failed writes to a read-only destination on Windows clean up the temporary
   file without changing the destination's contents or permissions. Cleanup

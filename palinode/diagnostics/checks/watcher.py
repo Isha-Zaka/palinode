@@ -7,22 +7,20 @@ PALINODE_DIR / db_path.
 Platform notes
 --------------
 On Linux:
-  - watcher_alive: probes ``systemctl is-active`` on the system manager first
-    and ``systemctl --user is-active`` second, for both shipped unit names
-    (``palinode-watcher.service`` and ``palinode-indexer.service``; the
-    installer's ``WATCHER_UNIT_NAME`` override is honoured when exported).
-    Falls back to scanning ``ps -ef`` for a process whose command line
-    contains ``palinode.indexer.watcher``. The unit-name and manager probing
-    lives in ``palinode.core.systemd_units`` so that ``palinode stop`` cannot
-    disagree with this check about which unit the host runs.
+  - watcher_alive: validates the configured store's runtime identity first,
+    then probes ``systemctl is-active`` on the system and ``--user`` managers
+    for shipped unit names. The unit-name and manager probing lives in
+    ``palinode.core.systemd_units`` so that ``palinode stop`` cannot disagree
+    with this check about which unit the host runs.
   - watcher_indexes_correct_db: reads ``/proc/<pid>/environ`` for the watcher
     PID to compare its PALINODE_DIR against the configured value. This catches
     the case where the watcher is restarted after a directory rename but still
     has the old PALINODE_DIR in its environment.
 
 On macOS:
-  - watcher_alive: scans ``ps -ef`` for the watcher process because no launchd
-    unit is shipped yet.
+  - watcher_alive: validates the configured store's runtime identity. No
+    global ``ps`` process-name scan is accepted, because it cannot establish
+    that the watcher belongs to this store and foreground children are spawn_main.
   - watcher_indexes_correct_db: /proc is not available on macOS, so this check
     returns severity=info with a "not supported on macOS" message.  Process
     env can be approximated via ``ps -Eww -p <pid>`` but that is not portable
@@ -31,6 +29,8 @@ On macOS:
 """
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -44,6 +44,7 @@ from palinode.diagnostics.registry import register
 from palinode.diagnostics.types import CheckResult, DoctorContext
 
 _WATCHER_MODULE = "palinode.indexer.watcher"
+_WATCHER_IDENTITY_RELATIVE_PATH = ".palinode/watcher.json"
 
 
 # ---------------------------------------------------------------------------
@@ -51,12 +52,75 @@ _WATCHER_MODULE = "palinode.indexer.watcher"
 # ---------------------------------------------------------------------------
 
 
-def _find_watcher_pid() -> int | None:
+def _watcher_identity_path(ctx: DoctorContext) -> Path:
+    return Path(ctx.config.memory_dir).expanduser().resolve() / _WATCHER_IDENTITY_RELATIVE_PATH
+
+
+def _watcher_identity_path_is_safe(ctx: DoctorContext) -> bool:
+    """Return whether the configured store's identity path is not symlinked."""
+    identity_path = _watcher_identity_path(ctx)
+    return not identity_path.parent.is_symlink() and not identity_path.is_symlink()
+
+
+def _find_watcher_identity_pid(ctx: DoctorContext) -> int | None:
+    """Return the live PID recorded by a watcher for *ctx*'s exact store.
+
+    ``palinode start`` uses a multiprocessing child, whose command line is a
+    generic ``spawn_main`` invocation rather than the watcher module. The
+    watcher therefore publishes an internal, store-scoped identity record.
+    Validate the path, PID, and OS process start token before trusting it: a
+    leftover file, PID reuse, or a record for another store is not health.
+    """
+    identity_path = _watcher_identity_path(ctx)
+    if not _watcher_identity_path_is_safe(ctx):
+        return None
+    try:
+        with identity_path.open(encoding="utf-8") as handle:
+            identity = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(identity, dict):
+        return None
+    pid = identity.get("pid")
+    start_token = identity.get("process_start")
+    recorded_store = identity.get("memory_dir")
+    configured_store = str(Path(ctx.config.memory_dir).expanduser().resolve())
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not isinstance(start_token, str)
+        or not start_token
+        or not isinstance(recorded_store, str)
+        or os.path.realpath(recorded_store) != configured_store
+    ):
+        return None
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or result.stdout.strip() != start_token:
+        return None
+    return pid
+
+
+def _find_watcher_pid(ctx: DoctorContext | None = None) -> int | None:
     """Return the PID of the running watcher process, or None if not found.
 
-    Uses ``ps -ef`` to scan all processes for one whose command line contains
-    ``palinode.indexer.watcher``.  Works on both Linux and macOS.
+    With *ctx*, only a store-scoped runtime identity is accepted. This
+    recognizes the multiprocessing child used by ``palinode start`` and avoids
+    accepting a watcher that belongs to another store. The legacy module scan
+    is retained only for callers without a configured-store context.
     """
+    if ctx is not None:
+        return _find_watcher_identity_pid(ctx)
     try:
         result = subprocess.run(
             ["ps", "-ef"],
@@ -111,14 +175,37 @@ def _read_proc_environ(pid: int) -> dict[str, str]:
 def watcher_alive(ctx: DoctorContext) -> CheckResult:
     """Verify the palinode-watcher process is currently running.
 
-    On Linux: probes ``systemctl is-active`` on the system manager first, then
-    ``--user``, accepting either shipped unit name. Falls back to a ``ps -ef``
-    scan when no unit is active (or systemctl is unavailable), and only then
-    suggests installing a unit.
-
-    On macOS: only ``ps -ef`` scan is used. There is no launchd unit yet, so
-    the ps scan is best-effort.
+    On every platform, a current watcher runtime identity is the only
+    process-level liveness proof accepted for the configured store. Linux also
+    accepts an active shipped systemd unit as a lifecycle signal when no
+    identity has been published yet. macOS has no launchd unit and does not
+    use a global process-name scan, because that cannot prove store association.
     """
+    identity_path = _watcher_identity_path(ctx)
+    identity_pid = _find_watcher_identity_pid(ctx)
+    if identity_pid is not None:
+        return CheckResult(
+            name="watcher_alive",
+            severity="error",
+            passed=True,
+            message=f"Watcher process found for configured store (PID {identity_pid}).",
+            remediation=None,
+        )
+    if identity_path.exists() or identity_path.is_symlink() or identity_path.parent.is_symlink():
+        return CheckResult(
+            name="watcher_alive",
+            severity="error",
+            passed=False,
+            message=(
+                f"Watcher identity at {identity_path} is stale, malformed, or belongs "
+                "to a different store; no watcher was accepted."
+            ),
+            remediation=(
+                "Stop the stale process if it is still running, then restart the watcher "
+                "with the configured PALINODE_DIR."
+            ),
+        )
+
     is_linux = sys.platform.startswith("linux")
 
     # Linux: try systemctl first — system manager, then --user
@@ -134,33 +221,16 @@ def watcher_alive(ctx: DoctorContext) -> CheckResult:
                     message=f"systemctl reports {manager} unit {active} is active",
                     remediation=None,
                 )
-        # No unit active under either manager; check via ps for non-unit installs
+        # No unit is active. A process-name scan cannot establish that an old
+        # standalone process belongs to this configured store, so do not accept it.
         unit_list = ", ".join(units)
-        pid = _find_watcher_pid()
-        if pid is not None:
-            return CheckResult(
-                name="watcher_alive",
-                severity="error",
-                passed=True,
-                message=(
-                    f"Watcher process found via ps (PID {pid}); "
-                    f"no systemctl unit ({unit_list}) is active under the "
-                    f"system or user manager — "
-                    f"consider installing the unit for auto-restart on reboot."
-                ),
-                remediation=(
-                    "Install the systemd unit with the templates under "
-                    "'deploy/systemd/'."
-                ),
-            )
-        # Not found by either method
         return CheckResult(
             name="watcher_alive",
             severity="error",
             passed=False,
             message=(
                 f"Watcher is not running: no unit ({unit_list}) is active under "
-                f"the system or user manager and no matching process found in ps."
+                f"the system or user manager and no store-scoped watcher identity found."
             ),
             remediation=(
                 "Start the watcher: 'systemctl --user start palinode-watcher' "
@@ -169,26 +239,19 @@ def watcher_alive(ctx: DoctorContext) -> CheckResult:
             ),
         )
 
-    # macOS / other: ps-only scan
-    pid = _find_watcher_pid()
-    if pid is not None:
-        return CheckResult(
-            name="watcher_alive",
-            severity="error",
-            passed=True,
-            message=f"Watcher process found via ps (PID {pid}).",
-            remediation=None,
-        )
+    # macOS / other: a global ps substring cannot associate a process with this
+    # store, and foreground multiprocessing children do not carry a module name.
     return CheckResult(
         name="watcher_alive",
         severity="error",
         passed=False,
         message=(
-            "No palinode-watcher process found in ps output. "
-                "(macOS: no launchd unit yet, so this is a ps-only check.)"
+            "No store-scoped watcher identity found. "
+                "(macOS: a global ps scan cannot prove the watcher uses this store.)"
         ),
         remediation=(
-            "Run 'palinode-watcher' in a terminal to start the watcher. "
+            "Run 'palinode start' or 'palinode-watcher' with the configured "
+            "PALINODE_DIR to start the watcher. "
             "On macOS, consider adding it to your login items or a launchd plist."
         ),
     )
@@ -224,8 +287,19 @@ def watcher_indexes_correct_db(ctx: DoctorContext) -> CheckResult:
             remediation=None,
         )
 
-    # Find watcher PID
-    pid = _find_watcher_pid()
+    # A current identity proves both liveness and store association. For a
+    # legacy Linux service without one, inspect its module process only so the
+    # /proc environment comparison below can reject a wrong-store watcher.
+    # Never override a known stale/malformed identity record with that global
+    # fallback.
+    pid = _find_watcher_pid(ctx)
+    identity_path = _watcher_identity_path(ctx)
+    if (
+        pid is None
+        and _watcher_identity_path_is_safe(ctx)
+        and not identity_path.exists()
+    ):
+        pid = _find_watcher_pid()
     if pid is None:
         return CheckResult(
             name="watcher_indexes_correct_db",

@@ -11,8 +11,6 @@ reindex / auto-summary observability state dicts.
 from __future__ import annotations
 
 import logging
-import os
-import re
 import threading
 from datetime import UTC, datetime
 from typing import Any
@@ -44,20 +42,11 @@ def _safe_500(e: Exception, context: str = "Internal error") -> HTTPException:
 
 
 def _project_from_cwd(cwd: str | None) -> str | None:
-    """Derive a project slug from a CWD path's basename.
+    """Compatibility slug view of the common project resolver."""
+    from palinode.core.context_prime import resolve_context
 
-    Mirrors the slug rules used by `palinode init` so the slug a session
-    self-reports matches the slug that scaffolding chose. Returns None if
-    cwd is None / empty / produces an unusable slug.
-    """
-    if not cwd:
-        return None
-    base = os.path.basename(os.path.normpath(cwd))
-    if not base:
-        return None
-    s = re.sub(r"[^a-zA-Z0-9_-]+", "-", base.strip().lower())
-    s = re.sub(r"-+", "-", s).strip("-")
-    return s or None
+    project = resolve_context(cwd=cwd).project
+    return project.removeprefix("project/") if project else None
 
 
 # ── Reindex concurrency guard ─────────────────────────────────────────

@@ -185,7 +185,7 @@ async def test_streaming_stops_reading_once_over_limit():
     # The crux: the oversized tail was never read, and the app never completed.
     assert handed_out == 2, (
         f"middleware read {handed_out} chunks; it must stop at the chunk that "
-        "crosses the limit (2) and never request the oversized tail (#297)"
+        "crosses the limit (2) and never request the oversized tail"
     )
     assert downstream_completed is False, (
         "downstream app must never see the full oversized body"

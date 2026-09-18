@@ -167,6 +167,59 @@ def test_status_health_doctor_report_version(client):
         )
 
 
+def test_status_exposes_redacted_server_disclosure(client, monkeypatch, tmp_path):
+    """The API, rather than a remote CLI caller, owns destination disclosure."""
+    from palinode.core.config import config
+
+    monkeypatch.setattr(config, "memory_dir", str(tmp_path))
+    monkeypatch.setattr(config.embeddings.primary, "url", "https://embed:token@example.test/v1?secret=x")
+    monkeypatch.setattr(config.auto_summary, "enabled", True)
+    monkeypatch.setattr(config.auto_summary, "ollama_url", "https://summary:token@example.test/v1?secret=x")
+    monkeypatch.setattr(config.auto_summary, "llm_fallbacks", [
+        {"model": "summary-backup", "url": "https://summary-fallback:token@example.test/v1?secret=x"},
+    ])
+    monkeypatch.setattr(config.consolidation, "llm_url", "ssh://llm:token@[2001:db8::5]/v1?secret=x")
+    monkeypatch.setattr(config.consolidation, "enabled", False)
+    monkeypatch.setattr(config.consolidation, "llm_fallbacks", [
+        {"model": "consolidation-backup", "url": "https://consolidation-fallback:token@example.test/v1?secret=x"},
+    ])
+    monkeypatch.setattr(config.ingestion.transcriptor, "url", "https://transcriptor:token@example.test/v1?secret=x")
+    monkeypatch.setattr(config.git, "auto_push", False)
+
+    def fake_run(argv, **kwargs):
+        if argv[:3] == ["git", "-C", str(tmp_path)]:
+            return mock.Mock(
+                stdout="origin\thttps://git:token@example.test/store.git?private=x (fetch)\n",
+                returncode=0,
+            )
+        return mock.Mock(stdout="0\n", returncode=0)
+
+    with (
+        mock.patch("httpx.get"),
+        mock.patch("palinode.core.git_tools.commit_count", return_value={"total_commits": 0, "summary": ""}),
+        mock.patch("subprocess.run", side_effect=fake_run),
+    ):
+        response = client.get("/status")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    rendered = response.text
+    assert body["memory_dir"] == str(tmp_path)
+    assert body["embedding_url"] == "https://***@example.test/v1?***"
+    assert body["consolidation_url"] == "ssh://***@[2001:db8::5]/v1?***"
+    assert body["auto_summary_enabled"] is True
+    assert body["auto_summary_primary_url"] == "https://***@example.test/v1?***"
+    assert body["auto_summary_llm_fallbacks"] == ["https://***@example.test/v1?***"]
+    assert body["consolidation_enabled"] is False
+    assert body["consolidation_llm_fallbacks"] == ["https://***@example.test/v1?***"]
+    assert body["transcriptor_url"] == "https://***@example.test/v1?***"
+    assert body["git_remotes"] == ["origin https://***@example.test/store.git?*** (fetch)"]
+    assert body["git_push_policy"] == "manual only (git.auto_push=false)"
+    assert "token" not in rendered
+    assert "secret=x" not in rendered
+    assert "private=x" not in rendered
+
+
 def test_health_counts_match_status_counts(client):
     """/health and /status report the same chunk count after inserts.
 

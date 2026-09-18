@@ -21,6 +21,7 @@ from fastapi import APIRouter
 from palinode import __version__
 from palinode.core import store, git_tools
 from palinode.core.config import config
+from palinode.core.disclosure import runtime_disclosure
 from palinode.core.ollama_client import OllamaRole
 
 from palinode.api._util import _auto_summary_state, _reindex_state, _utc_now
@@ -57,6 +58,9 @@ def status_api() -> dict[str, Any]:
     # name). Deferred import avoids the server↔routers cycle at module load.
     import palinode.api.server as _srv
     stats: dict[str, Any] = dict(store.get_stats())
+    # Server-owned configuration disclosure. This runs beside the actual store,
+    # rather than asking a remote CLI caller to inspect an untrusted memory_dir.
+    stats.update(runtime_disclosure())
 
     # Deployed package version — single source of truth is
     # palinode.__version__ (importlib.metadata), the same value CLI --version
@@ -96,12 +100,15 @@ def status_api() -> dict[str, Any]:
 
     db.close()
 
-    stats["hybrid_search"] = config.search.hybrid_enabled
+    from palinode.core.retrieval import diagnostics
+    stats["retrieval"] = diagnostics()
+    lexical = config.search.retrieval_mode == "lexical"
+    stats["hybrid_search"] = not lexical and config.search.hybrid_enabled
     stats["associative_capability"] = stats["total_entities"] > 0
 
     # Liveness via the centralized client's ping (raw GET, no circuit breaker).
     _ollama_client = _srv.get_ollama_client()
-    ollama_reachable = _ollama_client.ping(OllamaRole.EMBED)
+    ollama_reachable = None if lexical else _ollama_client.ping(OllamaRole.EMBED)
     stats["ollama_reachable"] = ollama_reachable
 
     # `ollama_reachable` only means the daemon answered a GET — it says nothing
@@ -111,7 +118,7 @@ def status_api() -> dict[str, Any]:
     # False — so /status can no longer be falsely green (keyword-only mode is the
     # actual state). Skip the probe entirely when the daemon isn't even reachable.
     stats["embed_functional"] = (
-        _embed_functional_cached(_ollama_client) if ollama_reachable else False
+        None if lexical else (_embed_functional_cached(_ollama_client) if ollama_reachable else False)
     )
 
     # Per-role Ollama traffic metrics (Phase 5): p50/p95/error-rate over a

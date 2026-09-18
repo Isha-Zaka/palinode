@@ -28,6 +28,14 @@ On-demand runs (``palinode consolidate`` / ``dream``, ``POST /consolidate``,
 the MCP tool) bypass the gate — an operator asking for a pass has already made
 the decision the gate exists to make. ``--respect-gate`` opts a manual
 invocation into the same policy, which is what a hand-rolled scheduler wants.
+
+The same state file also keeps a short **outcome history** per mode
+(:func:`record_outcome`), written for every real pass whether it succeeded,
+came back ``partial`` or raised. The gate's clock is stamped only on success,
+so on its own it cannot say *that a pass failed* — and a nightly that failed
+at the token cap was found by someone reading the cron log by hand.
+``palinode doctor`` reads the history to report the last outcome and the
+length of any failure streak; nothing in the gate's decision reads it.
 """
 
 from __future__ import annotations
@@ -36,6 +44,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -50,6 +59,12 @@ Mode = Literal["weekly", "nightly"]
 #: Sits beside the run lock in the store's git-ignored operational directory,
 #: so gate bookkeeping never becomes memory content.
 STATE_RELATIVE_PATH = Path(".palinode") / "consolidation-state.json"
+
+#: Outcome records kept per mode under the state file's ``runs`` key. Doctor
+#: derives the failure streak by walking back from the newest record, so the
+#: history only has to be longer than any streak worth reporting; a month of
+#: nightlies is plenty, and keeps the file a few KB.
+RUN_HISTORY_LIMIT = 30
 
 #: The one heading ``POST /session-end`` writes into the day's daily note.
 #: The dash is an em dash today; the alternatives are accepted so a cosmetic
@@ -310,6 +325,71 @@ def record_run(
         logger.warning(
             "Could not record consolidation run path=%s error=%r", path, error
         )
+
+
+def record_outcome(
+    mode: Mode,
+    *,
+    started_at: datetime,
+    finished_at: datetime,
+    status: str,
+    failed_projects: Sequence[str] = (),
+    lookback_days: int | None = None,
+    error: str | None = None,
+    memory_dir: str | os.PathLike[str] | None = None,
+) -> None:
+    """Append one pass's outcome to the state file's per-mode history.
+
+    Unlike :func:`record_run`, this is written for *every* real pass — a
+    ``partial`` and a pass that raised are exactly the records the history
+    exists to hold. ``status`` is the runner's own summary status (``success``,
+    ``partial``, ``no_new_notes``, ``no notes found``) or ``error`` when the
+    pass raised, with ``error`` naming the exception. The history is trimmed
+    to :data:`RUN_HISTORY_LIMIT` newest-last, and lives under its own ``runs``
+    key because ``record_run`` replaces ``modes[mode]`` wholesale.
+
+    Nothing in the gate reads this back; it is bookkeeping for ``palinode
+    doctor``, and like the clock it must never fail the pass it describes.
+    """
+    path = state_path(memory_dir)
+    state = _read_state(path)
+    runs = state.get("runs")
+    if not isinstance(runs, dict):
+        runs = {}
+    history = runs.get(mode)
+    if not isinstance(history, list):
+        history = []
+    history.append(
+        {
+            "started_at": started_at.isoformat().replace("+00:00", "Z"),
+            "finished_at": finished_at.isoformat().replace("+00:00", "Z"),
+            "status": status,
+            "failed_projects": list(failed_projects),
+            "lookback_days": lookback_days,
+            "error": error,
+        }
+    )
+    runs[mode] = history[-RUN_HISTORY_LIMIT:]
+    state["runs"] = runs
+    try:
+        _write_state(path, state)
+    except OSError as err:
+        logger.warning(
+            "Could not record consolidation outcome path=%s error=%r", path, err
+        )
+
+
+def run_history(
+    mode: Mode, memory_dir: str | os.PathLike[str] | None = None
+) -> list[dict[str, Any]]:
+    """The recorded outcomes for ``mode``, oldest first; empty when none."""
+    runs = _read_state(state_path(memory_dir)).get("runs")
+    if not isinstance(runs, dict):
+        return []
+    history = runs.get(mode)
+    if not isinstance(history, list):
+        return []
+    return [entry for entry in history if isinstance(entry, dict)]
 
 
 def status(memory_dir: str | os.PathLike[str] | None = None) -> dict[str, Any]:

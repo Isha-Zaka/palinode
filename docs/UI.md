@@ -54,6 +54,127 @@ ssh -L 6340:127.0.0.1:6340 user@memory-host
 Then open `http://127.0.0.1:6340/ui/` in your local browser. This does not make
 the UI listen on the remote machine's LAN interface.
 
+## First decision: inspect, correct, and retire
+
+The inspector is a read-only way to audit a memory after an agent or the CLI
+has saved it. This small, fictional example uses the `harbor-notes` project.
+It deliberately uses [explicit lexical retrieval](lexical-retrieval.md), so
+the first-use path needs no embedding, chat, or consolidation service. Use the
+[canonical Quickstart](QUICKSTART.md) to select and install the source checkout
+and create the disposable store; this section is the inspector view of that
+same walkthrough, not a second mandatory setup.
+
+In a disposable local store, set the server mode before starting it. In a
+second terminal using the same installed Palinode client, save the initial
+decision through the existing CLI:
+
+```bash
+# Terminal 1: reuse Quickstart's PALINODE_BIN and PALINODE_DIR; this keeps running.
+export PALINODE_RETRIEVAL_MODE=lexical
+export PALINODE_API_HOST=127.0.0.1
+"$PALINODE_BIN/palinode" start
+```
+
+```bash
+# Terminal 2: reuse the same PALINODE_BIN, PALINODE_DIR, and retrieval mode.
+"$PALINODE_BIN/palinode" save \
+  'Use SQLite for the local prototype because it runs as a single-user desktop app.' \
+  --type Decision --project harbor-notes --slug harbor-notes-storage \
+  --title 'Harbor Notes storage: local prototype'
+```
+
+Open <http://127.0.0.1:6340/ui/memory/decisions/harbor-notes-storage>.
+The fact page displays the saved text and its provenance rows, including the
+source path and latest Git commit. The **Memory** page can browse the saved
+file; its search box uses the configured retrieval mode, so searching
+`harbor-notes` in this example is keyword/FTS retrieval rather than a semantic
+claim. The inspector does not edit a memory or inject historical context into
+an agent.
+
+Use the existing read and Git-history commands when you need the complete
+source or commit evolution:
+
+```bash
+"$PALINODE_BIN/palinode" read decisions/harbor-notes-storage.md --meta
+"$PALINODE_BIN/palinode" history decisions/harbor-notes-storage.md --detail full
+```
+
+The linked **Saved** commit in the provenance panel opens the inspector's
+existing history route, which currently returns to the fact detail. The CLI
+history command above is the supported full-diff view.
+
+Before correcting the storage decision, save a UTC neighbor that must remain
+unchanged and a separate requirement supporting the hosted-service rationale.
+Then save an explicit correction with a supersession link, a typed support link
+to that requirement, and a historical quote from the initial decision. Do not
+silently alter the original decision:
+
+```bash
+"$PALINODE_BIN/palinode" save \
+  'Store event timestamps in UTC.' \
+  --type Decision --project harbor-notes --slug harbor-notes-timestamps
+
+"$PALINODE_BIN/palinode" save \
+  'The shared hosted service requires transactional coordination for concurrent writers.' \
+  --type Decision --project harbor-notes --slug harbor-notes-concurrent-write-requirement
+
+"$PALINODE_BIN/palinode" save \
+  'Use PostgreSQL for the shared hosted service because concurrent writers need transactional coordination.' \
+  --type Decision --project harbor-notes --slug harbor-notes-storage-shared \
+  --cite 'decisions/harbor-notes-storage.md::Use SQLite for the local prototype because it runs as a single-user desktop app.' \
+  --cite 'decisions/harbor-notes-concurrent-write-requirement.md::The shared hosted service requires transactional coordination for concurrent writers.' \
+  --backed-by decisions/harbor-notes-concurrent-write-requirement \
+  --metadata-json '{"supersedes":"decisions/harbor-notes-storage.md"}'
+
+"$PALINODE_BIN/palinode" archive decisions/harbor-notes-storage.md \
+  --superseded-by decisions/harbor-notes-storage-shared.md \
+  --reason 'The shared hosted service needs concurrent-write coordination.'
+```
+
+![The fictional Harbor Notes inspector after the initial SQLite decision has been archived, with its source path and Saved commit in the provenance panel.](images/inspector-harbor-notes.png)
+
+The screenshot is taken **after** the retirement above: it shows the archived
+initial SQLite decision and its Saved commit, not a state before the save steps.
+`archive` retires the old memory from default recall and records the reason in
+its audit history, but it is not permanent erasure: the original and its Git
+history remain recoverable. Start a fresh session and search for the PostgreSQL
+decision, then inspect its source and the UTC neighbor:
+
+```bash
+"$PALINODE_BIN/palinode" prime --project harbor-notes
+"$PALINODE_BIN/palinode" search 'PostgreSQL shared hosted service'
+"$PALINODE_BIN/palinode" read decisions/harbor-notes-storage-shared.md --meta
+"$PALINODE_BIN/palinode" read decisions/harbor-notes-timestamps.md --meta
+```
+
+The new decision's metadata records its supersession, the separately saved
+concurrent-writers support, and the preserved SQLite history reference; the UTC
+neighbor remains a separate unchanged file. The SQLite quote proves that the
+saved text matches the quoted passage, not that the old SQLite rationale
+supports PostgreSQL or that either claim is true. Likewise, an unresolved
+conflict such as north versus south deployment region stays unresolved until
+explicit evidence supports a change; neither the inspector nor an archive
+command should pick a winner.
+
+### Visibility and lifecycle limits
+
+The no-token demo described here is loopback-only, not a browser login flow.
+On a token-enabled API the browser must already send a bearer token
+on every UI request; the inspector has no sign-in form. Keep the loopback guard
+in place and use the SSH-forwarding pattern above instead of exposing `/ui/`.
+
+The Memory and Search views are discovery views and apply the configured
+visibility rules. A known, validated detail path and provenance/history can be
+read under the existing API contract, while Diffs and Compaction are privileged
+audit views that can expose broader Git history. Scope labels are not
+per-person authentication or encryption; see the [privacy and visibility
+contract](PRIVACY.md) before sharing a store, backup, or token.
+
+Archiving is lifecycle state, not a promise to remove every historical copy.
+It does not erase Git history, backups, clones, or an already-derived index.
+Capture, pause, and exclusion controls are separate future work; this guide
+does not claim they are available in the inspector.
+
 ## Views
 
 | View | Path | What it answers |
@@ -97,10 +218,11 @@ The browsable list omits operational or special-purpose paths: `daily/`,
 siblings ending in `-history.md`. History files remain available from the
 Compaction view.
 
-Search is different from browsing: it uses the existing hybrid search path and
-therefore needs an index and reachable embedding backend. If that backend is
-unavailable, the page keeps working and displays a `search unavailable`
-notice instead of failing the whole view.
+Search is different from browsing: it needs an index. In explicit lexical mode
+it uses FTS and needs no embedding endpoint; in hybrid mode it also needs the
+configured embedding endpoint. If hybrid's endpoint is unavailable, the page
+keeps working and displays a `search unavailable` notice instead of failing the
+whole view. Lexical mode is explicit, not a silent hybrid fallback.
 
 Each search hit shows two labels the browse list does not: `index matches
 source` / `⚠ index stale` (whether the indexed chunk still agrees with the file
@@ -211,7 +333,7 @@ separate authentication rules.
 | SQLite index | chunk count, search, recent memory, recall statistics | File browsing still works; search/recent/index metrics are empty or degraded. |
 | Git repository | recent changes, compaction commits, saved lineage | Those sections show no history; memory content still renders. |
 | Lint pass | health cards and quality queues | The affected request cannot build its health context. |
-| Embedding backend | semantic/hybrid search queries | Search shows a soft unavailable notice; other views remain usable. |
+| Embedding backend | semantic/hybrid search queries | Only hybrid search shows a soft unavailable notice; lexical FTS search and other views remain usable. |
 
 ## Installation footprint
 
@@ -235,7 +357,7 @@ today.
 | HTTP 403 with “loopback-only” | The API is configured with a non-loopback host. Restart it with `PALINODE_API_HOST=127.0.0.1`; public-intent and unauthenticated opt-out flags do not override this guard. |
 | HTTP 401 | Bearer authentication is enabled. The UI has no login page; ensure the browser client supplies the header on HTML and static-asset requests. |
 | Memories exist but chunks/search/recent are empty | Start the watcher or run `palinode reindex`, then refresh. |
-| Search alone says unavailable | Check the embedding service with `palinode doctor`. File and Git views do not require embeddings. |
+| Search alone says unavailable | In hybrid mode, check the embedding service with `palinode doctor`; in lexical mode, check index readiness. File and Git views do not require embeddings. |
 | Diffs or saved lineage are empty | Confirm the memory directory is a Git repository with commits in the selected time window. |
 | Compaction is empty | No matching compaction/nightly commit exists in the selected window; viewing the page does not run one. |
 

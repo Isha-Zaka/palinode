@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Palinode · history · {{ filename }}{% endblock %}
+{% block crumb %}<a href="{{ url_for('ui_memory', file_path=file_path) }}">memory</a> / {{ file_path }} / <b>history</b>{% endblock %}
+{% block health_pill %}<span class="pill"><span class="d"></span>read-only</span>{% endblock %}
+{% block content %}
+<div class="dash history-view">
+  <a class="backlink" href="{{ url_for('ui_memory', file_path=file_path) }}">← back to memory</a>
+  <h1>Commit history</h1>
+  <p class="lede">Read-only Git history for <code>{{ file_path }}</code>, newest first (up to {{ history_limit }} commits).</p>
+
+  {% if history_unavailable %}
+  <p class="empty">Git history is currently unavailable for this memory.</p>
+  {% elif history %}
+  <ul class="flist history-list">
+    {% for commit in history %}
+    <li class="commit">
+      <div class="commit-head">
+        <span class="mono">{{ commit.hash }}</span>
+        <span class="meta">{{ commit.date }}</span>
+        <span class="commit-msg">{{ commit.message }}</span>
+      </div>
+      {% if commit.stats %}<div class="commit-stats">{{ commit.stats }}</div>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No committed history for this memory.</p>
+  {% endif %}
+</div>
+{% endblock %}

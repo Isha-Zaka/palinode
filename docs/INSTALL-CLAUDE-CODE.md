@@ -64,20 +64,17 @@ Keep them running (add to login items, launchd, or systemd as needed).
 
 ### 4. Add MCP Server to Claude Code
 
-Let the CLI wire it — the Claude Code **CLI** reads `~/.claude.json` and project-local
-`.mcp.json`, **not** Claude Desktop's `claude_desktop_config.json` (a common mix-up; that
-file is for the Desktop app):
+Run the intended installation's CLI to preview its resolved executable:
 
 ```bash
-claude mcp add palinode -- palinode-mcp
-# or print a paste-ready block instead of writing config: palinode mcp-config --stdio
+PALINODE_DIR=~/.palinode palinode mcp-config --stdio --editor claude-code
 ```
 
-On a venv install, use the absolute path so the server resolves its own deps:
-
-```bash
-claude mcp add palinode -- ~/palinode-src/venv/bin/palinode-mcp
-```
+For a venv install, invoke `"$VENV/bin/palinode"` in that command. The generator
+selects that installation's absolute `palinode-mcp` path, including paths with
+spaces. Merge the `palinode` entry into `mcpServers` in `.mcp.json` at the project
+root. Keep any existing servers. Claude Code prompts for project server approval.
+This file belongs to Claude Code; Desktop uses `claude_desktop_config.json`.
 
 Run `/mcp` in Claude Code to verify `palinode` is connected.
 

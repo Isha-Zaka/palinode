@@ -1,8 +1,7 @@
-import os
-
 import click
 
 from palinode.cli._api import api_client
+from palinode.core.context_prime import ambient_cwd
 from palinode.cli._format import console, print_result, get_default_format, OutputFormat
 
 
@@ -30,7 +29,7 @@ def prime(cwd, project, fmt):
     and open action items for the resolved scope.
     """
     try:
-        data = api_client.context_prime(cwd=cwd or os.getcwd(), project=project)
+        data = api_client.context_prime(cwd=cwd or ambient_cwd(), project=project)
         output_fmt = OutputFormat(fmt) if fmt else get_default_format()
         if output_fmt == OutputFormat.JSON:
             print_result(data, fmt=output_fmt)

@@ -1,9 +1,7 @@
-import os
 import click
 from rich.markup import escape
 from palinode.cli._api import HTTPStatusError, api_client
 from palinode.cli._format import print_result, console, OutputFormat, get_default_format
-from palinode.core.config import config
 from palinode.core.parity import CATEGORIES, MEMORY_TYPES, RESOLVE_MODES, TIERS
 from palinode.core.scoring import describe_match
 
@@ -104,21 +102,10 @@ def _resolution_lines(resolution: object) -> list[str]:
 
 
 def _cli_resolve_context() -> list[str] | None:
-    """Resolve ambient project context from CWD for CLI (ADR-008)."""
-    if not config.context.enabled:
-        return None
-    explicit = os.environ.get("PALINODE_PROJECT")
-    if explicit:
-        return [explicit] if "/" in explicit else [f"project/{explicit}"]
-    basename = os.path.basename(os.getcwd())
-    if not basename:
-        return None
-    if basename in config.context.project_map:
-        entity = config.context.project_map[basename]
-        return [entity] if "/" in entity else [f"project/{entity}"]
-    if config.context.auto_detect:
-        return [f"project/{basename}"]
-    return None
+    """List view of the common ADR-008 resolver for ambient search."""
+    from palinode.core.context_prime import ambient_cwd, resolve_context
+
+    return resolve_context(cwd=ambient_cwd()).context
 
 
 def _status_labels(res: dict) -> str:
@@ -162,7 +149,7 @@ def _status_labels(res: dict) -> str:
 @click.option(
     "--threshold",
     type=float,
-    help="Similarity threshold (0.0–1.0).  Higher = stricter; default from config.",
+    help="Vector similarity floor (0.0–1.0); ignored in lexical mode. Default from config.",
 )
 @click.option(
     "--since-days",
@@ -229,6 +216,7 @@ def _status_labels(res: dict) -> str:
 @click.option("--format", "fmt", type=click.Choice(["json", "text"]), help="Output format")
 @click.option("--score/--no-score", default=False, help="Show relevance scores")
 @click.option("--no-context", is_flag=True, help="Disable ambient context boost")
+@click.option("--diagnostics", is_flag=True, help="Include retrieval diagnostics and receipt in JSON output")
 def search(
     query,
     limit,
@@ -246,6 +234,7 @@ def search(
     fmt,
     score,
     no_context,
+    diagnostics,
 ):
     """Search memory by meaning or keyword."""
     try:
@@ -275,8 +264,12 @@ def search(
             # parses `palinode search --format json` keeps parsing it. The
             # receipt is rendered in text mode and returned in full by the
             # REST surface.
-            print_result(results, fmt=output_fmt)
+            payload = {"results": results, "receipt": receipt} if diagnostics else results
+            print_result(payload, fmt=output_fmt)
         else:
+            if receipt and receipt.get("retrieval"):
+                from palinode.core.scoring import describe_diagnostics
+                console.print(escape(describe_diagnostics(receipt["retrieval"])))
             if not results:
                 console.print("[yellow]No results found.[/yellow]")
                 return

@@ -1176,6 +1176,7 @@ def search_fts(query: str, category: str | None = None, top_k: int = 10,
 
         sql = """
             SELECT c.id, c.file_path, c.section_id, c.content, c.category, c.metadata,
+                   c.content_hash, c.importance, c.last_recalled,
                    rank AS bm25_score
             FROM chunks_fts fts
             JOIN chunks c ON c.rowid = fts.rowid
@@ -1215,6 +1216,9 @@ def search_fts(query: str, category: str | None = None, top_k: int = 10,
             "content": row["content"],
             "category": row["category"],
             "metadata": meta,
+            "content_hash": row["content_hash"],
+            "importance": row["importance"],
+            "last_recalled": row["last_recalled"],
             "score": normalized,
         })
 
@@ -1881,7 +1885,7 @@ def _mark_vectorless(fts_results: list[dict[str, Any]]) -> None:
 
 def search_hybrid(
     query_text: str,
-    query_embedding: list[float],
+    query_embedding: list[float] | None,
     category: str | None = None,
     top_k: int = 10,
     threshold: float = 0.4,
@@ -1929,6 +1933,8 @@ def search_hybrid(
             written back for the merged hit set. The visibility-widening
             re-fetch passes False so a row already counted by the initial
             pass is not incremented a second time.
+        query_embedding: None selects lexical retrieval without vector access.
+            Uses the same rank/qualifier pipeline; FTS errors propagate.
         use_fts: When False, skip the BM25 arm entirely (no ``search_fts``
             call) and rank the vector candidates alone through
             :func:`palinode.core.ranker.rank_hybrid` with an empty FTS list.
@@ -1949,12 +1955,20 @@ def search_hybrid(
     # is deliberate: this is a wide-net candidate fetch — rank_hybrid applies
     # the caller's real vector `threshold` itself before fusion (see its
     # docstring).
-    vec_results = search(query_embedding, category=category, top_k=top_k * 2, threshold=0.0,
-                         record_access=False, kind_exclude_list=kind_exclude_list)
+    vec_results = (search(query_embedding, category=category, top_k=top_k * 2, threshold=0.0,
+                          record_access=False, kind_exclude_list=kind_exclude_list)
+                   if query_embedding is not None else [])
 
     fts_results: list[dict[str, Any]] = []
     effective_hybrid_weight = hybrid_weight
-    if use_fts:
+    if query_embedding is None:
+        # Explicit lexical retrieval has no second arm to hide a broken FTS
+        # backend. Let database/programming errors reach the typed API failure.
+        fts_results = search_fts(query_text, category=category, top_k=top_k * 2,
+                                 kind_exclude_list=kind_exclude_list)
+        effective_hybrid_weight = 1.0
+        fts_threshold = 0.0
+    elif use_fts:
         try:
             fts_results = search_fts(query_text, category=category, top_k=top_k * 2,
                                      kind_exclude_list=kind_exclude_list)

@@ -198,6 +198,8 @@ class TestCheckDivergence:
 def fake_home(tmp_path, monkeypatch):
     """Redirect Path.home() to a temp directory so no real configs are read."""
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     # Also patch platform.system to get deterministic path lists
     monkeypatch.setattr(platform, "system", lambda: "Darwin")
     return tmp_path
@@ -546,10 +548,13 @@ class TestEmitBuilders:
         entry = _build_http_entry("http://h:6341/mcp/", bearer="TOK")
         assert entry["headers"]["Authorization"] == "Bearer TOK"
 
-    def test_build_stdio_entry_shape(self):
+    def test_build_stdio_entry_shape(self, monkeypatch):
+        import importlib
+        mod = importlib.import_module("palinode.cli.mcp_config")
+        monkeypatch.setattr(mod, "_resolve_executable", lambda _: "/installed/bin/palinode-mcp")
         entry = _build_stdio_entry()
-        assert entry["command"] == "palinode-mcp"
-        assert entry["env"] == {}
+        assert entry["command"] == "/installed/bin/palinode-mcp"
+        assert "PALINODE_API_HOST" in entry["env"]
 
     def test_wrap_block(self):
         block = _wrap_block({"type": "http", "url": "u"})
@@ -605,12 +610,15 @@ class TestEmitCommand:
         entry = self._block(result.output)["mcpServers"]["palinode"]
         assert entry["headers"]["Authorization"] == "Bearer SECRET"
 
-    def test_stdio_json_emits_stdio_block(self, fake_home):
+    def test_stdio_json_emits_stdio_block(self, fake_home, monkeypatch):
+        import importlib
+        mod = importlib.import_module("palinode.cli.mcp_config")
+        monkeypatch.setattr(mod, "_resolve_executable", lambda _: "/installed/bin/palinode-mcp")
         runner = CliRunner()
         result = runner.invoke(main, ["mcp-config", "--stdio", "--json"])
         assert result.exit_code == 0, result.output
         entry = self._block(result.output)["mcpServers"]["palinode"]
-        assert entry["command"] == "palinode-mcp"
+        assert entry["command"] == "/installed/bin/palinode-mcp"
         assert "type" not in entry
 
     def test_http_and_stdio_together_is_error(self, fake_home):

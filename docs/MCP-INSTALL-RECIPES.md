@@ -13,6 +13,22 @@ of [MCP-SETUP.md](MCP-SETUP.md) — those clients are covered there.
 reports which ones contain a `palinode` entry. See
 [MCP-CONFIG-HOMES.md](MCP-CONFIG-HOMES.md) for the full reference.
 
+## Generated configurations and verification status
+
+Use [client-specific generation](MCP-CONFIG-HOMES.md#generate-a-client-specific-preview)
+for Claude Code (`--editor claude-code`, JSON), Codex CLI (`--editor codex`, TOML),
+Continue (`--editor continue`, YAML), or Desktop (`--editor claude-desktop`, JSON).
+Run the command from the intended installation; its MCP executable is resolved
+automatically. Merge the emitted entry into existing settings, preserving other
+servers. Use `--http --url <MCP-URL>` for a remote endpoint.
+
+The flagship clients are Claude Code and Codex CLI. Serializer and isolated
+process tests do not establish an authenticated chat interaction. Continue and
+the additional recipes below are documented setup guidance; their UI behavior
+requires verification in the actual installed client. Bare `palinode-mcp` values
+in the illustrative recipes show the schema; use the generated absolute command
+for an installation that must launch without an activated shell.
+
 ---
 
 ## Which transport should I use?

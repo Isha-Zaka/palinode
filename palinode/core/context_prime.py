@@ -28,18 +28,24 @@ Serves every surface per ADR-010 parity:
 
 Scope discipline (the ADR's critical constraint): project-scoped rows are
 returned ONLY when a project actually resolves — explicit ``project`` arg,
-else ``cwd`` basename through ``config.context.project_map`` /
-``auto_detect`` (the same ADR-008 resolution the ambient search boost uses).
+else environment, configured mappings and git-aware ``cwd`` resolution
+(the same ADR-008 resolution the ambient search boost uses).
 With no resolvable project (e.g. Claude Desktop, which has no CWD), the
-digest degrades to core memories only, clearly labelled — it never guesses
-a project and never bleeds another project's context.
+digest degrades to core memories only, clearly labelled. An inferred project
+is labelled unrecognized until visible current records confirm it; another
+project's records never fill the empty sections.
 """
 from __future__ import annotations
 
 import glob
 import os
+import re
+import subprocess
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from palinode.core.config import config
 from palinode.core.expiry import core_has_expired
@@ -75,9 +81,9 @@ MAX_LINE_CHARS = 200
 DIGEST_QUALIFIER_KEYS = ("contradicts", "stale_backing", "epistemic")
 
 PALINODE_HINT = (
-    "Memory available. Call palinode_search before answering questions about "
-    "prior decisions or project state; save decisions with palinode_save "
-    "(include the rationale); call palinode_session_end before the session ends."
+    "Memory available. Call palinode_search before answering prior-state questions. "
+    "Use palinode_session_end only for requested wrap-ups or new durable information. "
+    "Skip recall-only writes; honor no-save requests."
 )
 
 # On top of the never-memory dirs every surface skips
@@ -88,31 +94,104 @@ PALINODE_HINT = (
 _SKIP_DIRS = frozenset({"daily", "archive"})
 
 
-def resolve_project(cwd: str | None = None, project: str | None = None) -> str | None:
-    """Resolve a project entity ref, or None when no project can be named.
+@dataclass(frozen=True)
+class ProjectResolution:
+    project: str | None
+    basis: str
 
-    Explicit ``project`` wins (bare slugs gain the ``project/`` prefix), then
-    the ``PALINODE_PROJECT`` env var, then the ``cwd`` basename through
-    ``config.context.project_map`` and ``auto_detect`` — the same ADR-008
-    resolution order ``mcp.py:_resolve_context()`` uses. Never guesses when
-    none is usable.
+    @property
+    def context(self) -> list[str] | None:
+        return [self.project] if self.project else None
+
+
+def ambient_cwd() -> str:
+    """The client CWD hint takes precedence over its process directory."""
+    return os.environ.get("CWD") or os.getcwd()
+
+
+def _project_ref(project: str) -> str:
+    return project if "/" in project else f"project/{project}"
+
+
+def _project_slug(name: str) -> str:
+    return re.sub(r"-+", "-", re.sub(r"[^a-zA-Z0-9_-]+", "-", name.strip().lower())).strip("-")
+
+
+def _git_output(cwd: str, *args: str) -> str | None:
+    # Ignore inherited repository/config overrides: the supplied directory is
+    # the identity being inspected. These commands never contact a remote.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, *args], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=1, env=env, check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _repository_names(cwd: str) -> list[tuple[str, str]]:
+    """Origin identity, then common checkout; neither uses a task/branch name."""
+    common = _git_output(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not common:
+        return []
+    names: list[tuple[str, str]] = []
+    remote = _git_output(cwd, "config", "--get", "remote.origin.url")
+    if remote:
+        # URL, scp-style, and filesystem remotes. Never return credentials or
+        # the full URL as diagnostic output.
+        try:
+            path = urlsplit(remote).path if "://" in remote else remote.split(":", 1)[-1]
+            name = path.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
+            if name:
+                names.append((name, "git_origin"))
+        except ValueError:
+            pass
+    common_path = Path(common)
+    name = common_path.parent.name if common_path.name == ".git" else common_path.name.removesuffix(".git")
+    if name:
+        names.append((name, "git_common_dir"))
+    return names
+
+
+def resolve_context(cwd: str | None = None, project: str | None = None) -> ProjectResolution:
+    """Shared ADR-008 resolution; only explicit arguments bypass disablement.
+
+    Auto-detection supplies a candidate, not proof of an existing project.
+    The digest qualifies it against visible, current source records.
+    No implicit process CWD: an API host is not the caller's repository.
     """
     if project:
-        return project if "/" in project else f"project/{project}"
+        return ProjectResolution(_project_ref(project), "explicit")
+    if not config.context.enabled:
+        return ProjectResolution(None, "disabled")
     env = os.environ.get("PALINODE_PROJECT")
     if env:
-        return env if "/" in env else f"project/{env}"
+        return ProjectResolution(_project_ref(env), "environment")
     if not cwd:
-        return None
+        return ProjectResolution(None, "none")
     basename = os.path.basename(os.path.normpath(cwd))
-    if not basename:
-        return None
     mapped = config.context.project_map.get(basename)
     if mapped:
-        return mapped if "/" in mapped else f"project/{mapped}"
+        return ProjectResolution(_project_ref(mapped), "project_map")
+    names = _repository_names(cwd)
+    for name, _ in names:
+        mapped = config.context.project_map.get(name)
+        if mapped:
+            return ProjectResolution(_project_ref(mapped), "project_map")
     if config.context.auto_detect:
-        return f"project/{basename}"
-    return None
+        name, basis = names[0] if names else (basename, "cwd_basename")
+        slug = _project_slug(name)
+        if slug:
+            return ProjectResolution(_project_ref(slug), basis)
+    return ProjectResolution(None, "none")
+
+
+def resolve_project(cwd: str | None = None, project: str | None = None) -> str | None:
+    """Compatibility scalar view of the common resolver."""
+    return resolve_context(cwd=cwd, project=project).project
 
 
 def _scan_memories(base_dir: str) -> list[dict[str, Any]]:
@@ -219,7 +298,11 @@ def _row_gist(row: dict[str, Any]) -> str | None:
 
 def _digest_heading(digest: dict[str, Any]) -> str:
     if digest.get("project"):
-        return f"## Session context: {digest['project']}"
+        heading = f"## Session context: {digest['project']}"
+        if digest.get("project_resolved_by"):
+            state = "known" if digest.get("project_known") else "unrecognized — no visible current project records"
+            heading += f" ({digest['project_resolved_by']}; {state})"
+        return heading
     return "## Session context (no project resolved — core memories only)"
 
 
@@ -323,6 +406,7 @@ def build_context_digest(
     scope_chain: Any | None = None,
     *,
     now: datetime | None = None,
+    resolution: ProjectResolution | None = None,
 ) -> dict[str, Any]:
     """Build the bounded session-start digest for the resolved scope.
 
@@ -341,7 +425,8 @@ def build_context_digest(
     memories are still withheld — classic is a *selection* mode, and it was
     never meant to be a way around access control.
     """
-    resolved = resolve_project(cwd=cwd, project=project)
+    resolution = resolution or resolve_context(cwd=cwd, project=project)
+    resolved = resolution.project
     memories = _scan_memories(config.memory_dir)
     # Always route through the choke point; `meta` here is live frontmatter
     # (just parsed by _scan_memories), so this costs no extra read.
@@ -404,6 +489,8 @@ def build_context_digest(
 
     digest = {
         "project": resolved,
+        "project_resolved_by": resolution.basis,
+        "project_known": bool(resolved and any(_has_entity(m["meta"], resolved) for m in memories)),
         "core_memories": [_digest_row(m) for m in core[:MAX_CORE_MEMORIES]],
         "recent_decisions": [_digest_row(m) for m in recent_decisions],
         "open_action_items": [_digest_row(m) for m in open_action_items],

@@ -19,7 +19,7 @@ def test_recent_save_embeddings_warns_on_db_error(monkeypatch, caplog):
     import logging
 
     def _raise_db_error(*_args, **_kwargs):
-        raise sqlite3.Error("mocked DB open failure for #384")
+        raise sqlite3.Error("mocked DB open failure")
 
     monkeypatch.setattr(store, "get_db", _raise_db_error)
 
@@ -32,7 +32,7 @@ def test_recent_save_embeddings_warns_on_db_error(monkeypatch, caplog):
     # The failure must not be silent
     warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert warning_records, (
-        "recent_save_embeddings swallowed a sqlite3.Error with no log (#384)"
+        "recent_save_embeddings swallowed a sqlite3.Error with no log"
     )
     combined = " ".join(r.getMessage() for r in warning_records)
     assert "dedup" in combined.lower() or "recent_save_embeddings" in combined.lower(), (

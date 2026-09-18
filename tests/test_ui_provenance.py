@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import importlib
 import os
+import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -73,6 +75,37 @@ def _seed_fact(client, *, slug: str, content: str, **kw) -> str:
     assert res.status_code == 200, res.text
     abs_path = res.json()["file_path"]
     return os.path.relpath(abs_path, config.memory_dir)
+
+
+def _git(*args: str) -> None:
+    subprocess.run(
+        ["git", "-C", config.memory_dir, *args],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _seed_two_commit_history() -> str:
+    """Create a real saved-and-superseded memory timeline for the UI."""
+    _git("init", "-q")
+    _git("config", "user.email", "ui-history@example.invalid")
+    _git("config", "user.name", "UI history fixture")
+    rel = "decisions/storage-choice.md"
+    path = Path(config.memory_dir) / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\ntype: Decision\n---\n\n# Storage choice\n\nUse SQLite.\n",
+        encoding="utf-8",
+    )
+    _git("add", "--", rel)
+    _git("commit", "-qm", "save initial SQLite decision")
+    path.write_text(
+        "---\ntype: Decision\n---\n\n# Storage choice\n\nUse PostgreSQL.\n",
+        encoding="utf-8",
+    )
+    _git("add", "--", rel)
+    _git("commit", "-qm", "supersession to PostgreSQL <script>alert(1)</script>")
+    return rel
 
 
 # ── 1. Dashboard ──────────────────────────────────────────────────────────────
@@ -155,6 +188,77 @@ def test_memory_detail_supersedes_links_to_target(client):
     res = client.get(f"/ui/memory/{path.removesuffix('.md')}")
     assert res.status_code == 200
     assert "/ui/memory/decisions/old-policy.md" in res.text
+
+
+def test_memory_title_ignores_generated_footer_and_keeps_real_titles(client):
+    footer_only = Path(config.memory_dir) / "decisions" / "storage-choice.md"
+    footer_only.parent.mkdir(parents=True, exist_ok=True)
+    footer_only.write_text(
+        "---\ntype: Decision\n---\n\n## See also\n\n"
+        "<!-- palinode-auto-footer -->\n- [[palinode]]\n",
+        encoding="utf-8",
+    )
+    fallback = client.get("/ui/memory/decisions/storage-choice")
+    assert fallback.status_code == 200
+    assert "<h1>storage choice</h1>" in fallback.text
+    assert "<h1>See also</h1>" not in fallback.text
+
+    heading = _seed_fact(client, slug="heading-kept", content="# User heading\n\nbody")
+    heading_page = client.get(f"/ui/memory/{heading.removesuffix('.md')}")
+    assert "<h1>User heading</h1>" in heading_page.text
+
+    titled = _seed_fact(
+        client,
+        slug="title-kept",
+        content="# Different body heading\n\nbody",
+        title="Explicit decision title",
+    )
+    titled_page = client.get(f"/ui/memory/{titled.removesuffix('.md')}")
+    assert "<h1>Explicit decision title</h1>" in titled_page.text
+
+
+def test_history_renders_actual_two_commit_timeline_while_paused(client):
+    rel = _seed_two_commit_history()
+
+    paused = client.post("/controls", json={"capture_paused": True, "recall_paused": True})
+    assert paused.status_code == 200
+    res = client.get(f"/ui/history/{rel.removesuffix('.md')}")
+    assert res.status_code == 200
+    assert "Commit history" in res.text
+    assert "Read-only Git history" in res.text
+    assert "save initial SQLite decision" in res.text
+    # The real supersession commit is rendered as text, never executable HTML.
+    assert "supersession to PostgreSQL" in res.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in res.text
+    assert "<script>alert(1)</script>" not in res.text
+    assert "/ui/memory/decisions/storage-choice.md" in res.text
+
+
+def test_history_rejects_traversal_and_symlink_escape(client):
+    traversal = client.get("/ui/history/%2e%2e/%2e%2e/etc/passwd")
+    assert traversal.status_code in {400, 403, 404}
+
+    outside = Path(config.memory_dir).parent / "outside-memory.md"
+    outside.write_text("not a memory", encoding="utf-8")
+    link = Path(config.memory_dir) / "decisions" / "escaped.md"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside)
+    escaped = client.get("/ui/history/decisions/escaped")
+    assert escaped.status_code == 403
+
+    directory = Path(config.memory_dir) / "decisions" / "not-a-memory"
+    directory.mkdir()
+    not_a_file = client.get("/ui/history/decisions/not-a-memory")
+    assert not_a_file.status_code == 404
+
+
+def test_history_distinguishes_git_failure_from_no_commits(client, monkeypatch):
+    path = _seed_fact(client, slug="history-unavailable", content="# Memory\n\nbody")
+    with patch("palinode.api.ui.router.git_tools.history", side_effect=OSError("git unavailable")):
+        unavailable = client.get(f"/ui/history/{path.removesuffix('.md')}")
+    assert unavailable.status_code == 200
+    assert "Git history is currently unavailable" in unavailable.text
+    assert "No committed history" not in unavailable.text
 
 
 # ── 3. Markdown sanitization (the load-bearing security property) ─────────────
@@ -311,7 +415,7 @@ def test_host_is_loopback_classification():
     assert not _host_is_loopback("203.0.113.10")  # RFC 5737 documentation range
 
 
-def test_fact_template_broken_seal_flips_to_oxblood():
+def test_fact_template_broken_seal_flips_to_oxblood(monkeypatch):
     """Render fact.html directly (dormant tamper path) and assert the seal +
     header pill flip to the broken (oxblood) styling, and the panel gains the
     broken-seal class that greys the attestation badges. Proves the tamper
@@ -325,7 +429,7 @@ def test_fact_template_broken_seal_flips_to_oxblood():
     env = templates.env
     # The template uses url_for (injected by TemplateResponse via the request);
     # register a stub so a direct env render resolves it.
-    env.globals["url_for"] = lambda name, **kw: f"/{name}"
+    monkeypatch.setitem(env.globals, "url_for", lambda name, **kw: f"/{name}")
     tmpl = env.get_template("fact.html")
     base_ctx = dict(
         title="X", slug="x", category="decisions", memory_id="decisions/x",

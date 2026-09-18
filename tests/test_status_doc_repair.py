@@ -209,7 +209,7 @@ def test_repair_makes_frontmatter_strict_parseable():
         broke = False
     except yaml.YAMLError:
         broke = True
-    assert broke, "fixture no longer reproduces the #470 parse failure"
+    assert broke, "fixture no longer reproduces the historical parse failure"
 
     repaired, report = repair_status_doc(CORRUPTED_DOC)
 

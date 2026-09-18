@@ -22,6 +22,7 @@ from palinode.core import store, parser, embedder, cross_refs  # noqa: F401  (em
 from palinode.core.config import config
 from palinode.core.skip_dirs import is_skipped_path
 from palinode.indexer.index_file import index_file
+from palinode.indexer.watcher_identity import remove_identity, write_identity
 import json
 from datetime import UTC, datetime
 
@@ -104,7 +105,7 @@ schedules summary and description generation."""
         # a timer keyed by path; the timer re-reads the file when it fires, so a
         # burst of writes inside ``debounce_seconds`` is coalesced into one index
         # pass over the *final* content instead of the first write winning and
-        # the rest being dropped. Entries are evicted when the timer fires, so
+        # the rest being dropped. Entries are evicted when the pass finishes, so
         # the dict is bounded by the number of paths currently in flight.
         self._index_timers: dict[str, threading.Timer] = {}
         self._index_timers_lock = threading.Lock()
@@ -143,7 +144,7 @@ schedules summary and description generation."""
             timer.join(timeout)
         self._description_pending.clear()
 
-    def _schedule_index(self, filepath: str) -> None:
+    def _schedule_index(self, filepath: str, *, retry_empty: bool = True) -> None:
         """Arm (or re-arm) the per-path index timer for *filepath*.
 
         Cancel-and-reschedule: a new event inside the debounce window pushes the
@@ -153,27 +154,34 @@ schedules summary and description generation."""
             return
         delay = config.services.watcher.debounce_seconds
         with self._index_timers_lock:
+            if self._stopped:
+                return
             previous = self._index_timers.get(filepath)
             if previous is not None:
                 previous.cancel()
-            timer = threading.Timer(delay, self._fire_index, args=(filepath,))
+            timer = threading.Timer(
+                delay, self._fire_index, args=(filepath,),
+                kwargs={"retry_empty": retry_empty},
+            )
             timer.daemon = True
             self._index_timers[filepath] = timer
             timer.start()
 
-    def _fire_index(self, filepath: str) -> None:
-        """Timer callback: evict this path's entry, then index the file as it is *now*."""
-        with self._index_timers_lock:
-            # Only evict our own entry — a newer timer may already have replaced it.
-            if self._index_timers.get(filepath) is threading.current_thread():
-                del self._index_timers[filepath]
-        if self._stopped:
-            return
+    def _fire_index(self, filepath: str, *, retry_empty: bool = True) -> None:
+        """Index only the current timer's work, then retire its entry."""
         with self._index_lock:
+            # cancel() cannot stop a callback already waiting for this lock.
+            with self._index_timers_lock:
+                if self._stopped or self._index_timers.get(filepath) is not threading.current_thread():
+                    return
             try:
-                self._process_file(filepath)
+                self._process_file(filepath, retry_empty=retry_empty)
             except Exception as e:
                 logger.error(f"Failed to index {filepath}: {e}")
+            finally:
+                with self._index_timers_lock:
+                    if self._index_timers.get(filepath) is threading.current_thread():
+                        del self._index_timers[filepath]
 
     def _trigger_summaries(self) -> None:
         """Hits the summary generation API to auto-fill missing summaries."""
@@ -298,7 +306,7 @@ schedules summary and description generation."""
             
         return True
 
-    def _process_file(self, filepath: str) -> None:
+    def _process_file(self, filepath: str, *, retry_empty: bool = False) -> None:
         """Index a Markdown file, then schedule summary/description generation if needed.
 
         Synchronous and undebounced — this is the "index it now" primitive that
@@ -316,6 +324,15 @@ schedules summary and description generation."""
                 content = f.read()
         except Exception as e:
             logger.error(f"Failed to read {filepath}: {e}")
+            return
+
+        if not content and retry_empty:
+            # A non-atomic writer can pause between truncate and write. Keep
+            # the previous index for one more debounce window, then re-open
+            # the path. A persistently empty file must still reconcile: disk
+            # remains authoritative, and retries must not run forever.
+            logger.info("Deferring zero-byte read for one debounce window: %s", filepath)
+            self._schedule_index(filepath, retry_empty=False)
             return
 
         logger.info(f"Indexing: {filepath}")
@@ -356,6 +373,9 @@ schedules summary and description generation."""
                     )
             except Exception as e:
                 logger.warning("cross_refs pass failed for %s: %r", filepath, e)
+
+        if config.search.retrieval_mode == "lexical":
+            return
 
         # Re-parse for metadata so we can decide whether to schedule summary
         # generation. (Cheap — no embedder call.)
@@ -443,6 +463,7 @@ def main() -> None:
     
     observer.schedule(event_handler, config.palinode_dir, recursive=True)
     observer.start()
+    identity = write_identity()
     logger.info(f"Watching {config.palinode_dir} for changes...")
     try:
         while True:
@@ -456,6 +477,7 @@ def main() -> None:
         observer.stop()
         event_handler.shutdown()
         observer.join()
+        remove_identity(identity)
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ def test_server_json_top_level_version_matches_pyproject():
     server_version = manifest.get("version")
     assert server_version is not None, (
         "server.json has no top-level `version` field. "
-        "Add it or the registry manifest is malformed. See #313."
+        "Add it or the registry manifest is malformed."
     )
     assert server_version == _registry_version(pyproject_version), (
         f"server.json version ({server_version!r}) does not match the public "
@@ -87,7 +87,7 @@ def test_server_json_top_level_version_matches_pyproject():
         f"({_registry_version(pyproject_version)!r}, from {pyproject_version!r}). "
         "Update server.json to match — it is the MCP registry manifest. "
         "A mismatch causes `mcp-publisher publish` to ship a wrong-version entry. "
-        "See #313."
+        ""
     )
 
 
@@ -103,14 +103,14 @@ def test_server_json_package_versions_match_pyproject():
     packages = manifest.get("packages", [])
     assert packages, (
         "server.json has an empty or missing `packages` array. "
-        "The registry manifest is likely malformed. See #313."
+        "The registry manifest is likely malformed."
     )
 
     for i, pkg in enumerate(packages):
         pkg_version = pkg.get("version")
         assert pkg_version is not None, (
             f"server.json packages[{i}] has no `version` field. "
-            f"Package entry: {pkg!r}. See #313."
+            f"Package entry: {pkg!r}."
         )
         assert pkg_version == _registry_version(pyproject_version), (
             f"server.json packages[{i}].version ({pkg_version!r}) does not match "
@@ -118,7 +118,7 @@ def test_server_json_package_versions_match_pyproject():
             f"({_registry_version(pyproject_version)!r}, from {pyproject_version!r}). "
             f"Package identifier: {pkg.get('identifier', '<unknown>')}. "
             "Update all package version pins in server.json to match pyproject.toml. "
-            "See #313."
+            ""
         )
 
 
@@ -141,14 +141,14 @@ def test_server_json_is_valid_json():
     server_json_path = REPO_ROOT / "server.json"
     assert server_json_path.exists(), (
         f"server.json not found at {server_json_path}. "
-        "This file is the MCP registry manifest and must exist in the repo. See #313."
+        "This file is the MCP registry manifest and must exist in the repo."
     )
     try:
         json.loads(server_json_path.read_text())
     except json.JSONDecodeError as exc:
         raise AssertionError(
             f"server.json is not valid JSON: {exc}. "
-            "Fix the file before any version checks can pass. See #313."
+            "Fix the file before any version checks can pass."
         ) from exc
 
 
@@ -161,7 +161,7 @@ def test_pyproject_toml_is_parseable():
     pyproject_path = REPO_ROOT / "pyproject.toml"
     assert pyproject_path.exists(), (
         f"pyproject.toml not found at {pyproject_path}. "
-        "This is the canonical version source. See #313."
+        "This is the canonical version source."
     )
     try:
         with pyproject_path.open("rb") as fh:
@@ -169,12 +169,12 @@ def test_pyproject_toml_is_parseable():
     except Exception as exc:
         raise AssertionError(
             f"pyproject.toml failed to parse: {exc}. "
-            "Fix the file before version alignment can be verified. See #313."
+            "Fix the file before version alignment can be verified."
         ) from exc
     assert "project" in data, (
-        "pyproject.toml has no [project] table. Cannot read version. See #313."
+        "pyproject.toml has no [project] table. Cannot read version."
     )
     assert "version" in data["project"], (
         "pyproject.toml [project] table has no `version` key. "
-        "Cannot determine canonical version. See #313."
+        "Cannot determine canonical version."
     )

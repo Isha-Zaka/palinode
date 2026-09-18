@@ -229,7 +229,7 @@ def test_l1_cli_session_end_returns_success(isolated_memory, cli_with_api_redire
     from palinode.cli.session_end import session_end
 
     runner = CliRunner()
-    summary = "Implemented L1-L3 integration test for issue #139"
+    summary = "Implemented L1-L3 integration test metadata"
     result = runner.invoke(
         session_end,
         [

@@ -374,7 +374,19 @@ def _run_hook(tmp_path: Path, transcript: str) -> dict:
     t.write_text(transcript, encoding="utf-8")
     stdin = json.dumps({"transcript_path": str(t), "cwd": str(tmp_path), "reason": "clear"})
 
-    env = dict(os.environ, PALINODE_HOOK_DRYRUN="1")
+    # Dry-run still requires permission before inspecting transcript content.
+    # Keep this formatting test independent of any local running API.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    curl = bin_dir / "curl"
+    curl.write_text(
+        '#!/bin/sh\ncase "$*" in\n'
+        '  */controls/check*) printf \'{"allowed":true,"project":"fixture"}\\n\';;\n'
+        '  *) exit 1;;\nesac\n',
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    env = dict(os.environ, PALINODE_HOOK_DRYRUN="1", PATH=f"{bin_dir}:{os.environ['PATH']}")
     proc = subprocess.run(["bash", str(HOOK)], input=stdin,
                           capture_output=True, text=True, env=env,
                           encoding="utf-8", errors="replace")

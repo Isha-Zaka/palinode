@@ -30,6 +30,7 @@ const CFG: PalinodeConfig = {
   coreMaxFiles: 10,
   coreMaxChars: 4000,
   minMessages: 3,
+  captureOn: true,
   // The suites below this line pin the plain search channel — the behaviour a
   // deadline falls back to — so they run with resolution off. The shipped
   // default is ON; `configFromEnv` pins that, and the bounded-resolution
@@ -38,7 +39,7 @@ const CFG: PalinodeConfig = {
   resolveDeadlineMs: 250,
 };
 
-const ORIGIN = { project: "myproj", source: "pi-extension", harness: "pi", trigger: "session_shutdown" };
+const ORIGIN = { cwd: process.cwd(), project: "myproj", source: "pi-extension", harness: "pi", trigger: "session_shutdown" };
 
 const PROMPT = "how did we decide to handle the deploy rollback for the api?";
 
@@ -648,7 +649,7 @@ describe("session capture", () => {
   it("posts fail-open", async () => {
     const payload = buildSessionCapture(piEntries(3), CFG, ORIGIN)!;
     expect(await postSessionCapture(payload, CFG, failingFetch)).toBe(false);
-    const okFetch = stubFetch({ "/session-end": { status: "ok" } });
+    const okFetch = stubFetch({ "/controls/check": { allowed: true }, "/session-end": { status: "ok" } });
     expect(await postSessionCapture(payload, CFG, okFetch)).toBe(true);
   });
 });
@@ -681,6 +682,7 @@ describe("configFromEnv", () => {
       coreMaxFiles: 5,
       coreMaxChars: 2000,
       minMessages: 1,
+      captureOn: false,
       resolveOn: true,
       resolveDeadlineMs: 250,
     });
@@ -802,5 +804,20 @@ describe("reversal client (restore / unretract / forget-withdraw)", () => {
     expect(await withdrawForgetRequest("insights/x.md", CFG, failingFetch)).toBeNull();
     const notFound = stubFetch({}); // unrouted → 404
     expect(await restoreMemory("insights/x.md", CFG, notFound)).toBeNull();
+  });
+});
+
+
+describe("capture opt-in and policy", () => {
+  it("defaults off and rejects denied capture without sending content", async () => {
+    expect(configFromEnv({}).captureOn).toBe(false);
+    expect(configFromEnv({ PALINODE_CAPTURE_ENABLED: "1" }).captureOn).toBe(true);
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    const payload = { summary: "FAKE_SECRET_excluded", project: "fixture", source: "pi-extension",
+      harness: "pi", trigger: "session_shutdown", decisions: [], blockers: [], cwd: process.cwd() };
+    expect(await postSessionCapture(payload, CFG,
+      stubFetch({ "/controls/check": { allowed: false } }, calls))).toBe(false);
+    expect(calls).toHaveLength(1);
+    expect(JSON.stringify(calls)).not.toContain("FAKE_SECRET_excluded");
   });
 });

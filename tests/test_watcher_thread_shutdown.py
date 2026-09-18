@@ -166,7 +166,7 @@ def test_process_exit_leaves_no_watcher_timer_threads(tmp_path: Path) -> None:
     elapsed = time.monotonic() - started
 
     assert proc.returncode == 0, (
-        f"child exited {proc.returncode} (134/-6 == the #677 abort)\n"
+        f"child exited {proc.returncode} (134/-6 == the historical abort)\n"
         f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
     )
     surviving = json.loads(result_path.read_text())

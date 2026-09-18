@@ -26,10 +26,10 @@ def test_wrap_body_calls_palinode_push_before_session_end():
     body = _wrap_body()
     push_pos = body.find("palinode_push")
     session_end_pos = body.find("palinode_session_end")
-    assert push_pos != -1, "wrap body must mention palinode_push (#353)"
+    assert push_pos != -1, "wrap body must mention palinode_push"
     assert session_end_pos != -1, "wrap body must mention palinode_session_end"
     assert push_pos < session_end_pos, (
-        "palinode_push must appear before palinode_session_end (#353) — "
+        "palinode_push must appear before palinode_session_end — "
         f"push at char {push_pos}, session_end at char {session_end_pos}"
     )
 
@@ -38,7 +38,7 @@ def test_wrap_body_handles_no_remote_gracefully():
     """WRAP_COMMAND_BODY must tell the agent to skip gracefully with no remote."""
     body = _wrap_body().lower()
     assert "no remote" in body or "no upstream" in body, (
-        "wrap body must document graceful skip when no remote is configured (#353)"
+        "wrap body must document graceful skip when no remote is configured"
     )
 
 
@@ -53,7 +53,7 @@ def test_wrap_body_surfaces_non_remote_push_failures():
         or "abort" in body
     )
     assert has_error_surface, (
-        "wrap body must instruct the agent to surface push failures, not swallow them (#353)"
+        "wrap body must instruct the agent to surface push failures, not swallow them"
     )
 
 
@@ -79,5 +79,5 @@ def test_wrap_session_end_pushes_its_own_note():
     lowered = body.lower()
     assert ("push: true" in lowered) or ("push=true" in lowered) or ('"push": true' in lowered), (
         "palinode_session_end must be invoked with push: true so the committed "
-        "session note is shipped in the same call (#378)"
+        "session note is shipped in the same call"
     )

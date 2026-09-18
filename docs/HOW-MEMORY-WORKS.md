@@ -55,6 +55,57 @@ Every time you send a message, Palinode injects relevant context **before the ag
 
 To see the session-start digest yourself — the same one the SessionStart hook warms and the MCP `session_init` tool returns — run `palinode prime` from the project directory (see [CLI.md](CLI.md#palinode-prime)).
 
+### Choosing the project
+
+Startup recall, ambient CLI/MCP search and session-end use one project resolver.
+The order is:
+
+1. An explicit `project` argument (a slug or entity ref).
+2. `PALINODE_PROJECT`, when `context.enabled` is true.
+3. The supplied directory's basename in `context.project_map`.
+4. The repository origin name, then the common checkout name, in that map.
+5. With `context.auto_detect: true`, infer from the origin name, then the common
+   checkout name, then the normalized directory basename.
+
+Git inspection is local, read-only and bounded by timeouts. It does not fetch.
+For example, a checkout renamed to `checkout-2` and its linked worktree
+`fix-timeout/src` both resolve to `project/my-app` when their origin ends in
+`my-app.git`. Without an origin, linked worktrees use the common checkout name.
+`project_map: {my-app: customer-app}` maps both to `project/customer-app`.
+A mapping for the task directory itself remains an explicit override.
+Repositories with identical names need distinct mappings or explicit projects.
+
+`palinode prime --format json` reports `project`, `project_resolved_by` and
+`project_known`. The text digest also shows the basis and known/unrecognized
+state. **Known means that at least one visible, current record in the digest's
+source scan carries that entity.** It does not certify ownership or correctness.
+An inferred name with no such records is labelled unrecognized; hidden and retired
+records do not change that label. Its project sections remain empty rather than
+substituting another project's records. Global core memories can still appear.
+
+CLI and MCP search use `CWD` from the environment before the process directory;
+CLI prime and MCP session-init use an explicit `cwd` before that same default.
+Session-end uses the `cwd` supplied by the caller or hook. An API request never
+falls back to the API host's process directory. **A remote API host cannot inspect
+a checkout that exists only on your computer:** pass `project` explicitly to
+prime/session-end and set `PALINODE_PROJECT` for ambient CLI/MCP search. A remote
+or unavailable path can otherwise only supply a basename candidate. Bare API
+search uses its explicit `context` list; it does not infer the server's project.
+
+`context.enabled: false` disables all ambient project inference, including the
+environment and mappings. An explicit project still works. `auto_detect: false`
+disables inferred candidates while retaining configured mappings and overrides.
+Search context is a relevance boost; use the existing entity filter when you
+need to restrict search to one project's records.
+
+Save remains explicit: use `palinode save ... --project my-app`, the MCP/API
+`project` parameter, or `entities: [project/my-app]` for project-wide decisions.
+For temporary branch/task observations, state the task and its limits in the
+record, use existing `metadata.scope` (for example `session/<id>`) and an
+`expires_at` or `ttl` when appropriate, and avoid `core: true` unless it should
+be supplied generally. Session scope requires a matching caller scope chain;
+entity tags alone are not access control. A worktree name grants no authority.
+
 ### Phase 1: Core Memory (always injected)
 
 Core memory files are marked with `core: true` in their YAML frontmatter. These are the facts the agent should always know — who you are, what you're working on, key decisions.

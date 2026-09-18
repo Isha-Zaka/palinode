@@ -93,8 +93,23 @@ def test_default_banner_label_is_loud(monkeypatch, capsys, tmp_path):
     assert "defaults" in captured.err
     assert "⚠" in captured.err or "no config file" in captured.err, (
         "When defaults are loaded, banner must be visibly marked. "
-        "Plain 'defaults' label is the #273 regression."
+        "Plain 'defaults' label is the historical regression."
     )
+
+
+def test_config_banner_does_not_expose_endpoint_credentials(monkeypatch, capsys, tmp_path):
+    _isolate_config_search(monkeypatch, tmp_path)
+    from palinode.core import config as cfg_mod
+
+    endpoint = "https://fixture-user:fixture-password@embedding.example.invalid/v1?token=fixture-token"
+    monkeypatch.setenv("OLLAMA_URL", endpoint)
+    cfg = cfg_mod.load_config()
+
+    assert cfg.embeddings.primary.url == endpoint
+    captured = capsys.readouterr()
+    assert "Palinode config:" in captured.err
+    for secret in ("fixture-user", "fixture-password", "fixture-token"):
+        assert secret not in captured.out + captured.err
 
 
 # git-not-a-repo warning at API startup --------------------------
@@ -140,5 +155,5 @@ def test_lifespan_does_not_warn_when_auto_commit_disabled(tmp_path, monkeypatch)
     warning_idx = src.find("is not a git repository")
     assert auto_commit_idx < warning_idx, (
         "auto_commit check must gate the warning, not follow it. "
-        "Otherwise users with auto_commit=false get noise. (#354)"
+        "Otherwise users with auto_commit=false get noise."
     )

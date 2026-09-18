@@ -48,6 +48,24 @@
     ]
   ],
   [
+    "/controls",
+    [
+      "GET"
+    ]
+  ],
+  [
+    "/controls",
+    [
+      "POST"
+    ]
+  ],
+  [
+    "/controls/check",
+    [
+      "POST"
+    ]
+  ],
+  [
     "/dedup-suggest",
     [
       "POST"

@@ -22,7 +22,7 @@ def test_max_request_bytes_default_is_5mb():
     assert server._MAX_REQUEST_BYTES == 5 * 1024 * 1024, (
         "PALINODE_MAX_REQUEST_BYTES default changed from 5MB. Update "
         "README.md (API reference table) and docs/OPERATIONS.md (env-var "
-        "table) to match. See #298."
+        "table) to match."
     )
 
 
@@ -31,7 +31,7 @@ def test_max_request_bytes_documented_in_readme():
     readme = (REPO_ROOT / "README.md").read_text()
     assert "PALINODE_MAX_REQUEST_BYTES" in readme, (
         "README.md must mention the PALINODE_MAX_REQUEST_BYTES env var so "
-        "users hitting 413 can find the override. See #298."
+        "users hitting 413 can find the override."
     )
     assert "5 MB" in readme or "5MB" in readme, (
         "README.md must state the 5MB default to keep code and docs aligned."
@@ -53,17 +53,17 @@ def test_save_request_schema_uses_content_not_body():
     from palinode.api.server import SaveRequest
 
     fields = set(SaveRequest.model_fields.keys())
-    assert "content" in fields, "SaveRequest must accept `content` (#299)"
-    assert "type" in fields, "SaveRequest must accept `type` (#299)"
-    assert "slug" in fields, "SaveRequest must accept `slug` (#299)"
+    assert "content" in fields, "SaveRequest must accept `content`"
+    assert "type" in fields, "SaveRequest must accept `type`"
+    assert "slug" in fields, "SaveRequest must accept `slug`"
     # Negative guards — these are the wrong names from the issue.
     assert "body" not in fields, (
         "SaveRequest grew a `body` field — that's the legacy/wrong shape. "
-        "The canonical body field is `content`. See #299."
+        "The canonical body field is `content`."
     )
     assert "category" not in fields, (
         "SaveRequest grew a `category` field — category is derived from "
-        "`type`, not a separate input. See #299."
+        "`type`, not a separate input."
     )
 
 

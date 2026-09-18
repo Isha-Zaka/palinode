@@ -12,17 +12,25 @@ This project uses Palinode for persistent memory via MCP (server name: `palinode
 - When making an architectural or design decision, save the decision AND the
   rationale as `type="Decision"`.
 - Save surprising reusable findings as `type="Insight"`.
-- Every ~30 minutes of active work, save a one-line progress note.
+- After roughly 30 minutes, save a progress note only if new durable progress
+  has accumulated. Skip timer-based writes during recall-only work.
+- `palinode_save` and `palinode_session_end` are explicit, content-bearing
+  writes. They are separate from any opt-in client hook and from background
+  auto-summary enrichment.
 
 ### At session end — including `/clear`
-- Call `palinode_session_end` with `summary`, `decisions`, `blockers`, and
-  `project="sample-project"` before the session terminates.
-- `/clear` counts as a session end. The SessionEnd hook installed by
-  `palinode init` captures a fallback snapshot automatically, but calling
-  `palinode_session_end` from the agent first produces a far better record.
+- At a user-requested wrap-up, or when the session produced new durable
+  information, call `palinode_session_end` with `summary`, `decisions`,
+  `blockers`, and `project="sample-project"`.
+- Do not create a recap for a recall-only or no-new-information session, and
+  honor an explicit request not to save.
+- `/clear` by itself does not override that choice. The SessionEnd hook
+  installed by `palinode init --hook` is an opt-in automatic fallback;
+  plain `palinode init` does not enable transcript capture.
 - The user may type `/wrap` (session wrap-up) as a shortcut. It is
-  **deterministic** — always `palinode_session_end` with
-  summary/decisions/blockers, before `/clear`. See the `/wrap` command/skill
+  an explicit request to capture: perform its deterministic
+  `palinode_session_end` with summary/decisions/blockers before `/clear`,
+  unless the user separately says not to save. See the `/wrap` command/skill
   definition (installed by `palinode init`) for the exact prompt.
 - Mid-session checkpoints go through the `palinode_save` tool directly
   (`type="ProjectSnapshot"`); there is no separate slash command for them.

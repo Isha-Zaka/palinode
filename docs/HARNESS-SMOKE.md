@@ -4,6 +4,13 @@ Per-harness smoke checklist for validating Palinode MCP connectivity.
 Each harness runs the same 5-call sequence for cross-comparison.
 Tracked internally.
 
+This is a transport smoke, not proof that a client model recalled a memory in a
+new session. The flagship client proof is documented in
+[HARNESSES.md](HARNESSES.md#flagship-first-session-proof). Keep the two records
+separate: a successful
+MCP call does not show automatic hooks, project scope, client-owned-memory
+coexistence, or a model's answer.
+
 ---
 
 ## Canonical 5-call smoke sequence
@@ -25,6 +32,29 @@ After completing all 5 calls, record the result:
 ```bash
 palinode mcp-smoke <harness> --record
 ```
+
+## Flagship release evidence
+
+For the Claude Code hooks + MCP and Codex CLI MCP + `AGENTS.md` paths, attach a
+sanitized record of the following in addition to the five calls:
+
+- installed client and Palinode versions; the normal MCP config/listing
+  preflight; whether the client-owned memory feature stayed enabled;
+- session A save receipt for the SQLite decision and its rationale;
+- a fresh-session recall prompt with no pasted answer, selected source, and
+  either a correct response or an explicit no-relevant-memory outcome;
+- the PostgreSQL correction, its link to SQLite, and a second fresh-session
+  retrieval showing the correction's evidence;
+- the unchanged UTC neighbor, the unresolved north/south conflict, one linked
+  worktree run, and one run after a service restart;
+- separate save, indexing, connection, scope, recall, configured-lexical, and
+  authenticated-model-session outcomes.
+
+A developer-specific mechanical probe may exercise the same fictional
+transport flow in an isolated store. It is not a substitute for the
+installed-client trial; mark unavailable authentication, client lifecycle, or
+built-in-memory observations as unproven rather than inferring them from that
+probe.
 
 ---
 

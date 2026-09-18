@@ -53,7 +53,11 @@ This project uses Palinode for persistent memory via MCP (server name: `palinode
 - When making an architectural or design decision, save the decision AND the
   rationale as `type="Decision"`.
 - Save surprising reusable findings as `type="Insight"`.
-- Every ~30 minutes of active work, save a one-line progress note.
+- After roughly 30 minutes, save a progress note only if new durable progress
+  has accumulated. Skip timer-based writes during recall-only work.
+- `palinode_save` and `palinode_session_end` are explicit, content-bearing
+  writes. They are separate from any opt-in client hook and from background
+  auto-summary enrichment.
 
 """
 
@@ -70,14 +74,18 @@ This project's slug is `{project_slug}`. Pass it as the `project` argument to
 
 _CLAUDE_SESSION_END = """\
 ### At session end — including `/clear`
-- Call `palinode_session_end` with `summary`, `decisions`, `blockers`, and
-  `project="{project_slug}"` before the session terminates.
-- `/clear` counts as a session end. The SessionEnd hook installed by
-  `palinode init` captures a fallback snapshot automatically, but calling
-  `palinode_session_end` from the agent first produces a far better record.
+- At a user-requested wrap-up, or when the session produced new durable
+  information, call `palinode_session_end` with `summary`, `decisions`,
+  `blockers`, and `project="{project_slug}"`.
+- Do not create a recap for a recall-only or no-new-information session, and
+  honor an explicit request not to save.
+- `/clear` by itself does not override that choice. The SessionEnd hook
+  installed by `palinode init --hook` is an opt-in automatic fallback;
+  plain `palinode init` does not enable transcript capture.
 - The user may type `/wrap` (session wrap-up) as a shortcut. It is
-  **deterministic** — always `palinode_session_end` with
-  summary/decisions/blockers, before `/clear`. See the `/wrap` command/skill
+  an explicit request to capture: perform its deterministic
+  `palinode_session_end` with summary/decisions/blockers before `/clear`,
+  unless the user separately says not to save. See the `/wrap` command/skill
   definition (installed by `palinode init`) for the exact prompt.
 - Mid-session checkpoints go through the `palinode_save` tool directly
   (`type="ProjectSnapshot"`); there is no separate slash command for them.
@@ -87,8 +95,12 @@ _CLAUDE_SESSION_END = """\
 
 _NEUTRAL_SESSION_END = """\
 ### At session end
-- Call `palinode_session_end` with `summary`, `decisions`, `blockers`, and
-  `project="{project_slug}"` before the session terminates.
+- At a user-requested wrap-up, or when the session produced new durable
+  information, call `palinode_session_end` with `summary`, `decisions`,
+  `blockers`, and `project="{project_slug}"`.
+- Do not create a recap for a recall-only or no-new-information session, and
+  honor an explicit request not to save. Explicit tool writes remain separate
+  from opt-in client hooks and background auto-summary enrichment.
 
 """
 
@@ -144,10 +156,9 @@ HOOK_SCRIPT = """\
 # Fires on SessionEnd (including /clear, logout, exit). Reads the transcript
 # from stdin JSON, extracts a minimal summary, and POSTs to palinode-api.
 #
-# Fail-silent by design — never block Claude Code exit. If the API is
-# unreachable the capture is appended to a local replay log
-# (.claude/session-floor-fallback.jsonl) rather than lost, and the hook still
-# exits cleanly.
+# Fail-silent by design — never block Claude Code exit. Automatic capture is
+# gated by the persisted control service; a denial or unavailable service exits
+# before reading a transcript and never writes a content-bearing fallback.
 #
 # Install:
 #   1. Copy to .claude/hooks/palinode-session-end.sh (or ~/.claude/hooks/…)
@@ -181,7 +192,23 @@ fi
 INPUT=$(cat)
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 SOURCE_REASON=$(echo "$INPUT" | jq -r '.source // .reason // "other"')
+
+# This preflight intentionally precedes every transcript operation. A malformed
+# or unavailable response fails closed without emitting user content.
+CONTROL_PAYLOAD=$(jq -n \\
+  --arg cwd "$CWD" --arg source_path "$TRANSCRIPT_PATH" \\
+  '{action: "capture", cwd: $cwd, source_path: $source_path, automatic: true}')
+CONTROL=$(curl -sS -f \\
+  -X POST "${PALINODE_API}/controls/check" \\
+  ${AUTH[@]+"${AUTH[@]}"} \\
+  -H "Content-Type: application/json" \\
+  -d "$CONTROL_PAYLOAD" \\
+  --connect-timeout 2 \\
+  --max-time "${HOOK_TIMEOUT}" 2>/dev/null) || exit 0
+[ "$(echo "$CONTROL" | jq -r 'if .allowed == true then "yes" else "no" end' 2>/dev/null)" = "yes" ] || exit 0
+PROJECT=$(echo "$CONTROL" | jq -r '.project // empty' 2>/dev/null) || exit 0
 
 # Drop reasons we're not capturing. Word-boundary match on a space-padded
 # allowlist so substrings (e.g. "log" in "logout") don't false-positive.
@@ -201,7 +228,10 @@ fi
 # strictly richer than this deterministic floor, so writing the floor too just
 # duplicates. Skip. Override with PALINODE_HOOK_FORCE=1 to capture regardless.
 if [ "${PALINODE_HOOK_FORCE:-0}" != "1" ] \\
-   && grep -q 'palinode_session_end' "$TRANSCRIPT_PATH" 2>/dev/null; then
+   && jq -e -s 'any(.[]; .type == "assistant"
+       and any(.message.content[]?; .type == "tool_use"
+           and .name == "palinode_session_end"))' \\
+       "$TRANSCRIPT_PATH" >/dev/null 2>&1; then
   exit 0
 fi
 
@@ -223,8 +253,6 @@ MSG_COUNT=${MSG_COUNT:-0}
 if [ "$MSG_COUNT" -lt "$MIN_MESSAGES" ]; then
   exit 0
 fi
-
-PROJECT=$(basename "$CWD" 2>/dev/null || echo "unknown")
 
 # The first user turn is a *topic hint*, not content — and in Claude Code it is
 # routinely wrapped in harness markup (slash-command expansion, system
@@ -250,7 +278,13 @@ PAYLOAD=$(jq -n \\
   --arg summary "$SUMMARY" \\
   --arg project "$PROJECT" \\
   --arg source "claude-code-hook" \\
-  '{summary: $summary, project: $project, source: $source, decisions: [], blockers: []}')
+  --arg cwd "$CWD" \\
+  --arg source_path "$TRANSCRIPT_PATH" \\
+  --arg session_id "$SESSION_ID" \\
+  '{summary: $summary, project: $project, source: $source, cwd: $cwd,
+    source_path: $source_path, session_id: $session_id,
+    trigger: "session-end-hook", automatic: true,
+    decisions: [], blockers: []}')
 
 # Dry-run: print what would be POSTed and write nothing. Lets you verify the
 # hook wiring (reasons, triviality gate, payload shape) without touching the
@@ -261,21 +295,16 @@ if [ "${PALINODE_HOOK_DRYRUN:-0}" = "1" ]; then
   exit 0
 fi
 
-# POST the capture. `-f` makes curl fail on HTTP >=400 too (not just connection
-# errors), so a 5xx also routes to the fallback below. On ANY failure, never
-# lose the capture — append the payload to a local fallback log a later session
-# can replay. Always exit 0: a floor-capture failure must not block session exit.
-if ! curl -sS -o /dev/null -f \\
+# The API rechecks the persisted policy immediately before its write. Do not
+# persist a fallback on failure: a 403 may mean the user paused capture after
+# this preflight.
+curl -sS -o /dev/null -f \\
     -X POST "${PALINODE_API}/session-end" \\
     ${AUTH[@]+"${AUTH[@]}"} \\
     -H "Content-Type: application/json" \\
     -d "$PAYLOAD" \\
     --connect-timeout 5 \\
-    --max-time "${HOOK_TIMEOUT}"; then
-  FALLBACK="${CLAUDE_PROJECT_DIR:-$CWD}/.claude/session-floor-fallback.jsonl"
-  mkdir -p "$(dirname "$FALLBACK")" 2>/dev/null || true
-  printf '%s\\n' "$PAYLOAD" >> "$FALLBACK" 2>/dev/null || true
-fi
+    --max-time "${HOOK_TIMEOUT}" 2>/dev/null || true
 
 exit 0
 """
@@ -337,6 +366,20 @@ INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 SOURCE=$(echo "$INPUT" | jq -r '.source // "startup"')
+
+# Future automatic recall is controlled before priming or reading the core
+# list. If controls are unavailable, fail closed: an unavailable pause control
+# must not turn into an unannounced injection.
+CONTROL_PAYLOAD=$(jq -n --arg cwd "$CWD" \\
+  '{action: "recall", cwd: $cwd, automatic: true}')
+CONTROL=$(curl -sS -f \\
+  -X POST "${PALINODE_API}/controls/check" \\
+  ${AUTH[@]+"${AUTH[@]}"} \\
+  -H "Content-Type: application/json" \\
+  -d "$CONTROL_PAYLOAD" \\
+  --connect-timeout 2 \\
+  --max-time "${HOOK_TIMEOUT}" 2>/dev/null) || exit 0
+[ "$(echo "$CONTROL" | jq -r 'if .allowed == true then "yes" else "no" end' 2>/dev/null)" = "yes" ] || exit 0
 
 # Word-boundary match on a space-padded allowlist so substrings don't
 # false-positive (same pattern as palinode-session-end.sh).
@@ -401,6 +444,18 @@ ${DIGEST}"
 
 # Bound total size so a pathological store can't flood the context window.
 CONTEXT="${CONTEXT:0:${MAX_CHARS}}"
+
+# Recheck at the output boundary: a pause can be applied while the hook was
+# priming or reading the core list. Do not inject context authorized only by
+# the earlier preflight.
+FINAL_CONTROL=$(curl -sS -f \\
+  -X POST "${PALINODE_API}/controls/check" \\
+  ${AUTH[@]+"${AUTH[@]}"} \\
+  -H "Content-Type: application/json" \\
+  -d "$CONTROL_PAYLOAD" \\
+  --connect-timeout 2 \\
+  --max-time "${HOOK_TIMEOUT}" 2>/dev/null) || exit 0
+[ "$(echo "$FINAL_CONTROL" | jq -r 'if .allowed == true then "yes" else "no" end' 2>/dev/null)" = "yes" ] || exit 0
 
 jq -n --arg ctx "$CONTEXT" \\
   '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'
@@ -576,6 +631,22 @@ trim_to_boundary() {
 }
 
 INPUT=$(cat)
+CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+
+# Check controls before extracting the prompt. The hook input necessarily
+# carries the prompt envelope, but no prompt body is parsed, logged, or sent to
+# a recall endpoint until automatic recall is explicitly allowed.
+CONTROL_PAYLOAD=$(jq -n --arg cwd "$CWD" \\
+  '{action: "recall", cwd: $cwd, automatic: true}')
+CONTROL=$(curl -sS -f \\
+  -X POST "${PALINODE_API}/controls/check" \\
+  ${AUTH[@]+"${AUTH[@]}"} \\
+  -H "Content-Type: application/json" \\
+  -d "$CONTROL_PAYLOAD" \\
+  --connect-timeout 1 \\
+  --max-time "${HOOK_TIMEOUT}" 2>/dev/null) || exit 0
+[ "$(echo "$CONTROL" | jq -r 'if .allowed == true then "yes" else "no" end' 2>/dev/null)" = "yes" ] || exit 0
+
 PROMPT=$(echo "$INPUT" | jq -r '.prompt // empty')
 
 # Trivial-prompt gate: "yes", "ok", "continue" carry no recall signal, and
@@ -747,6 +818,17 @@ CONTEXT=$(trim_to_boundary "$CONTEXT" "$MAX_CHARS") || CONTEXT=""
 
 # Nothing survived the trim honestly — say nothing rather than a fragment.
 [ -n "$CONTEXT" ] || exit 0
+
+# Recheck at the output boundary: controls may have changed while recall was
+# resolving. A denied or unavailable control service must suppress injection.
+FINAL_CONTROL=$(curl -sS -f \\
+  -X POST "${PALINODE_API}/controls/check" \\
+  ${AUTH[@]+"${AUTH[@]}"} \\
+  -H "Content-Type: application/json" \\
+  -d "$CONTROL_PAYLOAD" \\
+  --connect-timeout 1 \\
+  --max-time "${HOOK_TIMEOUT}" 2>/dev/null) || exit 0
+[ "$(echo "$FINAL_CONTROL" | jq -r 'if .allowed == true then "yes" else "no" end' 2>/dev/null)" = "yes" ] || exit 0
 
 jq -n --arg ctx "$CONTEXT" \\
   '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext: $ctx}}'
@@ -1168,7 +1250,7 @@ def _write_session_skill(skills_root: Path, force: bool) -> str:
 PALINODE_SESSION_SKILL = """\
 ---
 name: palinode-session
-description: "Automatically manage persistent memory during coding sessions via Palinode MCP. Fires when: starting a new task, completing a milestone, making a decision, finishing a session, or when 30+ minutes have passed since last save. Also fires on 'save to memory', 'remember this', 'what do we know about'. Do NOT fire on trivial file edits or routine commands."
+description: "Guide intentional persistent-memory capture during coding sessions via Palinode MCP. Recall at session start; save durable milestones, explicit wrap-ups, and user-requested memories. Do NOT write for recall-only/no-new-information sessions or after an explicit no-save request."
 ---
 
 # Palinode Session Memory
@@ -1211,7 +1293,10 @@ palinode_save(
 
 ## Every ~30 Minutes
 
-If actively working and 30+ minutes since last palinode_save, save a brief progress note:
+If actively working and new durable progress has accumulated, consider a brief
+progress note after roughly 30 minutes. Do not turn this into a timer-based
+write for a recall-only/no-new-information session, and honor an explicit
+request not to save:
 
 ```
 palinode_save(
@@ -1222,7 +1307,8 @@ palinode_save(
 
 ## On Session End
 
-Before the user exits, capture the session:
+At a user-requested wrap-up, or when the session produced new durable
+information, capture the session:
 
 ```
 palinode_session_end(
@@ -1232,6 +1318,15 @@ palinode_session_end(
   project="[project-slug]"
 )
 ```
+
+Do not create a recap for a recall-only or no-new-information session, and
+honor an explicit request not to save. `palinode_save` and
+`palinode_session_end` are intentional, content-bearing MCP writes; they are
+separate from opt-in client hooks and background auto-summary enrichment.
+`palinode init --no-hook` leaves automatic hooks off, but this skill can still
+guide an agent to make an intentional explicit tool call. When the user invokes
+`/wrap`, preserve that explicit requested session-end write unless the user
+separately says not to save.
 
 ## Tool Reference
 
@@ -1756,8 +1851,12 @@ def _display_path(path: Path, target: Path) -> str:
 )
 @click.option(
     "--hook/--no-hook",
-    default=True,
-    help="Install the SessionStart + SessionEnd hook scripts + .claude/settings.json",
+    default=None,
+    help=(
+        "Opt in to Claude Code automatic hooks (including transcript-derived "
+        "SessionEnd capture). Default: off for a new project; preserve the "
+        "existing choice when Palinode hooks are already installed."
+    ),
 )
 @click.option(
     "--slash/--no-slash",
@@ -1793,8 +1892,9 @@ def _display_path(path: Path, target: Path) -> str:
     "session_skill",
     default=True,
     help=(
-        "Install the palinode-session skill (ambient memory behavior: recall "
-        "at start, save milestones, session-end capture) into the project's "
+        "Install the palinode-session skill (instruction-driven guidance: "
+        "recall at start and conditional explicit MCP saves/session-end calls, "
+        "not automatic hook capture) into the project's "
         "harness skill paths — .claude/skills/ always, plus .cursor/skills/ "
         "and .agent/skills/ when those harness footprints exist. Default: on."
     ),
@@ -1930,6 +2030,12 @@ def init(
     if cursor is None:
         cursor = (target / ".cursor").is_dir()
 
+    # A transcript is a new automatic source, so a fresh project must opt in
+    # explicitly with --hook. Existing hook installations are left in their
+    # chosen mode on re-run; --force remains required to replace their scripts.
+    if hook is None:
+        hook = (target / ".claude" / "hooks" / "palinode-session-end.sh").is_file()
+
     # 'personal' scope makes /wrap typeable in every project, not just this
     # one. /wrap is the sole lifecycle command — /save and /ps are
     # deprecated and no longer scaffolded (mid-session checkpoints call the
@@ -1985,8 +2091,24 @@ def init(
     )
     plan = build_plan(target, opts)
 
+    click.echo("Before your first capture:")
+    click.echo("  Memories are readable Markdown and Git history.")
+    click.echo("  private/restricted control discovery by scope, not encryption or user/agent authentication.")
+    click.echo("  API callers can read hidden known paths and access full-store maintenance tools.")
+    click.echo("  Protect the store, backups and API token; use filesystem permissions or separate instances.")
+    click.echo("  Contract: docs/PRIVACY.md (privacy and visibility).")
+    click.echo("  Before enabling hooks, run `palinode controls status` for control state and redacted effective destinations.")
+    click.echo("")
     click.echo(f"Palinode init → {target}")
     click.echo(f"  project slug: {slug}")
+    if hook:
+        click.echo("  automatic Claude hooks: enabled by --hook (SessionEnd reads the Claude transcript; controls can pause/exclude it)")
+    else:
+        click.echo("  automatic Claude hooks: not installed (use --hook to opt in to SessionStart, prompt recall, and transcript-derived SessionEnd capture)")
+    if session_skill:
+        click.echo("  instruction-driven session capture: palinode-session skill selected; it can guide conditional explicit MCP writes even without --hook")
+    else:
+        click.echo("  palinode-session skill: not selected (--no-skill); generated memory instructions can still guide explicit MCP writes")
     click.echo("")
 
     if dry_run:

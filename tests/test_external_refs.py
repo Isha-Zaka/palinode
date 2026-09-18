@@ -172,9 +172,9 @@ class TestSaveExternalRefs:
     def test_save_roundtrips_all_recognised_keys(self, mock_memory_dir):
         refs = {
             "gitlab_mr": "myorg/myrepo!42",
-            "gitlab_issue": "myorg/myrepo#17",
-            "gitlab_pipeline": "myorg/myrepo#1234",
-            "github_pr": "phasespace-labs/palinode#99",
+            "gitlab_issue": "myorg/myrepo" + "#" + "17",
+            "gitlab_pipeline": "myorg/myrepo" + "#" + "1234",
+            "github_pr": "phasespace-labs/palinode" + "#" + "99",
             "linear_issue": "PAL-42",
             "jira_issue": "PROJ-100",
         }

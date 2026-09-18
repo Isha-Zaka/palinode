@@ -149,6 +149,11 @@ ADMIN_EXEMPT_OPERATIONS: frozenset[str] = frozenset(
         "health",
         "git-stats",
         "generate-summaries",
+        # Store-operator policy management and its generated-hook preflight.
+        # These are deliberately API-only: adding MCP tools would let an
+        # agent mutate capture controls instead of keeping that authority with
+        # the local operator/API client.
+        "capture-controls",
     }
 )
 
@@ -784,6 +789,11 @@ INVENTORY_INFRA: dict[Surface, frozenset[str]] = {
             "GET /health/auto-summary",
             "GET /health/watcher",
             "POST /generate-summaries",
+            # ADMIN_EXEMPT capture-controls: persisted operator policy and the
+            # hook preflight endpoint are control-plane APIs, not memory tools.
+            "GET /controls",
+            "POST /controls",
+            "POST /controls/check",
             # Full-database operations (ADMIN_EXEMPT)
             "POST /reindex",
             "POST /rebuild-fts",
@@ -799,6 +809,13 @@ INVENTORY_INFRA: dict[Surface, frozenset[str]] = {
             "banner",
             "config edit",
             "config view",
+            # Server-owned operator control plane, surfaced locally through
+            # the CLI rather than as agent-callable MCP tools.
+            "controls exclude-path",
+            "controls exclude-project",
+            "controls pause",
+            "controls resume",
+            "controls status",
             "doctor",
             "start",
             "stop",

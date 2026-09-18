@@ -53,5 +53,5 @@ def test_palinode_cli_list_attribute_does_not_shadow_builtin():
     list_attr = getattr(palinode.cli, "list", None)
     assert not isinstance(list_attr, types.ModuleType), (
         "palinode.cli.list resolves to a submodule again — this is the "
-        "exact shape that broke palinode config view (#274). Rename it."
+        "exact shape that broke palinode config view. Rename it."
     )

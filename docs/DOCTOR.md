@@ -40,7 +40,7 @@ palinode doctor --fix --dry-run  # 3. preview safe fixes if any apply
 
 ## The check catalog
 
-There are 23 checks across six categories. Severity is one of `info`, `warn`, `error`, `critical`; `passed=True` means the check did not detect a problem (a passed `info` check still appears in the report so the operator can see the resolved state).
+The checks are grouped in six categories. Severity is one of `info`, `warn`, `error`, `critical`; `passed=True` means the check did not detect a problem (a passed `info` check still appears in the report so the operator can see the resolved state).
 
 ### Path integrity
 
@@ -149,7 +149,7 @@ Remediation: `systemctl --user restart palinode-watcher`. If that does not pick 
 
 ### Config drift
 
-Config-vs-runtime consistency checks. All `fast` (no network).
+Config-vs-runtime consistency checks. No network. All `fast` except `consolidation_schedule_effective`, which shells out to `crontab` and is therefore `deep`.
 
 | Check | Severity | Catches |
 |---|---|---|
@@ -158,6 +158,8 @@ Config-vs-runtime consistency checks. All `fast` (no network).
 | `process_env_drift` | warn / info | A running palinode-{api,mcp,watcher} has stale `PALINODE_DIR` |
 | `prompts_current` | warn / info | The store's consolidation prompts lag the ones shipped with this release |
 | `consolidation_targets_tagged` | warn / info | A consolidation target document carries body bullets but no `<!-- fact:id -->` markers, so every pass over it proposes nothing |
+| `consolidation_schedule_effective` | warn / info | The cron line runs a `--days N` lookback that differs from the configured one, so the config states a scope no pass actually uses |
+| `consolidation_last_run` | error / warn / info | Consecutive consolidation passes have failed — error at a streak as long as the nightly's lookback (the streak that drops a day of notes from every window), warn one short of it |
 
 #### `env_vs_yaml_consistency`
 
@@ -213,6 +215,37 @@ The check reads every `projects/*-status.md`, plus the target of any project a r
 Session-end mints an id on each line it appends, so this fires on stores that predate that fix and on documents built by hand or by an importer that does not mint — not on ongoing use.
 
 Tagged `fast`: one directory glob plus a bounded read of the recent daily notes, no network.
+
+#### `consolidation_schedule_effective`
+
+`palinode.config.yaml` declares the consolidation lookback — `consolidation.lookback_days` for the weekly pass, `consolidation.nightly.lookback_days` for the nightly one. The cron line that runs the pass may also pass `--days N`, and when it does the argument wins: the entry point reads `--days` from its argv and falls back to the configured value only when it is absent. Nothing announced the override, and on one real host the two disagreed in both directions for months — a nightly declaring 1 running 3, a weekly declaring 7 running 3. The cost is not the scope itself but the reasoning done from the wrong number: a failed nightly was diagnosed against a one-day window it never had.
+
+So the check reports the **effective** lookback whether or not it disagrees. Most of its value is the passing result — "nightly: `--days 1`, matching `consolidation.nightly.lookback_days=1`" is the line that ends the question.
+
+It looks in `/etc/cron.d/*`, `/etc/crontab`, and `crontab -l` for the invoking user; when doctor is not root it also tries `crontab -l -u root`, so that "I could not see root's crontab" is said rather than assumed. Files in `/etc/cron.d` whose names fall outside run-parts' `[A-Za-z0-9_-]` rule are skipped **because cron skips them** — a `palinode.bak-20260531` sitting in that directory is inert, and reporting its schedule as live would be worse than saying nothing. They are named in the output either way.
+
+- Warn: a line's `--days N` differs from the configured value (the message gives both numbers and states that cron wins); two lines invoke the same pass, so there is no single effective value; or a line cannot be read — an unparseable schedule (cron will not run it either), a non-integer `--days`, a trailing `--days` with no value, or the attached `--days=3` form, which the entry point does not read at all.
+- Info: the values agree, or the cron line passes no `--days` and the config genuinely governs.
+- Info: no consolidation entry found, no readable cron source, or not Linux. Each names what it looked at and why it came up empty. **Never a failure** — a check that fails on every laptop is a check nobody reads on the host where it matters.
+
+It reports only. It never edits a cron file or the config: which side should move is a judgement about what the weekly pass is *for*, and doctor does not have it. The schedule expression is printed but never compared against `consolidation.schedule`, because the crontab is an upper bound and the activity gate decides whether a tick does any work (see [OPERATIONS.md](OPERATIONS.md#consolidation-scheduling)) — flagging a difference there would fire on every host following the documented advice.
+
+Tagged `deep`: a handful of small file reads plus a `crontab` subprocess.
+
+#### `consolidation_last_run`
+
+`consolidation_schedule_effective` says what should run; this one says whether it did. Every real consolidation pass — cron, `palinode consolidate`, `POST /consolidate` — appends its outcome to the activity gate's state file (`<memory_dir>/.palinode/consolidation-state.json`, under `runs`): start and finish time, mode, the runner's status (`success`, `partial`, `no_new_notes`, `no notes found`, or `error` when the pass raised), the failed project ids, and the lookback it ran. The check reads that history and reports, per mode, the last run and the number of **consecutive failed passes**, derived by walking back from the newest record to the last success — never a stored counter, so a hand-edited file cannot put the count and the history out of step.
+
+The count is the number that matters. The nightly does not archive what it consolidates, so with a lookback of *L* days a day's notes are in the window of *L* consecutive nightlies: they survive *L*−1 failures and leave the nightly's view on the *L*-th. The weekly does not catch them — its own window (3 days by default, Sundays in the shipped crontab) reaches back only a few days from its run. *L* silent failures in a row is the only way a day of notes is lost, and before this check the only thing that said a nightly failed was the cron log; one real partial (the model's reply cut off at the token cap) was found by someone reading it by hand. The thresholds therefore follow the lookback the nightly actually ran, read from the newest record (or the configured `consolidation.nightly.lookback_days` when the record has none), and the message states the arithmetic in those numbers: on the shipped default of 1 a single failure is already the lost day and is an error outright; a host running `--days 3` warns at two and errors at three.
+
+- Error: a nightly streak as long as its lookback, or three or more consecutive failed weekly passes.
+- Warn: a nightly streak one short of that (never below one), or two consecutive failed weekly passes. For the nightly the message says why the next one matters: the next consecutive failure loses a day of notes. `partial` and `error` are failures; the idle statuses are not (a pass that found nothing in its window left nothing behind), and a `--dry-run` is never recorded, since a dry-run "success" would reset a real streak.
+- Info: the last pass succeeded, or the streak is below the warn threshold. The message still carries the facts — last run's status, time, `--days`, failed projects or the exception — plus when the last successful pass of each mode started, in hours, against its cadence. A store whose state file predates outcome records reports the gate's clock instead (the last successful start it knows of) and says outcomes are kept from this release on.
+- Info: no state file, or one that cannot be read or parsed. Names the path and the reason. **Never a failure** — on a laptop that consolidates by hand the absence is expected, and the message says so when no palinode cron is shipped for the platform.
+
+The remediation names where to read the cause (the runner logs it: `finish_reason=length` for the token cap, an open circuit for an unreachable endpoint, a prose-only reply) and the hand-run that recovers the missed days; an on-demand pass records its outcome too, so a success resets the streak. The cron log itself is not read — palinode does not know where the crontab redirected it.
+
+Tagged `fast`: one small JSON read.
 
 ### Index sanity
 

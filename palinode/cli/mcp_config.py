@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import platform
+import re
 import sys
+import sysconfig
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +33,7 @@ from palinode.cli._format import console
 DEFAULT_HTTP_HOST = "<palinode-host>"
 DEFAULT_HTTP_PORT = 6341
 DEFAULT_STDIO_COMMAND = "palinode-mcp"
+_PROJECT_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 # ---------------------------------------------------------------------------
@@ -50,15 +55,141 @@ def _build_http_entry(url: str, bearer: str | None = None) -> dict[str, Any]:
     """Build the ``palinode`` server entry for streamable-HTTP transport."""
     entry: dict[str, Any] = {"type": "http", "url": url}
     if bearer:
-        # Forward-compat for (MCP bearer-auth parity). The Tailscale-isolated
-        # endpoint is token-less today; pass --bearer once auth lands there.
         entry["headers"] = {"Authorization": f"Bearer {bearer}"}
     return entry
 
 
-def _build_stdio_entry() -> dict[str, Any]:
-    """Build the ``palinode`` server entry for local stdio transport."""
-    return {"command": DEFAULT_STDIO_COMMAND, "env": {}}
+def _resolve_executable(executable: str | None = None) -> str:
+    """Use this installation's recorded script, never an unrelated PATH hit."""
+    name = DEFAULT_STDIO_COMMAND + (".exe" if os.name == "nt" else "")
+    if executable is not None:
+        path = Path(executable).expanduser()
+        if not path.is_absolute() or ".." in path.parts:
+            raise click.ClickException("--executable must be an absolute path without '..'.")
+        if any(part.is_symlink() for part in (path, *path.parents)):
+            raise click.ClickException("--executable must name the real executable, not a symlink.")
+        candidates = [path]
+    else:
+        try:
+            dist = metadata.distribution("palinode")
+            candidates = [Path(dist.locate_file(f)).resolve()
+                          for f in (dist.files or []) if f.name == name]
+        except metadata.PackageNotFoundError:
+            candidates = []
+        if not candidates:
+            # Do not resolve sys.executable: venv Python often links to base Python.
+            candidates = [Path(sys.executable).absolute().parent / name,
+                          Path(sysconfig.get_path("scripts")) / name]
+    usable = sorted({p.absolute() for p in candidates if p.is_file() and os.access(p, os.X_OK)})
+    if len(usable) != 1:
+        reason = "Ambiguous" if len(usable) > 1 else "Missing or non-executable"
+        raise click.ClickException(
+            f"{reason} palinode-mcp for this installation. "
+            "Run the intended installation's palinode command, reinstall Palinode there, "
+            "or pass --executable /absolute/path/to/palinode-mcp."
+        )
+    return str(usable[0])
+
+
+def _validate_project_slug(_ctx: click.Context, _param: click.Parameter,
+                           value: str | None) -> str | None:
+    """Accept only a plain, safe project slug for a generated process env."""
+    if value is None:
+        return None
+    if not _PROJECT_SLUG_RE.fullmatch(value):
+        raise click.BadParameter(
+            "must be a slug containing letters, numbers, '.', '_' or '-' "
+            "(not a project/ ref or path)"
+        )
+    return value
+
+
+def _stdio_env(project: str | None = None) -> dict[str, str]:
+    """Carry connection settings across a GUI launch without copying the shell."""
+    from palinode.core.config import config
+
+    env = {
+        "PALINODE_DIR": str(Path(config.memory_dir).expanduser().absolute()),
+        "PALINODE_API_HOST": config.services.api.host,
+        "PALINODE_API_PORT": str(config.services.api.port),
+    }
+    for key in ("PALINODE_API_TOKEN", "PALINODE_API_TOKEN_FILE", "PALINODE_PROJECT",
+                "PALINODE_MCP_SURFACE", "PALINODE_ORG", "PALINODE_MEMBER",
+                "PALINODE_HARNESS", "PALINODE_AGENT"):
+        if key in os.environ:
+            value = os.environ[key]
+            if key.endswith("_FILE") and value:
+                value = str(Path(value).expanduser().absolute())
+            env[key] = value
+    # A generated entry names one spawned stdio process. Its explicit scope
+    # must win over a shell's ambient scope without changing any other client.
+    if project is not None:
+        env["PALINODE_PROJECT"] = project
+    return env
+
+
+def _build_stdio_entry(executable: str | None = None,
+                       project: str | None = None) -> dict[str, Any]:
+    """Build a local entry bound to the intended installed executable."""
+    return {"command": _resolve_executable(executable), "env": _stdio_env(project)}
+
+
+EDITORS = ("generic", "claude-code", "codex", "continue", "claude-desktop")
+MERGE_HELP = {
+    "generic": "Merge palinode into your client's mcpServers object; consult its config documentation.",
+    "claude-code": "Merge palinode into mcpServers in .mcp.json at your project root. "
+                   "Approve the project server when Claude Code prompts; use /mcp to verify.",
+    "codex": "Merge [mcp_servers.palinode] into ~/.codex/config.toml "
+             "($CODEX_HOME/config.toml if set), or .codex/config.toml in a trusted project. "
+             "Update an existing table instead of appending a duplicate. Use /mcp to verify.",
+    "continue": "Merge the palinode item into the mcpServers list in ~/.continue/config.yaml. "
+                "Keep the existing name, version, schema and models; use Agent mode to verify.",
+    "claude-desktop": "Merge palinode into mcpServers in Claude Desktop's claude_desktop_config.json "
+                      "(macOS: ~/Library/Application Support/Claude/; Windows: %APPDATA%/Claude/). "
+                      "Quit Desktop before editing, then relaunch.",
+}
+
+
+def _client_block(entry: dict[str, Any], editor: str) -> dict[str, Any]:
+    entry = dict(entry)
+    if editor == "codex":
+        entry.pop("type", None)
+        if "headers" in entry:
+            entry["http_headers"] = entry.pop("headers")
+        return {"mcp_servers": {"palinode": entry}}
+    if editor == "continue":
+        entry["type"] = "streamable-http" if "url" in entry else "stdio"
+        if "headers" in entry:
+            entry["requestOptions"] = {"headers": entry.pop("headers")}
+        return {"mcpServers": [{"name": "palinode", **entry}]}
+    if editor == "claude-code" and "command" in entry:
+        entry["type"] = "stdio"
+    return _wrap_block(entry)
+
+
+def _toml_string(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def _serialize_block(block: dict[str, Any], editor: str) -> str:
+    if editor == "continue":
+        import yaml
+        return yaml.safe_dump(block, sort_keys=False, allow_unicode=True).rstrip()
+    if editor == "codex":
+        # Our TOML subset is strings and string maps. JSON quoting also escapes
+        # Windows backslashes, quotes and control characters correctly for TOML.
+        entry = block["mcp_servers"]["palinode"]
+        lines = ["[mcp_servers.palinode]"]
+        for key, value in entry.items():
+            if not isinstance(value, dict):
+                lines.append(f"{key} = {_toml_string(value)}")
+        for key, value in entry.items():
+            if isinstance(value, dict):
+                lines.extend(["", f"[mcp_servers.palinode.{key}]"])
+                lines.extend(f"{_toml_string(k)} = {_toml_string(v)}"
+                             for k, v in value.items())
+        return "\n".join(lines)
+    return json.dumps(block, indent=2)
 
 
 def _wrap_block(entry: dict[str, Any]) -> dict[str, Any]:
@@ -78,7 +209,12 @@ def _candidate_paths() -> list[tuple[str, Path]]:
     home = Path.home()
     system = platform.system()
 
-    paths: list[tuple[str, Path]] = []
+    paths: list[tuple[str, Path]] = [
+        ("Claude Code project (.mcp.json)", Path.cwd() / ".mcp.json"),
+        ("Codex user config", Path(os.environ.get("CODEX_HOME") or home / ".codex") / "config.toml"),
+        ("Codex project config (trusted projects)", Path.cwd() / ".codex" / "config.toml"),
+        ("Continue user config", home / ".continue" / "config.yaml"),
+    ]
 
     # Claude Code CLI — the one users edit most often but may be wrong
     paths.append((
@@ -98,7 +234,6 @@ def _candidate_paths() -> list[tuple[str, Path]]:
             home / "Library" / "Application Support" / "Claude-3p" / "claude_desktop_config.json",
         ))
     elif system == "Windows":
-        import os
         appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
         paths.append((
             "Claude Desktop (Windows) — %APPDATA%\\Claude\\claude_desktop_config.json",
@@ -134,7 +269,6 @@ def _candidate_paths() -> list[tuple[str, Path]]:
             / "mcp_settings.json",
         ))
     elif system == "Windows":
-        import os
         appdata = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming"))
         paths.append((
             "Cline (Windows) — %APPDATA%\\Code\\User\\globalStorage\\saoudrizwan.claude-dev\\settings\\cline_mcp_settings.json",
@@ -181,7 +315,7 @@ def _candidate_paths() -> list[tuple[str, Path]]:
 # ---------------------------------------------------------------------------
 
 def _read_config(path: Path) -> tuple[dict[str, Any] | None, str | None]:
-    """Read and parse a JSON config file.
+    """Read and parse a JSON, TOML or YAML config file.
 
     Returns (data, error_message).  One of the two will always be None.
     """
@@ -190,10 +324,23 @@ def _read_config(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     except OSError as exc:
         return None, f"could not read file: {exc}"
 
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError as exc:
-        return None, f"JSON parse error: {exc}"
+    if path.suffix == ".toml":
+        import tomllib
+        try:
+            data = tomllib.loads(text)
+        except tomllib.TOMLDecodeError:
+            return None, "TOML parse error (file contents omitted)"
+    elif path.suffix in (".yaml", ".yml"):
+        import yaml
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError:
+            return None, "YAML parse error (file contents omitted)"
+    else:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return None, "JSON parse error (file contents omitted)"
 
     if not isinstance(data, dict):
         return None, "unexpected top-level type (expected object)"
@@ -207,13 +354,54 @@ def _extract_palinode_entry(data: dict[str, Any]) -> dict[str, Any] | None:
     Checks both ``mcpServers`` (Claude Desktop / Cline / Cursor shape) and
     ``context_servers`` (Zed shape).  Returns the first match found.
     """
-    for key in ("mcpServers", "context_servers"):
+    projects = data.get("projects")
+    project = projects.get(str(Path.cwd())) if isinstance(projects, dict) else None
+    local_servers = project.get("mcpServers") if isinstance(project, dict) else None
+    local_entry = local_servers.get("palinode") if isinstance(local_servers, dict) else None
+    if isinstance(local_entry, dict):
+        return local_entry
+    for key in ("mcpServers", "context_servers", "mcp_servers"):
         servers = data.get(key)
         if isinstance(servers, dict):
             entry = servers.get("palinode")
-            if entry is not None:
+            if isinstance(entry, dict):
                 return entry
+        if isinstance(servers, list):
+            for entry in servers:
+                if isinstance(entry, dict) and entry.get("name") == "palinode":
+                    return entry
     return None
+
+
+def _redact(value: Any) -> Any:
+    """Redact credential environment values, headers, arguments and URL credentials."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    if isinstance(value, list):
+        return [_redact(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key in ("env", "headers", "http_headers") and isinstance(item, dict):
+            result[key] = {
+                name: ("<redacted>" if key != "env" or any(
+                    part in name.upper() for part in ("TOKEN", "SECRET", "KEY", "PASSWORD", "AUTH")
+                ) else setting)
+                for name, setting in item.items()
+            }
+        elif key == "args":
+            result[key] = ["<redacted>"] if item else []
+        elif key in ("url", "serverUrl") and isinstance(item, str):
+            try:
+                parts = urlsplit(item)
+                result[key] = urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1],
+                                         parts.path, "<redacted>" if parts.query else "", ""))
+            except ValueError:
+                result[key] = "<redacted>"
+        else:
+            result[key] = _redact(item)
+    return result
 
 
 def _render_entry(entry: dict[str, Any] | None) -> str:
@@ -221,6 +409,7 @@ def _render_entry(entry: dict[str, Any] | None) -> str:
     if entry is None:
         return "(no palinode entry)"
 
+    entry = _redact(entry)
     if "url" in entry:
         return f"HTTP — url={entry['url']}"
 
@@ -268,7 +457,7 @@ class ConfigResult:
         if self.error:
             d["error"] = self.error
         elif self.entry is not None:
-            d["palinode_entry"] = self.entry
+            d["palinode_entry"] = _redact(self.entry)
             d["summary"] = _render_entry(self.entry)
         else:
             d["palinode_entry"] = None
@@ -302,8 +491,8 @@ def _check_divergence(results: list[ConfigResult]) -> list[tuple[ConfigResult, C
             if a.entry_json != b.entry_json:
                 diff = "\n".join(
                     difflib.unified_diff(
-                        (a.entry_json or "").splitlines(),
-                        (b.entry_json or "").splitlines(),
+                        json.dumps(_redact(a.entry), sort_keys=True, indent=2).splitlines(),
+                        json.dumps(_redact(b.entry), sort_keys=True, indent=2).splitlines(),
                         fromfile=str(a.path),
                         tofile=str(b.path),
                         lineterm="",
@@ -325,68 +514,32 @@ def _emit_config(
     port: int,
     bearer: str | None,
     output_json: bool,
+    editor: str = "generic",
+    executable: str | None = None,
+    project: str | None = None,
 ) -> None:
-    """Print a ready-to-paste MCP config block for the chosen transport.
-
-    TTY-aware: when piped (or --json), prints only the JSON block so the
-    output can be redirected straight into a config file; when interactive,
-    wraps it with guidance.
-    """
+    """Print a client-native fragment only; never open a destination for writing."""
+    if output_json and editor in ("codex", "continue"):
+        raise click.UsageError(f"{editor} requires {'TOML' if editor == 'codex' else 'YAML'}; omit --json.")
+    if emit_http and editor == "claude-desktop":
+        raise click.UsageError("Claude Desktop's local JSON config requires --stdio; use its Connectors UI for HTTP.")
     if emit_http:
-        resolved_url = _http_url(url, host, port)
-        entry = _build_http_entry(resolved_url, bearer=bearer)
+        entry = _build_http_entry(_http_url(url, host, port), bearer=bearer)
     else:
-        entry = _build_stdio_entry()
-    block = _wrap_block(entry)
-    block_json = json.dumps(block, indent=2)
-
-    # Piped / --json: emit the raw block only (no decoration).
+        entry = _build_stdio_entry(executable, project)
+    block = _client_block(entry, editor)
     if output_json or not sys.stdout.isatty():
-        click.echo(block_json)
+        click.echo(_serialize_block(block, editor))
         return
-
-    # Interactive: wrap with human guidance.
-    console.print()
-    if emit_http:
-        console.print("[bold]Palinode MCP — streamable-HTTP config[/bold]")
-    else:
-        console.print("[bold]Palinode MCP — stdio config[/bold]")
-    console.print()
-    console.print(
-        "Paste the [cyan]palinode[/cyan] entry into the config your client reads\n"
-        "(run [cyan]palinode mcp-config[/cyan] with no flags to find which file that is):"
-    )
-    console.print()
-    for line in block_json.splitlines():
-        console.print(f"  {line}")
-    console.print()
-
-    if emit_http:
-        console.print(
-            "[bold]Claude Code one-liner:[/bold]\n"
-            f"  [cyan]claude mcp add palinode --transport http --url {entry['url']}[/cyan]"
-        )
-        console.print()
-        if host == DEFAULT_HTTP_HOST and not url:
-            console.print(
-                f"[yellow]Replace [cyan]{DEFAULT_HTTP_HOST}[/cyan] with your palinode host[/yellow] "
-                "(the machine running palinode-mcp),\n"
-                "or re-run with [cyan]--host <name>[/cyan] / [cyan]--url <full-url>[/cyan]."
-            )
-            console.print()
-        console.print(
-            "Streamable-HTTP reuses the warm BGE-M3 model behind the running service —\n"
-            "no per-session Python cold-start and no persistent SSH tunnel.\n"
-            "[yellow]Note:[/yellow] Claude Desktop only accepts stdio entries — use [cyan]--stdio[/cyan] there."
-        )
-    else:
-        console.print(
-            "stdio runs a local [cyan]palinode-mcp[/cyan] process per session.\n"
-            "For a remote server, prefer [cyan]--http[/cyan] (warm model, no SSH/cold-start)."
-        )
-    console.print()
-    console.print("See [cyan]docs/MCP-CONFIG-HOMES.md[/cyan] for the full reference.")
-    console.print()
+    click.echo(f"Palinode MCP — {editor} {'HTTP' if emit_http else 'stdio'} preview")
+    click.echo(MERGE_HELP[editor])
+    click.echo("Generation never writes settings. Merge the fragment; do not overwrite the file.")
+    # The pasteable fragment carries configured credentials only in raw output.
+    safe_block = _redact(block)
+    if safe_block != block:
+        click.echo("Credentials hidden in this preview. Pipe output to a private preview file for the usable fragment.")
+    click.echo(_serialize_block(safe_block, editor))
+    click.echo("See docs/MCP-CONFIG-HOMES.md for destinations and verification.")
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +594,15 @@ def _emit_config(
     "--bearer",
     "bearer",
     default=None,
-    help="Optional bearer token for --http (forward-compat for bearer-auth parity).",
+    help="Optional bearer token for --http; included only in raw config output.",
+)
+@click.option("--editor", "--client", type=click.Choice(EDITORS), default="generic",
+              show_default=True, help="Client-native format and merge guidance (requires --stdio or --http).")
+@click.option("--executable", default=None, help="Explicit absolute MCP executable for --stdio.")
+@click.option(
+    "--project",
+    callback=_validate_project_slug,
+    help="Project slug for this generated stdio client (emitted as PALINODE_PROJECT).",
 )
 @click.option(
     "--json", "output_json",
@@ -457,11 +618,14 @@ def mcp_config(
     port: int,
     bearer: str | None,
     output_json: bool,
+    editor: str,
+    executable: str | None,
+    project: str | None,
 ) -> None:
     """Surface all MCP config-file homes, or emit a ready-to-paste config block.
 
     Default (no flags) walks every location a running MCP client might read,
-    parses the JSON, and reports what it finds for the 'palinode' server entry —
+    parses the client config, and reports what it finds for the 'palinode' server entry —
     useful when you edited one file and changes didn't take effect.
 
     With --http or --stdio, instead emit a copy-pasteable config block for the
@@ -472,6 +636,16 @@ def mcp_config(
 
     See docs/MCP-CONFIG-HOMES.md for the full canonical-location reference.
     """
+    if executable and not emit_stdio:
+        raise click.UsageError("--executable requires --stdio.")
+    if project is not None and not emit_stdio:
+        raise click.UsageError(
+            "--project requires --stdio; HTTP clients share the remote server process."
+        )
+    if editor != "generic" and not (emit_http or emit_stdio):
+        raise click.UsageError("--editor requires --stdio or --http.")
+    if emit_stdio and (url or bearer or host != DEFAULT_HTTP_HOST or port != DEFAULT_HTTP_PORT):
+        raise click.UsageError("--url, --host, --port and --bearer are HTTP options; use PALINODE_API_* for stdio.")
     # ---- Emit mode (--http / --stdio) -------------------------------------
     if emit_http or emit_stdio:
         if emit_http and emit_stdio:
@@ -483,6 +657,9 @@ def mcp_config(
             port=port,
             bearer=bearer,
             output_json=output_json,
+            editor=editor,
+            executable=executable,
+            project=project,
         )
         return
 
@@ -581,8 +758,7 @@ def mcp_config(
         console.print("[bold red]WARNING: configs diverge[/bold red]")
         console.print(
             "Multiple files have a 'palinode' entry but they differ.\n"
-            "Editing the wrong one is the silent-failure pattern documented in "
-            "docs/MCP-CONFIG-HOMES.md."
+            "Editing the wrong one can silently leave the intended configuration unchanged."
         )
         console.print()
         for a, b, diff in divergences:

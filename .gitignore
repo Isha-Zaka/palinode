@@ -90,6 +90,9 @@ nohup.out
 # Launch-posts working draft — local-only, not for git
 artifacts/launch-posts.md
 
+# Disposable agent/test stores; may contain transcript-derived memory and SQLite state.
+artifacts/scratch/
+
 # Public-sync working trees. Each is a full git CHECKOUT of the public repo or
 # a cut snapshot — one is 153 MB — regenerated per sync and never committed.
 # They are ignored not to save space but to keep `git status` legible: eight

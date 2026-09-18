@@ -53,7 +53,18 @@ def doctor(
             console.print(f"[red]Error:[/red] {exc}")
             sys.exit(1)
     else:
-        results = run_all(ctx)
+        if as_json:
+            # JSON is one complete document, so it cannot be streamed a check
+            # at a time without breaking its machine-readable contract.
+            results = run_all(ctx)
+        else:
+            _print_header()
+            results = run_all(
+                ctx,
+                on_result=lambda result: console.print(
+                    format_text([result], verbose=verbose)
+                ),
+            )
 
     if as_json:
         click.echo(format_json(results))
@@ -67,11 +78,9 @@ def doctor(
         _exit_for(results, to_stderr=True)
         return
 
-    from palinode import __version__
-    console.print("Palinode Diagnostics", style="bold underline")
-    console.print(f"Version: {__version__}", style="dim")
-    console.print()
-    console.print(format_text(results, verbose=verbose))
+    if check_name:
+        _print_header()
+        console.print(format_text(results, verbose=verbose))
     console.print()
 
     if fix_mode:
@@ -81,6 +90,15 @@ def doctor(
         # the operator runs `palinode doctor` again to confirm the state.
 
     _exit_for(results)
+
+
+def _print_header() -> None:
+    """Print the human-readable report header before a full diagnostic pass."""
+    from palinode import __version__
+
+    console.print("Palinode Diagnostics", style="bold underline")
+    console.print(f"Version: {__version__}", style="dim")
+    console.print()
 
 
 def _exit_for(results: list, *, to_stderr: bool = False) -> None:

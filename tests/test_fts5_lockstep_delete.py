@@ -93,7 +93,7 @@ class TestDeleteFileChunksLockstep:
         assert chunks == 1, "both chunks of the deleted file must be gone (k1 remains)"
         assert fts == chunks, (
             f"chunks_fts orphaned rows after delete: "
-            f"count(chunks)={chunks} != count(chunks_fts)={fts} (#439)"
+            f"count(chunks)={chunks} != count(chunks_fts)={fts}"
         )
         # Keyword recall, with NO rebuild_fts(): deleted token gone, kept present.
         assert store.search_fts("zebradelete") == []
@@ -137,7 +137,7 @@ class TestReindexPruneLockstep:
         assert after < before, "the removed section's chunk must be pruned"
         assert after_fts == after, (
             f"chunks_fts orphaned rows after re-index prune: "
-            f"count(chunks)={after} != count(chunks_fts)={after_fts} (#439)"
+            f"count(chunks)={after} != count(chunks_fts)={after_fts}"
         )
         # No rebuild_fts(): the pruned keyword is gone, the kept one remains.
         assert store.search_fts("giraffesection") == []
@@ -158,12 +158,12 @@ class TestNoBareFtsDeleteIdiom:
             assert "DELETE FROM chunks_fts" not in src, (
                 f"{mod.__name__} reintroduced a bare `DELETE FROM chunks_fts` — "
                 "use the sanctioned FTS5 'delete' command (store.fts5_delete_chunk) "
-                "so external-content tokens aren't orphaned (#439)."
+                "so external-content tokens aren't orphaned."
             )
 
     def test_sanctioned_delete_command_is_present(self):
         src = Path(inspect.getfile(store)).read_text(encoding="utf-8")
         assert "INSERT INTO chunks_fts(chunks_fts, rowid" in src and "'delete'" in src, (
             "store.fts5_delete_chunk must issue the FTS5 external-content "
-            "'delete' command (#439)."
+            "'delete' command."
         )

@@ -17,6 +17,9 @@
 
   {% if search.query %}
   <h2 class="section-h">Search results · "{{ search.query }}"</h2>
+  {% if search.retrieval %}
+  <p class="meta">Retrieval: {{ search.retrieval.active_mode }} · index: {{ search.retrieval.index_state }} · {{ search.retrieval.outcome }}</p>
+  {% endif %}
   {% if search.error %}
   <div class="notice">{{ search.error }}</div>
   {% elif search.results %}
@@ -24,7 +27,7 @@
     {% for r in search.results %}
     <li><a href="{{ url_for('ui_memory', file_path=r.id) }}">{{ r.path }}
       {% if r.type %}<span class="meta">· {{ r.type }}</span>{% endif %}
-      <span class="meta">· {{ r.score }}</span>
+      <span class="meta">· {{ r.match_label }}</span>
       {% if r.index_agreement == "valid" %}<span class="meta">· index matches source</span>
       {% elif r.index_agreement == "stale" %}<span class="meta">· ⚠ index stale</span>{% endif %}
       {% if r.currency == "retired" %}<span class="meta">· ⚠ retired{% if r.currency_reason %}: {{ r.currency_reason }}{% endif %}</span>

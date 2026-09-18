@@ -79,3 +79,18 @@ over an injected `fetch`, compiled into this package's `dist/` alongside the
 binding, so the installed extension has no runtime dependencies). The Pi
 binding (`src/index.ts`) is structural-typed against the slice of Pi's
 extension API it uses, so nothing here depends on Pi's own packages.
+
+### Capture controls
+
+Transcript capture is off by default. Set `PALINODE_CAPTURE_ENABLED=1` (or
+`captureOn: true` in a binding that accepts config overrides) to opt in.
+Automatic capture and recall require a successful metadata-only policy check
+against the matching controls-capable API. A paused, excluded, unavailable, or
+malformed policy produces no new capture or injection. Cline also checks before
+replaying cached recall into a later request. Already delivered client context
+and queued Pi messages cannot be withdrawn by this control.
+
+Use `palinode controls status`, `palinode controls pause`, and
+`palinode controls resume` to inspect and change the store policy. Capture
+remains bounded to the configured message floor and the first/latest user
+prompt excerpts; explicit tools remain subject to the API's store-level pause.

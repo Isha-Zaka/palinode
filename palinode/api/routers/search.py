@@ -185,6 +185,11 @@ class SearchRequest(BaseModel):
     # surface, this flag is the REST envelope opt-in, like the `ps` shortcut.
     # The receipt itself is built and logged either way.
     receipt: bool | None = None
+    # Passive injection is automatic recall.  Explicit callers may opt in to
+    # the same policy classification without changing their result shape.
+    automatic: bool = False
+    cwd: str | None = None
+    source_path: str | None = None
 
 
 def _attach_evidence(results: list[dict[str, Any]], req: "SearchRequest", chain) -> None:
@@ -223,19 +228,22 @@ def _build_receipt(results: list[dict[str, Any]], req: "SearchRequest", chain):
     )
 
 
-def _delivery(results: list[dict[str, Any]], req: "SearchRequest", receipt):
+def _delivery(results: list[dict[str, Any]], req: "SearchRequest", receipt, *, active_mode: str = "recency", chain=None):
     """Shape the response: today's bare array, or the receipt envelope.
 
     With ``resolve`` on, the envelope carries the receipt's **public** view —
     refs, exact revisions, dispositions, lineage, coverage, scope, times; never
     memory content and never the caller's query. With ``resolve`` off there is
-    no evidence to qualify, so it carries only the two-field reference
-    (``bundle_id`` + ``evaluated_at``): enough to correlate the response with
-    the logged delivery without growing an ordinary response.
+    no evidence to qualify, so it carries the compact reference
+    (``bundle_id`` + ``evaluated_at``). Both shapes add caller-visible retrieval
+    diagnostics, including on an empty result, without exposing global counts.
     """
     if not req.receipt:
         return results
     view = receipt.public() if (req.resolve and req.resolve != "none") else receipt.reference()
+    from palinode.core.retrieval import search_diagnostics
+
+    view["retrieval"] = search_diagnostics(active_mode, matched=bool(results), chain=chain)
     return {"results": results, "receipt": view}
 
 
@@ -307,7 +315,7 @@ class TopicCoverageRequest(BaseModel):
 def search_api(
     req: SearchRequest, request: Request = None
 ) -> list[dict[str, Any]] | dict[str, Any]:
-    """Semantic vector search against cached `.palinode.db` chunks.
+    """Configured hybrid/lexical search against derived `.palinode.db` chunks.
 
     Empty query routes to recency-only mode: returns the most recent
     chunks ordered by created_at desc, optionally filtered by `types` and
@@ -335,6 +343,23 @@ def search_api(
     # - FTS5 query string is sanitized via store.sanitize_fts_query()
     #   before MATCH, defending against operator-injection (`OR`, `NEAR`).
     """
+    from palinode.core.capture_policy import evaluate_capture_policy
+
+    decision = evaluate_capture_policy(
+        "recall",
+        automatic=req.automatic or req.mode == "passive",
+        cwd=req.cwd,
+        project=next(
+            (ref.split("/", 1)[1] for ref in (req.context or [])
+             if isinstance(ref, str) and ref.startswith("project/")),
+            None,
+        ),
+        source_path=req.source_path,
+    )
+    if not decision.allowed:
+        # The request query must never reach embedding, retrieval logging, or
+        # an error body when an automatic recall is denied.
+        raise HTTPException(status_code=403, detail=decision.reason)
     if request:
         client_ip = request.client.host if request.client else "unknown"
         if not _check_rate_limit(client_ip, "search", _RATE_LIMIT_SEARCH):
@@ -377,7 +402,7 @@ def search_api(
             _apply_tier(recent, req.tier)
             _enrich_with_rel_path(recent)
             _attach_evidence(recent, req, scope_chain)
-            return _delivery(recent, req, _build_receipt(recent, req, scope_chain))
+            return _delivery(recent, req, _build_receipt(recent, req, scope_chain), chain=scope_chain)
 
         # ADR-008: Augment query with project context before embedding
         embed_query = req.query
@@ -387,8 +412,10 @@ def search_api(
             if project_names:
                 embed_query = f"In the context of {', '.join(project_names)}: {req.query}"
 
+        lexical = config.search.retrieval_mode == "lexical"
+        active_mode = "lexical" if lexical else "hybrid"
         try:
-            query_emb: list[float] | None = embedder.embed(embed_query)
+            query_emb: list[float] | None = None if lexical else embedder.embed(embed_query)
         except embedder.EmbeddingInputError as e:
             # Per-input embed rejection (e.g. bge-m3 emitting NaN for this
             # exact string): the backend is healthy and the index is intact,
@@ -400,8 +427,9 @@ def search_api(
                 e.text_len, e.ollama_message,
             )
             query_emb = None
+            active_mode = "keyword-fallback"
         if query_emb is not None and not query_emb:
-            return []
+            raise RuntimeError("Embedder returned an empty query vector")
 
         use_hybrid = req.hybrid if req.hybrid is not None else config.search.hybrid_enabled
 
@@ -423,18 +451,17 @@ def search_api(
         )
 
         if query_emb is None:
-            # Keyword fallback: BM25 only, in FTS rank order. Skips the hybrid
-            # ranker's decay/priority/context shaping (its weights assume
-            # cosine-scale scores) but flows through the same visibility gate,
-            # type filters, and snippet enrichment below. Each hit is marked
-            # `mode: keyword-fallback` so callers can see the degraded mode.
             def _run(n: int, record_access: bool = True) -> list[dict[str, Any]]:
-                hits = store.search_fts(
-                    req.query, category=req.category, top_k=n,
-                    kind_exclude_list=kind_exclude_list,
+                hits = store.search_hybrid(
+                    query_text=req.query, query_embedding=None,
+                    category=req.category, top_k=n,
+                    date_after=effective_date_after, date_before=req.date_before,
+                    context_entities=req.context, include_daily=bool(req.include_daily),
+                    kind_exclude_list=kind_exclude_list, mode=recall_mode,
+                    session_id=req.session_id, record_access=record_access,
                 )
                 for h in hits:
-                    h["mode"] = "keyword-fallback"
+                    h["mode"] = active_mode
                 return hits
         elif use_hybrid:
             def _run(n: int, record_access: bool = True) -> list[dict[str, Any]]:
@@ -498,6 +525,10 @@ def search_api(
         results = _filter_type_deny(results, req.type_deny)
         results = _filter_min_priority(results, req.min_priority)
         final = results[:limit]
+        if query_emb is not None and not use_hybrid:
+            active_mode = "vector"
+        for hit in final:
+            hit["retrieval_mode"] = active_mode
 
         # per-result snippet enrichment so MCP callers (and any other
         # budget-constrained consumer) can avoid pulling full chunk bodies.
@@ -535,7 +566,7 @@ def search_api(
             session_id=req.session_id,
             receipt=receipt,
         )
-        return _delivery(final, req, receipt)
+        return _delivery(final, req, receipt, active_mode=active_mode, chain=scope_chain)
     except embedder.EmbeddingInputError:
         raise  # typed 422 via the app-level handler in server.py
     except embedder.EmbeddingUnavailable:

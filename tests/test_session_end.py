@@ -120,7 +120,7 @@ def test_session_end_with_full_metadata(tmp_path, monkeypatch):
         from palinode.api.server import session_end_api, SessionEndRequest
 
         req = SessionEndRequest(
-            summary="Shipped #145 metadata",
+            summary="Shipped metadata",
             project="palinode",
             source="test",
             harness="claude-code",
@@ -240,7 +240,7 @@ def test_session_end_push_true_ships_note(tmp_path, monkeypatch):
     """push=True invokes the push and reports pushed=True, even with auto_push off."""
     result, mpush = _run_session_end_with_push(
         tmp_path, monkeypatch, push=True, auto_push=False)
-    assert mpush.called, "push=True must invoke git_tools.push (#378)"
+    assert mpush.called, "push=True must invoke git_tools.push"
     assert result["pushed"] is True
     assert result["committed"] is True
 

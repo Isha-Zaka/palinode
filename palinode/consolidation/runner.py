@@ -665,6 +665,46 @@ def _record_gate_run(
     activity_gate.record_run(mode, now=started_at)
 
 
+def _record_run_outcome(
+    mode: str,
+    result: dict[str, Any] | None,
+    started_at: datetime,
+    *,
+    dry_run: bool,
+    lookback_days: int,
+    error: BaseException | None = None,
+) -> None:
+    """Append the pass's outcome to the gate's state file, success or not.
+
+    The companion to ``_record_gate_run``, which stamps the clock only on a
+    full success and therefore cannot say that a pass *failed*. This records
+    every real pass — ``success``, ``partial``, the idle statuses, and
+    ``error`` when the pass raised — so ``palinode doctor`` can report the
+    last outcome and count a failure streak instead of leaving that to whoever
+    reads the cron log. A dry run consolidated nothing and records nothing:
+    a dry-run "success" written here would reset a real streak.
+    """
+    from palinode.consolidation import activity_gate
+
+    if dry_run:
+        return
+    if error is not None:
+        status = "error"
+        failed: list[str] = []
+    else:
+        status = str((result or {}).get("status") or "unknown")
+        failed = [str(project) for project in (result or {}).get("failed_projects") or []]
+    activity_gate.record_outcome(
+        mode,
+        started_at=started_at,
+        finished_at=activity_gate._utc_now(),
+        status=status,
+        failed_projects=failed,
+        lookback_days=lookback_days,
+        error=f"{type(error).__name__}: {error}" if error is not None else None,
+    )
+
+
 class ArchivePartition(NamedTuple):
     """Where each collected note goes once the pass has run.
 
@@ -1567,20 +1607,30 @@ def run_consolidation(
     out. A pass that raises or returns ``partial`` records nothing, so the next
     tick retries it immediately rather than waiting out a fresh interval; a dry
     run records nothing either, since it changed no memory and consolidated no
-    notes. See ``_record_gate_run``.
+    notes. See ``_record_gate_run``. The pass's *outcome* — including a
+    partial or a raise — is appended to the same state file regardless, so
+    doctor can report it (``_record_run_outcome``).
     """
     from palinode.consolidation import activity_gate
     from palinode.consolidation.run_lock import consolidation_run_lock
 
     with consolidation_run_lock():
         started_at = activity_gate._utc_now()
-        result = _run_consolidation_unlocked(
-            lookback_days=lookback_days,
-            dry_run=dry_run,
-            llm_fn=llm_fn,
-            sources=sources,
-        )
+        lookback = lookback_days or config.consolidation.lookback_days
+        try:
+            result = _run_consolidation_unlocked(
+                lookback_days=lookback_days,
+                dry_run=dry_run,
+                llm_fn=llm_fn,
+                sources=sources,
+            )
+        except Exception as error:
+            _record_run_outcome(
+                "weekly", None, started_at, dry_run=dry_run, lookback_days=lookback, error=error
+            )
+            raise
         _record_gate_run("weekly", result, started_at, dry_run=dry_run)
+        _record_run_outcome("weekly", result, started_at, dry_run=dry_run, lookback_days=lookback)
         return result
 
 
@@ -1848,12 +1898,20 @@ def run_nightly(lookback_days: int | None = None, dry_run: bool = False, llm_fn:
 
     with consolidation_run_lock():
         started_at = activity_gate._utc_now()
-        result = _run_nightly_unlocked(
-            lookback_days=lookback_days,
-            dry_run=dry_run,
-            llm_fn=llm_fn,
-        )
+        lookback = lookback_days or config.consolidation.nightly.lookback_days
+        try:
+            result = _run_nightly_unlocked(
+                lookback_days=lookback_days,
+                dry_run=dry_run,
+                llm_fn=llm_fn,
+            )
+        except Exception as error:
+            _record_run_outcome(
+                "nightly", None, started_at, dry_run=dry_run, lookback_days=lookback, error=error
+            )
+            raise
         _record_gate_run("nightly", result, started_at, dry_run=dry_run)
+        _record_run_outcome("nightly", result, started_at, dry_run=dry_run, lookback_days=lookback)
         return result
 
 

@@ -30,7 +30,7 @@ def test_build_directory_not_tracked():
     tracked = _git_ls_files("build/")
     assert not tracked, (
         "build/ contains tracked files — these should be in .gitignore "
-        "(#295). Tracked: " + ", ".join(tracked[:5]) + ("..." if len(tracked) > 5 else "")
+        "Tracked: " + ", ".join(tracked[:5]) + ("..." if len(tracked) > 5 else "")
     )
 
 
@@ -38,7 +38,7 @@ def test_dist_directory_not_tracked():
     tracked = _git_ls_files("dist/")
     assert not tracked, (
         "dist/ contains tracked files — these should be in .gitignore "
-        "(#295). Tracked: " + ", ".join(tracked[:5]) + ("..." if len(tracked) > 5 else "")
+        "Tracked: " + ", ".join(tracked[:5]) + ("..." if len(tracked) > 5 else "")
     )
 
 
@@ -46,7 +46,7 @@ def test_egg_info_not_tracked():
     tracked = _git_ls_files("*.egg-info/")
     assert not tracked, (
         "*.egg-info/ contains tracked files — these should be in .gitignore "
-        "(#295). Tracked: " + ", ".join(tracked[:5])
+        "Tracked: " + ", ".join(tracked[:5])
     )
 
 

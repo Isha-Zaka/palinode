@@ -56,3 +56,28 @@ describe("palinode_search score presentation", () => {
     expect(text).not.toContain("score: 75%");
   });
 });
+
+describe("lexical retrieval diagnostics", () => {
+  for (const outcome of ["matched", "no_match", "not_indexed"]) {
+    it(`renders ${outcome} from the API receipt`, async () => {
+      global.fetch = async (_url, init) => {
+        expect(JSON.parse(String(init?.body)).receipt).toBe(true);
+        return new Response(JSON.stringify({
+          results: outcome === "matched" ? [{ category: "decisions", content: "orionledger", file_path: "/memory/decision.md", score: 1, raw_score: null, retrieval_mode: "lexical" }] : [],
+          receipt: { retrieval: { active_mode: "lexical", index_state: outcome === "not_indexed" ? "not_indexed" : "ready", outcome } },
+        }), { status: 200 });
+      };
+      const result = await captureSearchExecute()("lexical", { query: "orionledger" });
+      expect(result.content[0].text).toContain("Retrieval: lexical");
+      expect(result.content[0].text).toContain(outcome);
+      expect(result.content[0].text).not.toContain("% match");
+    });
+  }
+
+  it("keeps a backend failure distinct from no match", async () => {
+    global.fetch = async () => new Response("Embedding backend unavailable", { status: 503 });
+    const result = await captureSearchExecute()("outage", { query: "orionledger" });
+    expect(result.content[0].text).toContain("search failed");
+    expect(result.content[0].text).not.toContain("No relevant memories");
+  });
+});

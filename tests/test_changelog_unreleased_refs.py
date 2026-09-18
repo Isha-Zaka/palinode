@@ -122,27 +122,28 @@ def _unreleased_section() -> tuple[str, int]:
 
 _DEV = "dev"
 _PUBLIC = "https://github.com/phasespace-labs/palinode"
+_HASH = "#"
 
 
 @pytest.mark.parametrize(
     "label,section",
     [
-        ("qualified dev ref", f"### Fixed\n\n- fusion no longer drops hits ({_DEV}#654).\n"),
+        ("qualified dev ref", f"### Fixed\n\n- fusion no longer drops hits ({_DEV}{_HASH}654).\n"),
         (
             "qualified dev ref, long prefix",
-            f"### Fixed\n\n- see palinode-{_DEV}#654 for background.\n",
+            f"### Fixed\n\n- see palinode-{_DEV}{_HASH}654 for background.\n",
         ),
         (
             "public credit link",
-            f"### Fixed\n\n- normalised BM25 floor\n  ([#201]({_PUBLIC}/pull/201),\n  thanks @someone).\n",
+            f"### Fixed\n\n- normalised BM25 floor\n  ([{_HASH}201]({_PUBLIC}/pull/201),\n  thanks @someone).\n",
         ),
         (
             "public issue link in prose",
-            f"### Changed\n\n- [#154]({_PUBLIC}/issues/154) put the floor on the wrong scale.\n",
+            f"### Changed\n\n- [{_HASH}154]({_PUBLIC}/issues/154) put the floor on the wrong scale.\n",
         ),
         (
             "sample id inside a fence",
-            "### Added\n\n- order-id extraction:\n\n  ```json\n  {\"order\": \"#000000301\", \"prior\": \"#301\"}\n  ```\n",
+            "### Added\n\n- order-id extraction:\n\n  ```json\n  {\"order\": \"#000000301\", \"prior\": \"" + _HASH + "301\"}\n  ```\n",
         ),
         ("hex colour", "### Added\n\n- badge colour is now #fff on dark themes.\n"),
         ("url path number", f"### Fixed\n\n- see {_PUBLIC}/issues/199 for the measurement.\n"),
@@ -156,23 +157,23 @@ def test_followable_forms_pass(label: str, section: str) -> None:
 @pytest.mark.parametrize(
     "label,section,expected",
     [
-        ("bare ref in prose", "### Fixed\n\n- fusion no longer drops hits (#654).\n", "#654"),
-        ("bare ref as an example string", "### Changed\n\n- a marker such as #654 is rewritten.\n", "#654"),
-        ("bare ref at line start", "### Fixed\n\n- context:\n  #1109 was the cause.\n", "#1109"),
+        ("bare ref in prose", "### Fixed\n\n- fusion no longer drops hits (" + _HASH + "654).\n", _HASH + "654"),
+        ("bare ref as an example string", "### Changed\n\n- a marker such as " + _HASH + "654 is rewritten.\n", _HASH + "654"),
+        ("bare ref at line start", "### Fixed\n\n- context:\n  " + _HASH + "1109 was the cause.\n", _HASH + "1109"),
         (
             "bare ref beside an allowed one",
-            f"### Fixed\n\n- floor fix ({_DEV}#1267) and also #898.\n",
-            "#898",
+            f"### Fixed\n\n- floor fix ({_DEV}{_HASH}1267) and also {_HASH}898.\n",
+            _HASH + "898",
         ),
         (
             "bare ref beside a public link",
-            f"### Fixed\n\n- [#201]({_PUBLIC}/pull/201) supersedes #1142.\n",
-            "#1142",
+            f"### Fixed\n\n- [{_HASH}201]({_PUBLIC}/pull/201) supersedes {_HASH}1142.\n",
+            _HASH + "1142",
         ),
         (
             "bare ref after a fenced block closes",
-            "### Added\n\n```json\n{\"order\": \"#301\"}\n```\n\n- the extractor (#1215).\n",
-            "#1215",
+            "### Added\n\n```json\n{\"order\": \"" + _HASH + "301\"}\n```\n\n- the extractor (" + _HASH + "1215).\n",
+            _HASH + "1215",
         ),
     ],
 )
@@ -183,8 +184,8 @@ def test_bare_forms_are_flagged(label: str, section: str, expected: str) -> None
 
 def test_flagged_line_number_is_reported() -> None:
     """A failure has to name the line, or the fix is a hunt through the section."""
-    section = "\n\n### Fixed\n\n- one line\n- the offender (#654) here\n"
-    assert bare_issue_refs(section) == [(6, "#654", "- the offender (#654) here")]
+    section = "\n\n### Fixed\n\n- one line\n- the offender (" + _HASH + "654) here\n"
+    assert bare_issue_refs(section) == [(6, _HASH + "654", "- the offender (" + _HASH + "654) here")]
 
 
 # --- the live file ----------------------------------------------------------

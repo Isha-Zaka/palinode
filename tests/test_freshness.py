@@ -183,7 +183,7 @@ def test_multisection_fresh_file_marked_valid(tmp_path, monkeypatch):
     checked = check_freshness(results)
     for r in checked:
         assert r["freshness"] == "valid", (
-            f"section {r['section_id']!r} reported {r['freshness']!r} but should be valid (#203)"
+            f"section {r['section_id']!r} reported {r['freshness']!r} but should be valid"
         )
 
 

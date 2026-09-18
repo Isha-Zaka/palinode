@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from palinode.core.config import config
@@ -51,8 +51,7 @@ class ScopeOverride(BaseModel):
 
 
 class PrimeRequest(BaseModel):
-    #: Working directory used to resolve the project scope (basename →
-    #: project entity, via the ADR-008 resolution the search boost uses).
+    #: Working directory used for the shared, git-aware ADR-008 resolution.
     cwd: str | None = None
     #: Explicit project slug or entity ref; overrides cwd resolution.
     project: str | None = None
@@ -65,6 +64,11 @@ class PrimeRequest(BaseModel):
     mode: Literal["classic", "scoped"] | None = None
     #: Explicit chain override (ADR-009 §3.5).
     scope: ScopeOverride | None = None
+    # Hook/session-start callers set this so automatic exclusions are enforced
+    # before the digest reads memory.  The MCP tool remains explicit unless it
+    # deliberately opts into the automatic classification.
+    automatic: bool = False
+    source_path: str | None = None
 
 
 @router.post("/context/prime")
@@ -87,8 +91,19 @@ def context_prime_api(req: PrimeRequest) -> dict[str, Any]:
     rows are written for a prime: a session-start injection ledger is a
     separate contract, and this endpoint has never written to that log.
     """
-    from palinode.core.context_prime import build_context_digest, resolve_project
+    from palinode.core.capture_policy import evaluate_capture_policy
+    from palinode.core.context_prime import build_context_digest, resolve_context
     from palinode.core.receipt import build_digest_receipt
+
+    decision = evaluate_capture_policy(
+        "recall",
+        automatic=req.automatic,
+        cwd=req.cwd,
+        project=req.project or (req.scope.project if req.scope else None),
+        source_path=req.source_path,
+    )
+    if not decision.allowed:
+        raise HTTPException(status_code=403, detail=decision.reason)
 
     configured = config.scope.prime_mode
     if configured not in _PRIME_MODES:
@@ -102,7 +117,8 @@ def context_prime_api(req: PrimeRequest) -> dict[str, Any]:
     # project level also drives the digest's project sections so the response
     # stays internally coherent.
     project_arg = req.project or (req.scope.project if req.scope else None)
-    resolved = resolve_project(cwd=req.cwd, project=project_arg)
+    resolution = resolve_context(cwd=req.cwd, project=project_arg)
+    resolved = resolution.project
 
     if req.scope is not None:
         chain = ScopeChain(**req.scope.model_dump())
@@ -114,6 +130,7 @@ def context_prime_api(req: PrimeRequest) -> dict[str, Any]:
         cwd=req.cwd,
         project=project_arg,
         scope_chain=chain if mode == "scoped" else None,
+        resolution=resolution,
     )
 
     logger.info(

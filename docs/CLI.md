@@ -44,6 +44,123 @@ Global options: `palinode --version` prints the banner and version;
 
 ## Commands
 
+### `palinode controls`
+
+```
+palinode controls [OPTIONS] COMMAND [ARGS]...
+```
+
+API-backed capture, recall, and automatic-capture controls. This command keeps
+no local pause state: every read and mutation goes to the server so other
+clients see the same policy. Subcommands default to text on a TTY and JSON when
+piped; pass `--format` to choose explicitly.
+
+### `palinode controls status`
+
+```
+palinode controls status [OPTIONS]
+```
+
+Shows API control state and a first-use disclosure: effective store/project,
+observed project setup (not running-client proof), destinations with credentials
+and query values redacted, and the stated policy limits.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--cwd DIRECTORY` | current directory | Project directory to observe and use for the content-free policy preflight |
+| `--project TEXT` | none | Explicit project for the content-free policy preflight |
+| `--format [json\|text]` | auto | Output format |
+
+```bash
+palinode controls status --format json
+```
+
+Output: **auto**.
+
+### `palinode controls pause`
+
+```
+palinode controls pause [OPTIONS]
+```
+
+Pause future API capture and/or recall. The default pauses both; it cannot
+withdraw context already delivered or cancel an in-flight request.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--capture / --no-capture` | capture | Select capture control |
+| `--recall / --no-recall` | recall | Select recall control |
+| `--format [json\|text]` | auto | Output format |
+
+```bash
+palinode controls pause
+```
+
+Output: **auto**.
+
+### `palinode controls resume`
+
+```
+palinode controls resume [OPTIONS]
+```
+
+Resume the selected future API capture and/or recall path.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--capture / --no-capture` | capture | Select capture control |
+| `--recall / --no-recall` | recall | Select recall control |
+| `--format [json\|text]` | auto | Output format |
+
+```bash
+palinode controls resume
+```
+
+Output: **auto**.
+
+### `palinode controls exclude-project`
+
+```
+palinode controls exclude-project [OPTIONS] PROJECT
+```
+
+Add one project to automatic capture/recall exclusions, or remove that one exclusion.
+Explicit user/API writes remain allowed.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--remove` | off | Remove rather than add this exclusion |
+| `--format [json\|text]` | auto | Output format |
+
+```bash
+palinode controls exclude-project private-prototype
+```
+
+Output: **auto**.
+
+### `palinode controls exclude-path`
+
+```
+palinode controls exclude-path [OPTIONS] PATH
+```
+
+Add one source path to automatic capture/recall exclusions, or remove that one
+exclusion. This is not a general secret detector.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--remove` | off | Remove rather than add this exclusion |
+| `--format [json\|text]` | auto | Output format |
+
+```bash
+palinode controls exclude-path "$PWD/.env"
+```
+
+`PATH` must be an absolute path with no `..` or symlink component; the API
+normalizes and rejects unsafe input rather than treating it as an exclusion.
+
+Output: **auto**.
+
 ### `palinode archive`
 
 ```
@@ -521,6 +638,8 @@ Output: **auto**.
 
 ### `palinode init`
 
+**Before your first capture:** Palinode stores readable Markdown and Git history. `private`/`restricted` control discovery by scope; a caller with API access can still read a hidden memory by its known path and use full-store maintenance tools. These labels provide no encryption or per-user/per-agent authentication. Protect the store, backups and API credentials; use separate instances or filesystem permissions for stronger separation. See the [privacy contract](PRIVACY.md). `init` prints this boundary before provisioning capture hooks, including in dry runs.
+
 ```
 palinode init [OPTIONS]
 ```
@@ -679,11 +798,13 @@ recipes in [MCP-INSTALL-RECIPES.md](MCP-INSTALL-RECIPES.md).
 | `--host TEXT` | placeholder | Host for `--http` |
 | `--port INTEGER` | 6341 | Streamable-HTTP MCP port for `--http` |
 | `--bearer TEXT` | none | Optional bearer token for `--http` |
+| `--project TEXT` | none | Safe project slug for a generated `--stdio` client; emitted as that client's `PALINODE_PROJECT`. Not available for HTTP. |
 | `--json` | off | Emit results as JSON |
 
 ```bash
 palinode mcp-config --diagnose
 palinode mcp-config --http --host memory.example.internal > ~/.cursor/mcp.json
+palinode mcp-config --stdio --project harbor-notes
 ```
 
 Output: **`--json` flag, auto** — when piped, only the raw block is printed.
@@ -861,7 +982,7 @@ Scope resolution and the phases of session recall are in
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--cwd TEXT` | current dir | Working directory used to resolve the project scope |
+| `--cwd TEXT` | `CWD` env, then current dir | Working directory used to resolve the project scope |
 | `-p, --project TEXT` | resolved from cwd | Explicit project slug or entity ref |
 | `--format [json\|text]` | auto | Output format |
 
@@ -869,6 +990,10 @@ Scope resolution and the phases of session recall are in
 palinode prime
 palinode prime -p checkout --format json
 ```
+
+The digest reports the project, resolution basis and whether visible current
+records recognize it. See [project resolution](HOW-MEMORY-WORKS.md#choosing-the-project)
+for linked worktrees, overrides, disablement and remote API paths.
 
 Output: **auto**.
 
