@@ -181,23 +181,49 @@ def _generate_id(content: str) -> str:
 
 def _translate_wikilinks(
     body: str,
-    slug_map: dict[str, str],
+    source_destinations: dict[str, str],
+    exact_stem_index: dict[str, list[str]],
+    slug_index: dict[str, list[str]],
     orphan_warnings: list[str],
+    collision_warnings: list[str],
     source_rel: Path,
 ) -> str:
-    """Rewrite [[wikilinks]] using slug_map.
+    """Rewrite [[wikilinks]] without collapsing colliding source names.
 
-    - If the target slug is in slug_map → rewrite [[Old]] to [[new-slug]]
-    - Otherwise → leave as-is, log a warning
+    Resolution order:
+    1. A unique, case-sensitive source-stem match wins.
+    2. Otherwise a unique slug match is used.
+    3. Ambiguous matches are left untouched and reported.
+    4. Missing matches are left untouched and reported as orphans.
+
+    source_destinations is keyed by each source's unique relative path, so
+    two source files can never overwrite one another merely because their stems
+    slugify to the same value.
     """
     def replace(m: re.Match) -> str:
         raw = m.group(1).strip()
+
+        exact_matches = exact_stem_index.get(raw, [])
+        if len(exact_matches) == 1:
+            return f"[[{source_destinations[exact_matches[0]]}]]"
+        if len(exact_matches) > 1:
+            collision_warnings.append(
+                f"{source_rel}: wikilink [[{raw}]] is ambiguous between "
+                f"{', '.join(exact_matches)} — leaving as-is"
+            )
+            return m.group(0)
+
         raw_slug = slugify(raw)
-        if raw_slug in slug_map:
-            return f"[[{slug_map[raw_slug]}]]"
-        if raw.lower() in slug_map:
-            return f"[[{slug_map[raw.lower()]}]]"
-        # Leave untouched
+        slug_matches = slug_index.get(raw_slug, [])
+        if len(slug_matches) == 1:
+            return f"[[{source_destinations[slug_matches[0]]}]]"
+        if len(slug_matches) > 1:
+            collision_warnings.append(
+                f"{source_rel}: wikilink [[{raw}]] is ambiguous for slug "
+                f"'{raw_slug}' between {', '.join(slug_matches)} — leaving as-is"
+            )
+            return m.group(0)
+
         orphan_warnings.append(
             f"{source_rel}: wikilink [[{raw}]] has no matching import target — "
             "leaving as-is (run palinode orphan-repair post-import)"
@@ -243,13 +269,14 @@ def plan_import(
     source_vault: Path,
     memory_dir: Path,
     into_category: Optional[str] = None,
-) -> tuple[list[ImportPlan], list[str]]:
+) -> tuple[list[ImportPlan], list[str], list[str]]:
     """Walk source_vault and build an ImportPlan for each .md file.
 
     Returns:
-        (plans, orphan_warnings) — plans is the list of ImportPlan objects;
-        orphan_warnings is a list of human-readable messages about unresolved
-        wikilinks (populated during wikilink translation on the second pass).
+        (plans, orphan_warnings, collision_warnings) — plans is the list of
+        ImportPlan objects; orphan_warnings contains links with no import target,
+        while collision_warnings contains source-name collisions and ambiguous
+        links that cannot be resolved uniquely.
     """
     # Pass 1: collect all .md files and compute category + dest paths
     plans_pre: list[tuple[Path, Path, dict, str, str, str]] = []
@@ -293,20 +320,49 @@ def plan_import(
         dest_path = _make_dest_path(memory_dir, src_rel, category, used_dest_paths)
         plans_pre.append((src_abs, src_rel, metadata, body, category, reason, dest_path))
 
-    # Build slug map from the full set of planned destinations (before wikilink rewrite)
-    slug_map: dict[str, str] = {}
-    for src_abs, _src_rel, _metadata, _body, _category, _reason, dest_path in plans_pre:
-        src_slug = slugify(src_abs.stem)
-        dest_rel = dest_path.stem
-        slug_map[src_slug] = dest_rel
-        slug_map[src_abs.stem.lower()] = dest_rel
+    # Build lookup indexes from the full set of planned destinations before
+    # rewriting wikilinks. The canonical map is keyed by unique source-relative
+    # path; secondary indexes may legitimately contain multiple source keys.
+    source_destinations: dict[str, str] = {}
+    exact_stem_index: dict[str, list[str]] = {}
+    slug_index: dict[str, list[str]] = {}
+
+    for _src_abs, src_rel, _metadata, _body, _category, _reason, dest_path in plans_pre:
+        source_key = src_rel.as_posix()
+        source_destinations[source_key] = dest_path.stem
+        exact_stem_index.setdefault(src_rel.stem, []).append(source_key)
+        slug_index.setdefault(slugify(src_rel.stem), []).append(source_key)
 
     # Pass 2: translate wikilinks and build final ImportPlan objects
     plans: list[ImportPlan] = []
     orphan_warnings: list[str] = []
+    collision_warnings: list[str] = []
+
+    # Report name collisions even if every actual link can be resolved by an
+    # exact stem. Previously these collisions were silent and iteration order
+    # decided which destination survived in the slug map.
+    for src_slug, source_keys in slug_index.items():
+        if len(source_keys) > 1:
+            destinations = ", ".join(
+                f"{key} -> {source_destinations[key]}"
+                for key in source_keys
+            )
+            collision_warnings.append(
+                f"wikilink target collision for slug '{src_slug}': "
+                f"{destinations}; exact-stem links resolve exactly, other "
+                "spellings are ambiguous and left as-is"
+            )
 
     for src_abs, src_rel, metadata, body, category, reason, dest_path in plans_pre:
-        translated_body = _translate_wikilinks(body, slug_map, orphan_warnings, src_rel)
+        translated_body = _translate_wikilinks(
+            body,
+            source_destinations,
+            exact_stem_index,
+            slug_index,
+            orphan_warnings,
+            collision_warnings,
+            src_rel,
+        )
 
         merged_meta = _add_palinode_frontmatter(metadata, category, src_abs)
         content = _render_frontmatter_and_body(merged_meta, translated_body)
@@ -320,7 +376,7 @@ def plan_import(
             content=content,
         ))
 
-    return plans, orphan_warnings
+    return plans, orphan_warnings, collision_warnings
 
 
 def execute_import(

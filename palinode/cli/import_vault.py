@@ -112,7 +112,7 @@ def from_vault(
         click.echo("[dry-run] Pass --apply to write files.")
     click.echo("")
 
-    plans, orphan_warnings = plan_import(
+    plans, orphan_warnings, collision_warnings = plan_import(
         source_vault=source_path,
         memory_dir=memory_dir,
         into_category=into_cat,
@@ -135,6 +135,12 @@ def from_vault(
         )
 
     click.echo("")
+
+    if collision_warnings:
+        click.echo(f"Wikilink target collisions ({len(collision_warnings)}):")
+        for warn in collision_warnings:
+            click.echo(f"  warning: {warn}")
+        click.echo("")
 
     if orphan_warnings:
         click.echo(f"Orphaned wikilinks ({len(orphan_warnings)}) — left as-is:")

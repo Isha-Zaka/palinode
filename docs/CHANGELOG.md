@@ -10,6 +10,7 @@ All notable changes to Palinode. Format follows [Keep a Changelog](https://keepa
 
 ### Fixed
 
+- Vault imports now preserve distinct wikilink targets when source filenames share a slug, prefer exact source-stem matches, and report unresolved slug collisions instead of silently resolving them by iteration order.
 ### Removed
 
 ### Security
