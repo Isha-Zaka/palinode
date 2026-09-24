@@ -333,6 +333,81 @@ def _validated_embedding_dimensions() -> int:
     return dimensions
 
 
+def _ensure_embedding_space(
+    db: sqlite3.Connection,
+    dimensions: int,
+) -> None:
+    """Record and verify the embedding space used by this database."""
+    configured_model = config.embeddings.primary.model
+
+    had_existing_vector_index = (
+        db.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN ('chunks_vec', 'triggers_vec')
+            LIMIT 1
+            """
+        ).fetchone()
+        is not None
+    )
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS embedding_space (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            model TEXT NOT NULL,
+            dimensions INTEGER NOT NULL
+        )
+    """)
+
+    cursor = db.execute(
+        """
+        INSERT OR IGNORE INTO embedding_space (id, model, dimensions)
+        VALUES (1, ?, ?)
+        """,
+        (configured_model, dimensions),
+    )
+
+    if cursor.rowcount == 1 and had_existing_vector_index:
+        _store_logger.warning(
+            "Adopting embedding space model=%s dimensions=%d for an "
+            "existing database. Existing vectors cannot be independently "
+            "verified.",
+            configured_model,
+            dimensions,
+        )
+
+    row = db.execute(
+        """
+        SELECT model, dimensions
+        FROM embedding_space
+        WHERE id = 1
+        """
+    ).fetchone()
+
+    if row is None:
+        raise RuntimeError("Embedding space metadata could not be initialized")
+
+    recorded_model = row["model"]
+    recorded_dimensions = int(row["dimensions"])
+
+    if (
+        recorded_model != configured_model
+        or recorded_dimensions != dimensions
+    ):
+        raise RuntimeError(
+            "Embedding space mismatch: "
+            f"database uses model={recorded_model!r}, "
+            f"dimensions={recorded_dimensions}, but active configuration uses "
+            f"model={configured_model!r}, dimensions={dimensions}. "
+            "Vectors from different embedding spaces cannot be compared safely. "
+            "To recover, delete .palinode.db and run `palinode reindex`. "
+            "Warning: deleting the database also removes DB-only state, including "
+            "registered triggers and recall reinforcement state "
+            "(importance, last_recalled, recall_count)."
+        )
+
+
 def _parameterize_in_clause(values: Sequence[Any]) -> tuple[str, tuple[Any, ...]]:
     """Build placeholder-only IN clauses while keeping values parameterized."""
     params = tuple(values)
@@ -356,6 +431,12 @@ def init_db() -> None:
     # the default DELETE journal. Leaves ``.db-wal`` / ``.db-shm`` sidecars
     # next to the DB while any connection is open; both are gitignored.
     db.execute("PRAGMA journal_mode=WAL")
+
+    try:
+        _ensure_embedding_space(db, dimensions)
+    except Exception:
+        db.close()
+        raise
     db.execute("""
         CREATE TABLE IF NOT EXISTS chunks (
             id TEXT PRIMARY KEY,
